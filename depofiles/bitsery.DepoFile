@@ -1,0 +1,6 @@
+# Copyright 2026 Victor Stewart
+# SPDX-License-Identifier: Apache-2.0
+NAME bitsery
+VERSION 5.2.3
+SOURCE URL https://github.com/fraillt/bitsery/archive/refs/tags/v5.2.3.tar.gz
+TARGET bitsery::bitsery INTERFACE include

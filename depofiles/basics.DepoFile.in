@@ -1,0 +1,27 @@
+# Copyright 2026 Victor Stewart
+# SPDX-License-Identifier: Apache-2.0
+NAME @BASICS_SELF_PACKAGE_NAME@
+VERSION 0.1.0
+# mimalloc mode: @BASICS_SELF_MIMALLOC_MODE@
+# preferred direct dependency linkage: @BASICS_SELF_DEPENDENCY_LINK_MODE@
+# direct dependencies remain on their exported primary targets unless a depofile exposes alternate artifacts.
+DEPENDS SG14 VERSION 0.1.0
+DEPENDS aegis VERSION 0.3.0
+DEPENDS bitsery VERSION 5.2.3
+DEPENDS gxhash VERSION 3.4.1
+DEPENDS itoa VERSION 0.1.0
+DEPENDS libbpf VERSION 1.5.0
+DEPENDS libcurl VERSION 8.8.0
+DEPENDS libssh2 VERSION 1.11.0
+DEPENDS liburing VERSION 2.14
+DEPENDS nghttp2 VERSION 1.64.0
+DEPENDS openssl VERSION 3.4.1
+DEPENDS simdjson VERSION 4.2.4
+DEPENDS static_type_info VERSION 0.1.0
+DEPENDS zlib VERSION 1.3.2
+@BASICS_SELF_MIMALLOC_DEPENDS@
+SOURCE URL @BASICS_SELF_SOURCE_URL@
+SHA256 @BASICS_SELF_SOURCE_SHA256@
+TARGET basics::basics INTERFACE include
+DEFINES basics::basics USE_MIMALLOC=@BASICS_SELF_USE_MIMALLOC@
+LINK basics::basics @BASICS_SELF_DIRECT_DEPENDENCY_LINKS@@BASICS_SELF_MIMALLOC_LINK@

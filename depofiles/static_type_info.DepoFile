@@ -1,0 +1,6 @@
+# Copyright 2026 Victor Stewart
+# SPDX-License-Identifier: Apache-2.0
+NAME static_type_info
+VERSION 0.1.0
+SOURCE GIT https://github.com/victorstewart/StaticTypeInfo.git b8c1b8d143f70797032e462b65bb89f9b4c8b665
+TARGET static_type_info::static_type_info INTERFACE include

@@ -1,0 +1,16 @@
+# Copyright 2026 Victor Stewart
+# SPDX-License-Identifier: Apache-2.0
+NAME liburing
+VERSION 2.14
+PRIMARY_TARGET liburing::liburing
+SOURCE URL https://github.com/axboe/liburing/archive/refs/tags/liburing-2.14.tar.gz
+BUILD_SYSTEM AUTOCONF
+AUTOCONF_CONFIGURE ./configure --prefix="${DEPO_PREFIX}" --use-libc
+AUTOCONF_BUILD_SH <<'EOF'
+make -j$(nproc) library
+make liburing.pc liburing-ffi.pc
+EOF
+AUTOCONF_INSTALL make install
+TARGET liburing::liburing STATIC lib/liburing.a SHARED lib/liburing.so.2.14 INTERFACE include
+ARTIFACT lib/liburing.so.2
+ARTIFACT lib/liburing.so

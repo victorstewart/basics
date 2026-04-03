@@ -1,0 +1,7 @@
+# Copyright 2026 Victor Stewart
+# SPDX-License-Identifier: Apache-2.0
+NAME SG14
+VERSION 0.1.0
+SOURCE GIT https://github.com/victorstewart/SG14.git 0aaa487f3bb11d7cdcb72cfa8be1fab5814203c8
+STAGE_TREE SOURCE SG14 include/SG14
+TARGET SG14::SG14 INTERFACE include

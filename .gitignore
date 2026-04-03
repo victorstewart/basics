@@ -1,0 +1,24 @@
+# Copyright 2026 Victor Stewart
+# SPDX-License-Identifier: Apache-2.0
+.DS_Store
+.idea/
+.vscode/
+.clangd/
+.cache/
+.depos/
+.deps/
+build/
+build-*/
+cmake-build-*/
+out/
+bin/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+compile_commands.json
+CMakeUserPresets.json
+.tasks/

@@ -1,0 +1,18 @@
+# Copyright 2026 Victor Stewart
+# SPDX-License-Identifier: Apache-2.0
+NAME openssl
+VERSION 3.4.1
+SOURCE URL https://github.com/openssl/openssl/releases/download/openssl-3.4.1/openssl-3.4.1.tar.gz
+BUILD_SYSTEM AUTOCONF
+AUTOCONF_CONFIGURE_SH <<'EOF'
+./Configure "linux-${DEPO_TARGET_ARCH}" --prefix="${DEPO_PREFIX}" --libdir=lib --openssldir="${DEPO_PREFIX}/ssl" no-quic no-tests no-docs no-shared
+EOF
+AUTOCONF_BUILD_SH <<'EOF'
+make build_generated
+make -j$(nproc) libcrypto.a libssl.a
+EOF
+AUTOCONF_INSTALL make install_dev DESTDIR=
+TARGET openssl INTERFACE include
+TARGET openssl::crypto STATIC lib/libcrypto.a
+TARGET openssl::ssl STATIC lib/libssl.a
+LINK openssl openssl::ssl openssl::crypto

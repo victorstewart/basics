@@ -1,0 +1,6 @@
+# Copyright 2026 Victor Stewart
+# SPDX-License-Identifier: Apache-2.0
+NAME itoa
+VERSION 0.1.0
+SOURCE GIT https://github.com/jeaiii/itoa.git 69308f65e87a9954f11f952ed04d551eabeee0ae
+TARGET itoa::itoa INTERFACE include
