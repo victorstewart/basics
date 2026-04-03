@@ -1,0 +1,11 @@
+# Copyright 2026 Victor Stewart
+# SPDX-License-Identifier: Apache-2.0
+NAME lz4
+VERSION 1.10.0
+SYSTEM_LIBS ALLOW
+SOURCE URL https://github.com/lz4/lz4/archive/refs/tags/v1.10.0.tar.gz
+BUILD_SYSTEM CMAKE
+CMAKE_CONFIGURE cmake -S ${DEPO_SOURCE_DIR}/build/cmake -B ${DEPO_BUILD_DIR} -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${DEPO_PREFIX} -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DLZ4_BUILD_CLI=OFF -DLZ4_BUILD_LEGACY_LZ4C=OFF
+CMAKE_BUILD cmake --build ${DEPO_BUILD_DIR} --parallel $(nproc)
+CMAKE_INSTALL cmake --install ${DEPO_BUILD_DIR}
+TARGET lz4::lz4 STATIC lib/liblz4.a INTERFACE include

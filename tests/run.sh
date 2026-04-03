@@ -82,9 +82,10 @@ run_variant() {
   local compiler_label="$3"
   local mimalloc_mode="$4"
   local dependency_link_mode="$5"
-  local variant_sanitizer_mode="${6:-NONE}"
+  local tidesdb_mode="${6:-OFF}"
+  local variant_sanitizer_mode="${7:-NONE}"
 
-  echo "==> [${compiler_label}] BASICS_MIMALLOC_MODE=${mimalloc_mode} BASICS_DEPENDENCY_LINK_MODE=${dependency_link_mode} BASICS_SANITIZER_MODE=${variant_sanitizer_mode}"
+  echo "==> [${compiler_label}] BASICS_MIMALLOC_MODE=${mimalloc_mode} BASICS_DEPENDENCY_LINK_MODE=${dependency_link_mode} BASICS_ENABLE_TIDESDB=${tidesdb_mode} BASICS_SANITIZER_MODE=${variant_sanitizer_mode}"
 
   rm -rf "${build_dir}"
 
@@ -93,6 +94,7 @@ run_variant() {
     -B "${build_dir}"
     -DBASICS_MIMALLOC_MODE="${mimalloc_mode}"
     -DBASICS_DEPENDENCY_LINK_MODE="${dependency_link_mode}"
+    -DBASICS_ENABLE_TIDESDB="${tidesdb_mode}"
     -DBASICS_SANITIZER_MODE="${variant_sanitizer_mode}"
   )
 
@@ -118,6 +120,7 @@ run_variant() {
 if [[ ${matrix_mode} -eq 1 ]]; then
   mimalloc_modes=(NONE OBJECT STATIC SHARED)
   dependency_link_modes=(STATIC SHARED)
+  tidesdb_modes=(OFF ON)
 
   for compiler_index in "${!compiler_bins[@]}"; do
     compiler_bin="${compiler_bins[compiler_index]}"
@@ -125,15 +128,17 @@ if [[ ${matrix_mode} -eq 1 ]]; then
 
     for mimalloc_mode in "${mimalloc_modes[@]}"; do
       for dependency_link_mode in "${dependency_link_modes[@]}"; do
-        build_dir="${matrix_build_root}/${compiler_label}/${mimalloc_mode,,}-${dependency_link_mode,,}"
-        run_variant "${build_dir}" "${compiler_bin}" "${compiler_label}" "${mimalloc_mode}" "${dependency_link_mode}"
+        for tidesdb_mode in "${tidesdb_modes[@]}"; do
+          build_dir="${matrix_build_root}/${compiler_label}/${mimalloc_mode,,}-${dependency_link_mode,,}-tidesdb-${tidesdb_mode,,}"
+          run_variant "${build_dir}" "${compiler_bin}" "${compiler_label}" "${mimalloc_mode}" "${dependency_link_mode}" "${tidesdb_mode}"
+        done
       done
     done
   done
 else
   if [[ "${sanitizer_mode}" == "ASAN_UBSAN" ]]; then
-    run_variant "${sanitizer_build_dir}" "${compiler_bins[0]}" "${compiler_labels[0]}" NONE STATIC "${sanitizer_mode}"
+    run_variant "${sanitizer_build_dir}" "${compiler_bins[0]}" "${compiler_labels[0]}" NONE STATIC OFF "${sanitizer_mode}"
   else
-    run_variant "${quick_build_dir}" "${compiler_bins[0]}" "${compiler_labels[0]}" OBJECT STATIC "${sanitizer_mode}"
+    run_variant "${quick_build_dir}" "${compiler_bins[0]}" "${compiler_labels[0]}" OBJECT STATIC OFF "${sanitizer_mode}"
   fi
 fi

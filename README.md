@@ -22,7 +22,7 @@ Sanitizer lane:
 bash ./tests/run.sh --sanitizers
 ```
 
-Full supported matrix:
+Full supported matrix across `BASICS_MIMALLOC_MODE`, `BASICS_DEPENDENCY_LINK_MODE`, and `BASICS_ENABLE_TIDESDB`:
 
 ```bash
 bash ./tests/run.sh --matrix

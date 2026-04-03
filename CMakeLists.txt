@@ -14,6 +14,7 @@ set(BASICS_DEPENDENCY_LINK_MODE "" CACHE STRING "Explicit preferred direct depen
 set_property(CACHE BASICS_DEPENDENCY_LINK_MODE PROPERTY STRINGS STATIC SHARED)
 set(BASICS_SANITIZER_MODE "NONE" CACHE STRING "Optional sanitizer mode for basics test targets: NONE or ASAN_UBSAN")
 set_property(CACHE BASICS_SANITIZER_MODE PROPERTY STRINGS NONE ASAN_UBSAN)
+option(BASICS_ENABLE_TIDESDB "Include the optional TidesDB wrapper and dependency in the generated basics package surface" OFF)
 
 file(GLOB _basics_dependency_depofiles CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/depofiles/*.DepoFile")
 list(SORT _basics_dependency_depofiles)
@@ -32,7 +33,19 @@ function(_basics_prepare_self_depofile out_var)
 
   string(TOLOWER "${_basics_mimalloc_mode}" _basics_mimalloc_mode_suffix)
   string(TOLOWER "${_basics_dependency_link_mode}" _basics_dependency_link_mode_suffix)
-  set(BASICS_SELF_PACKAGE_NAME "basics_mimalloc_${_basics_mimalloc_mode_suffix}_deps_${_basics_dependency_link_mode_suffix}")
+  if (BASICS_ENABLE_TIDESDB)
+    set(_basics_tidesdb_variant_suffix "on")
+    set(BASICS_SELF_TIDESDB_ENABLED "ON")
+    set(BASICS_SELF_TIDESDB_DEPENDS "DEPENDS tidesdb VERSION 8.6.2")
+    set(BASICS_SELF_TIDESDB_LINK " tidesdb::tidesdb")
+  else()
+    set(_basics_tidesdb_variant_suffix "off")
+    set(BASICS_SELF_TIDESDB_ENABLED "OFF")
+    set(BASICS_SELF_TIDESDB_DEPENDS "")
+    set(BASICS_SELF_TIDESDB_LINK "")
+  endif()
+
+  set(BASICS_SELF_PACKAGE_NAME "basics_mimalloc_${_basics_mimalloc_mode_suffix}_deps_${_basics_dependency_link_mode_suffix}_tidesdb_${_basics_tidesdb_variant_suffix}")
   set(BASICS_SELF_MIMALLOC_MODE "${_basics_mimalloc_mode}")
   set(BASICS_SELF_DEPENDENCY_LINK_MODE "${_basics_dependency_link_mode}")
   if (_basics_dependency_link_mode STREQUAL "STATIC")
@@ -43,7 +56,7 @@ function(_basics_prepare_self_depofile out_var)
     message(FATAL_ERROR "Unsupported BASICS_DEPENDENCY_LINK_MODE='${BASICS_DEPENDENCY_LINK_MODE}'. Expected STATIC or SHARED.")
   endif()
 
-  set(BASICS_SELF_DIRECT_DEPENDENCY_LINKS "SG14::SG14 aegis::aegis bitsery::bitsery gxhash::gxhash itoa::itoa libbpf::libbpf libcurl::libcurl libssh2::libssh2 zlib::zlib ${BASICS_SELF_LIBURING_LINK} nghttp2::nghttp2 openssl simdjson::simdjson static_type_info::static_type_info")
+  set(BASICS_SELF_DIRECT_DEPENDENCY_LINKS "SG14::SG14 aegis::aegis bitsery::bitsery gxhash::gxhash itoa::itoa libbpf::libbpf libcurl::libcurl libssh2::libssh2 zlib::zlib ${BASICS_SELF_LIBURING_LINK} nghttp2::nghttp2 openssl simdjson::simdjson static_type_info::static_type_info${BASICS_SELF_TIDESDB_LINK}")
 
   set(_basics_self_root "${CMAKE_BINARY_DIR}/.deps/basics-self")
   set(_basics_payload_root "${_basics_self_root}/payload")
@@ -54,7 +67,12 @@ function(_basics_prepare_self_depofile out_var)
   file(REMOVE_RECURSE "${_basics_self_root}")
   file(MAKE_DIRECTORY "${_basics_include_root}")
 
-  foreach(_basics_public_dir IN ITEMS base ebpf enums macros networking services types)
+  set(_basics_public_dirs base ebpf enums macros networking services types)
+  if (BASICS_ENABLE_TIDESDB)
+    list(APPEND _basics_public_dirs databases)
+  endif()
+
+  foreach(_basics_public_dir IN LISTS _basics_public_dirs)
     file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/${_basics_public_dir}" DESTINATION "${_basics_include_root}")
   endforeach()
   file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/includes.h" DESTINATION "${_basics_include_root}")
@@ -129,6 +147,15 @@ string(TOUPPER "${BASICS_MIMALLOC_MODE}" _basics_selected_mimalloc_mode)
 set(_basics_effective_depofiles ${_basics_dependency_depofiles})
 if (_basics_selected_mimalloc_mode STREQUAL "NONE")
   list(REMOVE_ITEM _basics_effective_depofiles "${CMAKE_CURRENT_SOURCE_DIR}/depofiles/mimalloc.DepoFile")
+endif()
+if (NOT BASICS_ENABLE_TIDESDB)
+  list(REMOVE_ITEM
+    _basics_effective_depofiles
+    "${CMAKE_CURRENT_SOURCE_DIR}/depofiles/lz4.DepoFile"
+    "${CMAKE_CURRENT_SOURCE_DIR}/depofiles/snappy.DepoFile"
+    "${CMAKE_CURRENT_SOURCE_DIR}/depofiles/tidesdb.DepoFile"
+    "${CMAKE_CURRENT_SOURCE_DIR}/depofiles/zstd.DepoFile"
+  )
 endif()
 
 _basics_validate_depofile_versions(${_basics_dependency_depofiles} "${CMAKE_CURRENT_SOURCE_DIR}/depofiles/basics.DepoFile.in")
@@ -280,6 +307,7 @@ add_test(
     "${CMAKE_COMMAND}"
       "-DBASICS_REPO_ROOT=${CMAKE_CURRENT_SOURCE_DIR}"
       "-DBASICS_PACKAGE_DEPOFILE=${_basics_self_depofile}"
+      "-DBASICS_DOWNSTREAM_ENABLE_TIDESDB=$<IF:$<BOOL:${BASICS_ENABLE_TIDESDB}>,ON,OFF>"
       "-DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/downstream-package-consumer"
       "-DEXPECT_MIMALLOC_OBJECT_INTERPOSITION=$<IF:$<STREQUAL:${_basics_selected_mimalloc_mode},OBJECT>,ON,OFF>"
       "-DGENERATOR=${CMAKE_GENERATOR}"
@@ -287,5 +315,16 @@ add_test(
       "-DCMAKE_BUILD_TYPE_VALUE=${CMAKE_BUILD_TYPE}"
       "-DCMAKE_MAKE_PROGRAM_VALUE=${CMAKE_MAKE_PROGRAM}"
       "-DDEPOS_EXECUTABLE_VALUE=${DEPOS_EXECUTABLE}"
+      "-DDEPOS_ROOT_VALUE=${DEPOS_ROOT}"
+      "-DDEPOS_BOOTSTRAP_DIR_VALUE=${DEPOS_BOOTSTRAP_DIR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_downstream_consumer.cmake"
+)
+
+add_test(
+  NAME basics_tidesdb_package_contract
+  COMMAND
+    "${CMAKE_COMMAND}"
+      "-DBASICS_PACKAGE_DEPOFILE=${_basics_self_depofile}"
+      "-DEXPECT_TIDESDB=$<IF:$<BOOL:${BASICS_ENABLE_TIDESDB}>,ON,OFF>"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_tidesdb_package_contract.cmake"
 )
