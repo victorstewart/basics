@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <networking/ring.interfaces.h>
+#include <types/types.containers.h>
+#include <cstdlib>
+
 class RingMultiplexer : virtual public RingInterface, virtual public RingLifecycle {
 public:
 };
@@ -213,8 +217,8 @@ public:
   RingDispatcher()
   {
     dispatcher = this;
-    Ring::interfacer = this;
-    Ring::lifecycler = this;
+    ringInterfacer = this;
+    ringLifecycler = this;
   }
 };
 

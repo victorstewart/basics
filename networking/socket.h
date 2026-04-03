@@ -1,8 +1,12 @@
 // Copyright 2026 Victor Stewart
 // SPDX-License-Identifier: Apache-2.0
+#include <services/bitsery.h>
+#include <networking/time.h>
+#include <networking/ip.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
+#include <net/if.h>
 #include <netinet/udp.h>
 #include <sys/un.h>
 #include <linux/bpf.h>

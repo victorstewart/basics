@@ -4,6 +4,23 @@
 
 #include "types/types.containers.h"
 
+struct ForeignByteKey {
+
+  const uint8_t *data = nullptr;
+  uint64_t size = 0;
+};
+
+template <>
+struct byte_string_view_traits<ForeignByteKey> {
+
+  constexpr static bool enabled = true;
+
+  static ByteStringView view(const ForeignByteKey& key)
+  {
+    return ByteStringView {key.data, key.size};
+  }
+};
+
 namespace {
 
 struct HashableKey {
@@ -61,6 +78,10 @@ static void testNoncryptoHasher(TestSuite& suite)
 
   HashableKey hashable {77};
   EXPECT_EQ(suite, hasher(hashable), size_t(hashable.hash()));
+
+  ForeignByteKey foreignAlpha {reinterpret_cast<const uint8_t *>("alpha"), 5};
+  ForeignByteKey foreignAlphaCopy {reinterpret_cast<const uint8_t *>("alpha"), 5};
+  EXPECT_EQ(suite, hasher(foreignAlpha), hasher(foreignAlphaCopy));
 }
 
 static void testKeysAreEqual(TestSuite& suite)
@@ -80,6 +101,16 @@ static void testKeysAreEqual(TestSuite& suite)
   constexpr auto alphaCtv = "alpha"_ctv;
   constexpr auto alphaCtvCopy = "alpha"_ctv;
   EXPECT_TRUE(suite, equal(alphaCtv, alphaCtvCopy));
+  EXPECT_TRUE(suite, alpha == alphaCopy);
+  EXPECT_FALSE(suite, alpha == beta);
+  EXPECT_TRUE(suite, alpha == "alpha"_ctv);
+  EXPECT_TRUE(suite, "alpha"_ctv == alpha);
+  EXPECT_TRUE(suite, alphaCtv == alpha);
+
+  ForeignByteKey foreignAlpha {reinterpret_cast<const uint8_t *>("alpha"), 5};
+  ForeignByteKey foreignBeta {reinterpret_cast<const uint8_t *>("beta"), 4};
+  EXPECT_TRUE(suite, equal(foreignAlpha, foreignAlpha));
+  EXPECT_FALSE(suite, equal(foreignAlpha, foreignBeta));
 
   int left = 5;
   int leftCopy = 5;

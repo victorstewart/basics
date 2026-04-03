@@ -14,60 +14,6 @@
 #include "networking/pool.h"
 #include "networking/timerwheel.h"
 #include "networking/coroutinestack.h"
-
-struct io_uring_recvmsg_out;
-
-class TimeoutPacket;
-
-class TimeoutDispatcher {
-public:
-  virtual ~TimeoutDispatcher() = default;
-  virtual void dispatchTimeout(TimeoutPacket *packet) = 0;
-};
-
-class TimeoutPacket {
-public:
-  void *originator = nullptr;
-  TimeoutDispatcher *dispatcher = nullptr;
-};
-
-class RingLifecycle {
-public:
-  virtual ~RingLifecycle() = default;
-  virtual void beforeRing(void) {}
-  virtual void afterRing(void) {}
-  virtual bool signalHandler(const struct signalfd_siginfo&)
-  {
-    return true;
-  }
-};
-
-class RingInterface {
-public:
-  virtual ~RingInterface() = default;
-  virtual void waitidHandler(void *) {}
-  virtual void timeoutHandler(TimeoutPacket *, int) {}
-  virtual void acceptHandler(void *, int) {}
-  virtual void acceptMultishotHandler(void *, int, bool) {}
-  virtual void closeHandler(void *) {}
-  virtual void connectHandler(void *, int) {}
-  virtual void tcpFastOpenHandler(void *, int) {}
-  virtual void recvHandler(void *, int) {}
-  virtual void recvmsgHandler(void *, struct msghdr *, int) {}
-  virtual void recvmsgMultishotHandler(void *, struct io_uring_recvmsg_out *, int, bool) {}
-  virtual void sendHandler(void *, int) {}
-  virtual void sendmsgHandler(void *, struct msghdr *, int) {}
-  virtual void shutdownHandler(void *) {}
-  virtual void pollHandler(void *, int) {}
-  virtual void restartMultishotRecvMsgOn(void *) {}
-};
-
-class Ring {
-public:
-  static inline RingInterface *interfacer = nullptr;
-  static inline RingLifecycle *lifecycler = nullptr;
-};
-
 #include "networking/multiplexer.h"
 
 namespace {
@@ -185,16 +131,16 @@ struct DispatcherScope {
 
   DispatcherScope()
       : savedDispatcher(RingDispatcher::dispatcher),
-        savedInterfacer(Ring::interfacer),
-        savedLifecycler(Ring::lifecycler)
+        savedInterfacer(ringInterfacer),
+        savedLifecycler(ringLifecycler)
   {
   }
 
   ~DispatcherScope()
   {
     RingDispatcher::dispatcher = savedDispatcher;
-    Ring::interfacer = savedInterfacer;
-    Ring::lifecycler = savedLifecycler;
+    ringInterfacer = savedInterfacer;
+    ringLifecycler = savedLifecycler;
   }
 };
 
@@ -434,8 +380,8 @@ static void testRingDispatcherRoutesHandlers(TestSuite& suite)
 {
   DispatcherScope scope;
   EXPECT_TRUE(suite, RingDispatcher::dispatcher == &scope.localDispatcher);
-  EXPECT_TRUE(suite, Ring::interfacer == &scope.localDispatcher);
-  EXPECT_TRUE(suite, Ring::lifecycler == &scope.localDispatcher);
+  EXPECT_TRUE(suite, ringInterfacer == &scope.localDispatcher);
+  EXPECT_TRUE(suite, ringLifecycler == &scope.localDispatcher);
 
   RecordingRingInterface interfaceTarget;
   RecordingMultiplexer multiplexer;

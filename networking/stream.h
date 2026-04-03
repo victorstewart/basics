@@ -1,6 +1,8 @@
 // Copyright 2026 Victor Stewart
 // SPDX-License-Identifier: Apache-2.0
+#include <services/crypto.h>
 #include <base/traits.h>
+#include <networking/socket.h>
 #include <cstring>
 #include <limits>
 #include <time.h>

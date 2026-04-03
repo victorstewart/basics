@@ -460,6 +460,34 @@ public:
   }
 
   template <typename T>
+  static bool deserializeSafe(const uint8_t *buffer, const uint8_t *terminal, T&& object)
+  {
+    if (likely(terminal > buffer))
+    {
+      Context context;
+      SafeDeserializer deserializer(context, buffer, terminal - buffer);
+      deserializer.object(object);
+      return deserializer.adapter().isCompletedSuccessfully();
+    }
+
+    return false;
+  }
+
+  template <typename BufferLike, typename T>
+  requires (ByteViewableType<BufferLike> && !decay_equiv_v<BufferLike, String>)
+  static bool deserializeSafe(BufferLike&& buffer, T&& object)
+  {
+    const ByteStringView view = basics_byte_string_view(buffer);
+
+    if (view.data != nullptr)
+    {
+      return deserializeSafe(view.data, view.data + view.size, std::forward<T>(object));
+    }
+
+    return false;
+  }
+
+  template <typename T>
   static bool deserialize(const uint8_t *buffer, const uint8_t *terminal, T&& object)
   {
     reusableBufferView.setInvariant(buffer, terminal - buffer);
@@ -467,7 +495,7 @@ public:
   }
 
   template <typename BufferLike, typename T>
-  requires (ByteStringViewType<BufferLike>)
+  requires (ByteViewableType<BufferLike>)
   static bool deserialize(BufferLike&& buffer, T&& object)
   {
     const ByteStringView view = basics_byte_string_view(buffer);

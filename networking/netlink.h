@@ -15,6 +15,9 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
+#include <networking/msg.h>
+#include <networking/pool.h>
+#include <networking/socket.h>
 #include <ebpf/program.h>
 
 #pragma once

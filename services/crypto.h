@@ -1,6 +1,7 @@
 // Copyright 2026 Victor Stewart
 // SPDX-License-Identifier: Apache-2.0
 // #include <argon2/argon2.h>
+#include <includes.h>
 #include <cstring>
 #include <type_traits>
 #include <openssl/rand.h>

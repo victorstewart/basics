@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <services/bitsery.h>
+#include <services/filesystem.h>
+
 enum class ArgumentNature : uint8_t {
 
   variable,

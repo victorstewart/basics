@@ -7,6 +7,8 @@
 #include <networking/multiplexer.h>
 #include <networking/socket.h>
 #include <networking/time.h>
+#include <services/time.h>
+#include <macros/bytes.h>
 #include <libssh2/libssh2.h>
 #include <libssh2/libssh2_sftp.h>
 

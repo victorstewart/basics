@@ -4,6 +4,23 @@
 
 #include "services/bitsery.h"
 
+struct ForeignBufferView {
+
+  const uint8_t *data = nullptr;
+  uint64_t size = 0;
+};
+
+template <>
+struct byte_string_view_traits<ForeignBufferView> {
+
+  constexpr static bool enabled = true;
+
+  static ByteStringView view(const ForeignBufferView& buffer)
+  {
+    return ByteStringView {buffer.data, buffer.size};
+  }
+};
+
 namespace {
 
 struct FixedBinaryBlob {
@@ -103,6 +120,18 @@ static void testStringRoundTripAndFailures(TestSuite& suite)
   expectInflatedPrefixSizeFails(suite, source);
 }
 
+static void testExternalByteViewDeserialize(TestSuite& suite)
+{
+  String source("foreign-buffer");
+  String serialized = serializeObject(suite, source);
+
+  ForeignBufferView view {serialized.data(), serialized.size()};
+
+  String decoded;
+  EXPECT_TRUE(suite, BitseryEngine::deserializeSafe(view, decoded));
+  EXPECT_STRING_EQ(suite, decoded, source);
+}
+
 static void testVectorRoundTripAndFailures(TestSuite& suite)
 {
   Vector<uint32_t> source;
@@ -191,6 +220,7 @@ int main()
 
   testFixedBinarySequenceRoundTrip(suite);
   testStringRoundTripAndFailures(suite);
+  testExternalByteViewDeserialize(suite);
   testVectorRoundTripAndFailures(suite);
   testBytellHashMapRoundTripAndFailures(suite);
   testBytellHashSetRoundTripAndFailures(suite);

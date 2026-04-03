@@ -71,7 +71,7 @@ template <typename T> concept isEqualityComparable = hasEqualsMethod<T> || hasEq
 
 template <Hasher::SeedPolicy seedPolicy>
 struct noncrypto_hasher_with_policy {
-  template <typename T> requires (ByteStringViewType<T>)
+  template <typename T> requires (ByteViewableType<T>)
   size_t operator()(const T& key) const
   {
     const ByteStringView view = basics_byte_string_view(key);
@@ -93,7 +93,7 @@ struct noncrypto_hasher_with_policy {
   }
 
   template <typename T>
-  requires (isHashable<T> && !ByteStringViewType<T> && !Integral<T> && !Pointer<T>)
+  requires (isHashable<T> && !ByteViewableType<T> && !Integral<T> && !Pointer<T>)
   size_t operator()(const T& key) const
   {
     return key.hash();
@@ -117,7 +117,7 @@ struct keys_are_equal {
   //    return lhs == rhs;
   // }
 
-  template <typename T> requires (ByteStringViewType<T>)
+  template <typename T> requires (ByteViewableType<T>)
   bool operator()(const T& lhs, const T& rhs) const
   {
     const ByteStringView left = basics_byte_string_view(lhs);
@@ -137,14 +137,14 @@ struct keys_are_equal {
   }
 
   template <typename T>
-  requires (hasEqualsMethod<T> && !ByteStringViewType<T>)
+  requires (hasEqualsMethod<T> && !ByteViewableType<T>)
   bool operator()(const T& lhs, const T& rhs) const
   {
     return lhs.equals(rhs);
   }
 
   template <typename T>
-  requires (!hasEqualsMethod<T> && hasEqualOperator<T> && !ByteStringViewType<T>)
+  requires (!hasEqualsMethod<T> && hasEqualOperator<T> && !ByteViewableType<T>)
   bool operator()(const T& lhs, const T& rhs) const
   {
     return lhs == rhs;

@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <services/time.h>
+#include <networking/time.h>
+#include <networking/socket.h>
+#include <networking/ring.h>
+
 class Reconnector : public virtual SocketBase {
 public:
 

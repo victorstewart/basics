@@ -317,6 +317,17 @@ static ByteStringView basics_byte_string_view(T&& string)
   return byte_string_view_traits<std::remove_cvref_t<T>>::view(string);
 }
 
+template <typename T> requires (StringType<T> && !ByteStringViewType<T>)
+static ByteStringView basics_byte_string_view(T&& string)
+{
+  return ByteStringView {reinterpret_cast<const uint8_t *>(string.data()), static_cast<uint64_t>(string.size())};
+}
+
+template <typename T>
+concept ByteViewableType = requires (const std::remove_reference_t<T>& string) {
+  { basics_byte_string_view(string) } -> std::same_as<ByteStringView>;
+};
+
 template <typename T> concept SimdjsonObject = requires (T string) { string.get_raw_json_string(); };
 
 template <typename T, typename U>
@@ -2152,28 +2163,6 @@ public:
 
 using CompileTimeStringFormatter2 = String::CompileTimeStringFormatter;
 
-template <>
-struct byte_string_view_traits<String> {
-
-  constexpr static bool enabled = true;
-
-  static ByteStringView view(const String& string)
-  {
-    return ByteStringView {string.data(), string.size()};
-  }
-};
-
-template <char... Chars>
-struct byte_string_view_traits<CompileTimeStringView<Chars...>> {
-
-  constexpr static bool enabled = true;
-
-  static ByteStringView view(const CompileTimeStringView<Chars...>& string)
-  {
-    return ByteStringView {reinterpret_cast<const uint8_t *>(string.data()), string.size()};
-  }
-};
-
 template <typename T> concept StringDescendent = std::is_base_of_v<String, typeof_unqual_t<T>>;
 
 // so we can use the array new operator
@@ -2297,13 +2286,17 @@ CompileTimeStringView<Chars...>::operator String() const
   return String((uint8_t *)string, length);
 }
 
-static bool operator==(const StringType auto& lhs, const StringType auto& rhs)
+template <typename A, typename B>
+requires (StringType<A> && StringType<B> && !CompileTimeStringViewType<A> && !CompileTimeStringViewType<B>)
+static bool operator==(const A& lhs, const B& rhs)
 {
   // lhs.equal(rhs);
   return (lhs.size() == rhs.size()) && ((lhs.data() == rhs.data()) || (lhs.size() == 0) || (memcmp(lhs.data(), rhs.data(), lhs.size()) == 0));
 }
 
-static bool operator!=(const StringType auto& lhs, const StringType auto& rhs)
+template <typename A, typename B>
+requires (StringType<A> && StringType<B> && !CompileTimeStringViewType<A> && !CompileTimeStringViewType<B>)
+static bool operator!=(const A& lhs, const B& rhs)
 {
   return !lhs.equal(rhs);
 }

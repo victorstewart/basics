@@ -1,5 +1,6 @@
 // Copyright 2026 Victor Stewart
 // SPDX-License-Identifier: Apache-2.0
+#include <macros/bytes.h>
 #pragma once
 
 template <uint32_t CONTROL_LEN, uint32_t PAYLOAD_LEN>

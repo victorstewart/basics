@@ -1,5 +1,7 @@
 // Copyright 2026 Victor Stewart
 // SPDX-License-Identifier: Apache-2.0
+#include <networking/includes.h>
+#include <services/filesystem.h>
 #include <execinfo.h>
 #include <ucontext.h>
 #include <cxxabi.h>
