@@ -1,7 +1,7 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
 NAME @BASICS_SELF_PACKAGE_NAME@
-VERSION 0.1.0
+VERSION 0.2.0
 # mimalloc mode: @BASICS_SELF_MIMALLOC_MODE@
 # preferred direct dependency linkage: @BASICS_SELF_DEPENDENCY_LINK_MODE@
 # tidesdb support: @BASICS_SELF_TIDESDB_ENABLED@
