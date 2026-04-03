@@ -4,9 +4,10 @@
 
 `basics` is my personal C++20 utility library.
 
-This repo is public for source visibility and collaboration, but it is not a supported public package and no external adoption surface is promised.
-
-It builds through CMake with `depos`-managed dependencies.
+It builds through CMake with `depos`-managed dependencies. Release tags publish a detached
+`basics.DepoFile` asset alongside the GitHub source tarball so `depos 0.5.0+` consumers can
+download one depofile, fetch the source tarball, and let the embedded `depofiles/` tree resolve
+the full dependency graph.
 
 ## Build And Test
 
@@ -37,6 +38,14 @@ ctest --test-dir build --output-on-failure -j"$(nproc)"
 ```
 
 Other repo-owned workflows, including benchmarks and profiling, live under `tests/`.
+
+## Release Asset
+
+Generate the detached published release depofile for the current tagged version:
+
+```bash
+cmake -DOUTPUT="$PWD/.run/release-assets/basics.DepoFile" -P tools/generate_release_depofile.cmake
+```
 
 ## License
 

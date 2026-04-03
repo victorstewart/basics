@@ -9,28 +9,13 @@ include(CTest)
 
 option(BASICS_DOWNSTREAM_ENABLE_TIDESDB "Require the optional TidesDB basics package surface in the downstream smoke consumer" OFF)
 
-if (NOT DEFINED BASICS_REPO_ROOT OR "${BASICS_REPO_ROOT}" STREQUAL "")
-  message(FATAL_ERROR "BASICS_REPO_ROOT must be provided to the downstream package smoke project.")
-endif()
-
 if (NOT DEFINED BASICS_PACKAGE_DEPOFILE OR "${BASICS_PACKAGE_DEPOFILE}" STREQUAL "")
   message(FATAL_ERROR "BASICS_PACKAGE_DEPOFILE must be provided to the downstream package smoke project.")
 endif()
 
-include("${BASICS_REPO_ROOT}/.depos.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/../../.depos.cmake")
 
-file(GLOB _basics_dependency_depofiles CONFIGURE_DEPENDS "${BASICS_REPO_ROOT}/depofiles/*.DepoFile")
-list(SORT _basics_dependency_depofiles)
-if (NOT BASICS_DOWNSTREAM_ENABLE_TIDESDB)
-  list(REMOVE_ITEM
-    _basics_dependency_depofiles
-    "${BASICS_REPO_ROOT}/depofiles/lz4.DepoFile"
-    "${BASICS_REPO_ROOT}/depofiles/snappy.DepoFile"
-    "${BASICS_REPO_ROOT}/depofiles/tidesdb.DepoFile"
-    "${BASICS_REPO_ROOT}/depofiles/zstd.DepoFile"
-  )
-endif()
-depos_depend(FILES ${_basics_dependency_depofiles} "${BASICS_PACKAGE_DEPOFILE}")
+depos_depend("${BASICS_PACKAGE_DEPOFILE}")
 
 add_executable(basics_downstream_package_smoke main.cpp)
 target_compile_features(basics_downstream_package_smoke PRIVATE cxx_std_20)

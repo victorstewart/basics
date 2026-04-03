@@ -1,9 +1,5 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
-if (NOT DEFINED BASICS_REPO_ROOT OR "${BASICS_REPO_ROOT}" STREQUAL "")
-  message(FATAL_ERROR "BASICS_REPO_ROOT is required.")
-endif()
-
 if (NOT DEFINED BASICS_PACKAGE_DEPOFILE OR "${BASICS_PACKAGE_DEPOFILE}" STREQUAL "")
   message(FATAL_ERROR "BASICS_PACKAGE_DEPOFILE is required.")
 endif()
@@ -12,14 +8,13 @@ if (NOT DEFINED BUILD_DIR OR "${BUILD_DIR}" STREQUAL "")
   message(FATAL_ERROR "BUILD_DIR is required.")
 endif()
 
-set(_downstream_source_dir "${BASICS_REPO_ROOT}/tests/downstream_package")
+set(_downstream_source_dir "${CMAKE_CURRENT_LIST_DIR}/downstream_package")
 
 file(REMOVE_RECURSE "${BUILD_DIR}")
 
 set(_configure_args
   -S "${_downstream_source_dir}"
   -B "${BUILD_DIR}"
-  "-DBASICS_REPO_ROOT=${BASICS_REPO_ROOT}"
   "-DBASICS_PACKAGE_DEPOFILE=${BASICS_PACKAGE_DEPOFILE}"
 )
 
