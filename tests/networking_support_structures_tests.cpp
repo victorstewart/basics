@@ -786,6 +786,78 @@ static void testKeepaliveTimeoutClampsTcpUserTimeoutFloor(TestSuite& suite)
   socket.close();
 }
 
+struct FixedFileSlotFixture
+{
+  explicit FixedFileSlotFixture(uint32_t capacity = 512, uint32_t reserveLimit = 256)
+      : previousFixedFiles(Ring::fixedfiles),
+        previousCapacity(Ring::fixedFileCapacity),
+        previousReserveLimit(Ring::fixedFileReserveLimit),
+        previousRegistered(Ring::fixedFilesWereRegistered),
+        previousVacantReserved(std::move(Ring::vacantFixedFileSlots)),
+        previousVacantAccepted(std::move(Ring::vacantAcceptedFixedFileSlots)),
+        previousFdToRingSlot(std::move(Ring::fdToRingSlot))
+  {
+    Ring::fixedfiles = new int[capacity];
+    Ring::fixedFileCapacity = capacity;
+    Ring::fixedFileReserveLimit = reserveLimit;
+    Ring::fixedFilesWereRegistered = false;
+    memset(Ring::fixedfiles, 0xff, sizeof(int) * capacity);
+
+    Ring::vacantFixedFileSlots.clear();
+    Ring::vacantAcceptedFixedFileSlots.clear();
+    Ring::fdToRingSlot.clear();
+
+    for (uint32_t index = 1; index < reserveLimit; ++index)
+    {
+      Ring::vacantFixedFileSlots.insert(int(index));
+    }
+
+    for (uint32_t index = reserveLimit; index < capacity; ++index)
+    {
+      Ring::vacantAcceptedFixedFileSlots.insert(int(index));
+    }
+  }
+
+  ~FixedFileSlotFixture()
+  {
+    delete[] Ring::fixedfiles;
+    Ring::fixedfiles = previousFixedFiles;
+    Ring::fixedFileCapacity = previousCapacity;
+    Ring::fixedFileReserveLimit = previousReserveLimit;
+    Ring::fixedFilesWereRegistered = previousRegistered;
+    Ring::vacantFixedFileSlots = std::move(previousVacantReserved);
+    Ring::vacantAcceptedFixedFileSlots = std::move(previousVacantAccepted);
+    Ring::fdToRingSlot = std::move(previousFdToRingSlot);
+  }
+
+  int *previousFixedFiles = nullptr;
+  uint32_t previousCapacity = 0;
+  uint32_t previousReserveLimit = 0;
+  bool previousRegistered = false;
+  bytell_hash_set<int> previousVacantReserved = {};
+  bytell_hash_set<int> previousVacantAccepted = {};
+  bytell_hash_map<int, int> previousFdToRingSlot = {};
+};
+
+static void testFreshProcessFdAliasDoesNotUninstallOccupiedReservedSlot(TestSuite& suite)
+{
+  FixedFileSlotFixture fixture;
+
+  Ring::vacantFixedFileSlots.erase(177);
+  Ring::fixedfiles[177] = 41;
+
+  UnixStream stream;
+  stream.setUnixPairHalf(177);
+  stream.isFixedFile = false;
+
+  EXPECT_TRUE(suite, Ring::tryInstallFDIntoFixedFileSlot(&stream));
+  EXPECT_TRUE(suite, stream.isFixedFile);
+  EXPECT_TRUE(suite, stream.fslot > 0);
+  EXPECT_TRUE(suite, stream.fslot != 177);
+  EXPECT_EQ(suite, Ring::fixedfiles[177], 41);
+  EXPECT_EQ(suite, Ring::getFDFromFixedFileSlot(stream.fslot), 177);
+}
+
 } // namespace
 
 int main()
@@ -805,5 +877,6 @@ int main()
   testTrackedCloseCompletionIgnoresRetiredDuplicate(suite);
   testMissingMsghdrCompletionIsIgnored(suite);
   testKeepaliveTimeoutClampsTcpUserTimeoutFloor(suite);
+  testFreshProcessFdAliasDoesNotUninstallOccupiedReservedSlot(suite);
   return suite.finish("networking_support_structures_tests");
 }

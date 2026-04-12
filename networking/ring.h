@@ -1349,7 +1349,8 @@ public:
     // object while the new socket is still only a process fd. Reclaim that
     // reserved slot before installing the replacement fd so reconnect/TFO
     // fallback reuses its original slot instead of leaking the pool.
-    if (fixedfiles != nullptr &&
+    if (socket->isFixedFile &&
+        fixedfiles != nullptr &&
         socket->fslot > 0 &&
         static_cast<uint32_t>(socket->fslot) < fixedFileReserveLimit &&
         static_cast<uint32_t>(socket->fslot) < fixedFileCapacity &&
