@@ -19,8 +19,8 @@
 class RecvmsgMultishoter {
 public:
 
-  struct msghdr msgh;
-  uint32_t bgid;
+  struct msghdr msgh = {};
+  uint32_t bgid = 0;
 };
 
 class WaitableProcess {
@@ -32,11 +32,12 @@ public:
 class Ring {
 public:
 
-  enum class Operation : uint8_t {
+   enum class Operation : uint8_t {
 
-    signal,
-    recv,
-    recvmsg,
+      signal,
+      cancel,
+      recv,
+      recvmsg,
     recvmsgMultishot,
     accept,
     acceptMultishot,
@@ -94,7 +95,14 @@ private:
     alignas(uint64_t) uint8_t optval[32] = {0};
   };
 
-  static thread_local inline Pool<MsghdrPackage, true, false> msghdrPackagePool;
+  struct LinkTimeoutPackage {
+
+    void *socket = nullptr;
+    uint8_t generation = 0;
+    Operation linkedOp = Operation::timeout;
+  };
+
+  static thread_local inline Pool<MsghdrPackage, true, true> msghdrPackagePool;
   struct FileBufferPackage {
     int fslot;
     String *buf;
@@ -109,6 +117,8 @@ private:
 
   static thread_local inline bytell_hash_map<uint32_t, BufferRing> bufferRingsByBgid;
   static thread_local inline bytell_hash_map<void *, uint8_t> socketGenerationByIdentity;
+  static thread_local inline bytell_hash_map<void *, RecvmsgMultishoter *> recvmsgMultishoterByIdentity;
+  static thread_local inline bytell_hash_map<uint64_t, int> closeSlotByUserData;
 
   static uint8_t getTagFromUserData(uint64_t user_data)
   {
@@ -271,10 +281,14 @@ private:
   static void appendTimeoutMs(T *socket, uint64_t timeoutMs, Operation linkedOp)
   {
     socket->timeout.setTimeoutMs(timeoutMs);
+    LinkTimeoutPackage *package = new LinkTimeoutPackage();
+    package->socket = socketIdentity(socket);
+    package->generation = socket->ioGeneration;
+    package->linkedOp = linkedOp;
 
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_link_timeout(sqe, (struct __kernel_timespec *)&(socket->timeout), 0);
-    setUserData(sqe, Operation::linkTimeout, socketIdentity(socket), static_cast<uint8_t>(linkedOp));
+    setUserData(sqe, Operation::linkTimeout, package);
   }
 
 public:
@@ -341,16 +355,18 @@ public:
   // } __attribute__((packed));
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T> && std::is_base_of_v<RecvmsgMultishoter, T>)
-  static void queueRecvmsgMultishot(T *socket)
+  static void queueRecvmsgMultishot(T *socket, unsigned flags = 0)
   {
     requireFixedFileSocket(socket, "queueRecvmsgMultishot");
+    void *socketKey = socketIdentity(socket);
     noteSocketGeneration(socket);
+    recvmsgMultishoterByIdentity[socketKey] = static_cast<RecvmsgMultishoter *>(socket);
     struct io_uring_sqe *sqe = getSQESafe();
-    io_uring_prep_recvmsg_multishot(sqe, socket->fslot, &socket->msgh, 0);
+    io_uring_prep_recvmsg_multishot(sqe, socket->fslot, &socket->msgh, flags);
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT);
     sqe->buf_group = socket->bgid;
     sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
-    setUserData(sqe, Operation::recvmsgMultishot, socket, socket->ioGeneration);
+    setUserData(sqe, Operation::recvmsgMultishot, socketKey, socket->ioGeneration);
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T> && !std::is_base_of_v<RecvmsgMultishoter, T>)
@@ -539,7 +555,7 @@ public:
     requireFixedFileSocket(socket, "queueAcceptMultishot");
     noteSocketGeneration(socket);
     struct io_uring_sqe *sqe = getSQESafe();
-    io_uring_prep_multishot_accept_direct(sqe, socket->fslot, nullptr, nullptr, 0);
+    io_uring_prep_multishot_accept(sqe, socket->fslot, nullptr, nullptr, 0);
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
     setUserData(sqe, Operation::acceptMultishot, socket, socket->ioGeneration);
   }
@@ -550,10 +566,10 @@ public:
     requireFixedFileSocket(socket, "queueAccept");
     noteSocketGeneration(socket);
     struct io_uring_sqe *sqe = getSQESafe();
-    // accept_direct returns an io_uring direct descriptor, not a process fd.
-    // CLOEXEC is meaningless there and some kernels reject it with EINVAL.
-    int directAcceptFlags = (flags & ~SOCK_CLOEXEC);
-    io_uring_prep_accept_direct(sqe, socket->fslot, saddr, saddrlen, directAcceptFlags, IORING_FILE_INDEX_ALLOC);
+    // Accept into a process fd first, then adopt it into our dynamic fixed-file
+    // pool on completion. This keeps slot 0 and the reserved socket slots under
+    // local control even on kernels that ignore file-allocation ranges.
+    io_uring_prep_accept(sqe, socket->fslot, saddr, saddrlen, flags);
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
     setUserData(sqe, Operation::accept, socket, socket->ioGeneration);
   }
@@ -608,7 +624,12 @@ public:
   {
     struct io_uring_sqe *sqe = getSQESafe();
     void *socketKey = socketIdentity(socket);
+    if (isClosing.contains(socketKey))
+    {
+      return;
+    }
     bool hadPendingSend = socket->pendingSend;
+    int closeSlot = -1;
 
     // A fresh socket may be created/reused in closeHandler; clear operation guards now
     // so reconnect paths can re-arm recv/send deterministically on the next fd/fslot.
@@ -631,6 +652,7 @@ public:
     }
 
     isClosing.insert(socketKey);
+    closingGenerationByIdentity.insert_or_assign(socketKey, socket->ioGeneration);
 
     if (socket->isFixedFile)
     {
@@ -639,7 +661,7 @@ public:
         std::abort();
       }
 
-      closingObjectToSlot[socketKey] = socket->fslot;
+      closeSlot = socket->fslot;
       io_uring_prep_close_direct(sqe, socket->fslot);
       socket->fslot = -1;
       socket->isFixedFile = false;
@@ -656,7 +678,48 @@ public:
       socket->isFixedFile = false;
     }
 
-    setUserData(sqe, Operation::close, socketKey);
+    uint64_t userData = getUserDataFor(Operation::close, socketKey, socket->ioGeneration);
+    sqe->user_data = userData;
+    closeSlotByUserData.insert_or_assign(userData, closeSlot);
+  }
+
+  static bool shouldIgnoreMissingCloseCompletion(void *socketKey, uint8_t tag)
+  {
+    if (isClosing.contains(socketKey) == false)
+    {
+      return true;
+    }
+
+    auto closingIt = closingGenerationByIdentity.find(socketKey);
+    if (closingIt == closingGenerationByIdentity.end())
+    {
+      return false;
+    }
+
+    return (closingIt->second != tag);
+  }
+
+  static bool shouldIgnoreMissingMsghdrCompletion(MsghdrPackage *package)
+  {
+    return (package == nullptr || msghdrPackagePool.contains(package) == false);
+  }
+
+  static bool resolveTrackedCloseSlot(uint64_t user_data, void *socketKey, uint8_t tag, int& slot)
+  {
+    auto slotIt = closeSlotByUserData.find(user_data);
+    if (slotIt == closeSlotByUserData.end())
+    {
+      if (shouldIgnoreMissingCloseCompletion(socketKey, tag))
+      {
+        return false;
+      }
+
+      std::abort();
+    }
+
+    slot = slotIt->second;
+    closeSlotByUserData.erase(slotIt);
+    return true;
   }
 
   static void queueCloseRaw(int fslot) // maybe you accepted direct, but want to reject it
@@ -672,19 +735,21 @@ public:
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
-  static void queueCancel(T *socket, Operation op)
-  {
-    struct io_uring_sqe *sqe = getSQESafe();
-    io_uring_prep_cancel64(sqe, getUserDataFor(op, socketIdentity(socket), socket->ioGeneration), IORING_ASYNC_CANCEL_ANY);
-  }
+   static void queueCancel(T *socket, Operation op)
+   {
+      struct io_uring_sqe *sqe = getSQESafe();
+      io_uring_prep_cancel64(sqe, getUserDataFor(op, socketIdentity(socket), socket->ioGeneration), IORING_ASYNC_CANCEL_ANY);
+      setUserData(sqe, Operation::cancel, socketIdentity(socket), socket->ioGeneration);
+   }
 
-  template <typename T> requires (std::is_base_of_v<SocketBase, T>)
-  static void queueCancelAll(T *socket)
-  {
-    requireFixedFileSocket(socket, "queueCancelAll");
-    struct io_uring_sqe *sqe = getSQESafe();
-    io_uring_prep_cancel_fd(sqe, socket->fslot, IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED);
-  }
+   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
+   static void queueCancelAll(T *socket)
+   {
+      requireFixedFileSocket(socket, "queueCancelAll");
+      struct io_uring_sqe *sqe = getSQESafe();
+      io_uring_prep_cancel_fd(sqe, socket->fslot, IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED);
+      setUserData(sqe, Operation::cancel, socketIdentity(socket), socket->ioGeneration);
+   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
   static void queueShutdown(T *socket)
@@ -704,7 +769,7 @@ public:
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_poll_add(sqe, socket->fslot, poll_mask);
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
-    setUserData(sqe, Operation::poll, socket);
+    setUserData(sqe, Operation::poll, socket, socket->ioGeneration);
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
@@ -725,7 +790,7 @@ public:
       io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
     }
 
-    setUserData(sqe, Operation::poll, socket);
+    setUserData(sqe, Operation::poll, socket, socket->ioGeneration);
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
@@ -743,7 +808,7 @@ public:
     {
       io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
     }
-    setUserData(sqe, Operation::poll, socket);
+    setUserData(sqe, Operation::poll, socket, socket->ioGeneration);
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
@@ -768,7 +833,7 @@ public:
       io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
     }
 
-    setUserData(sqe, Operation::poll, socket);
+    setUserData(sqe, Operation::poll, socket, socket->ioGeneration);
   }
 
   static void queueRingMessage(uint32_t ringSlot, String *container)
@@ -821,23 +886,42 @@ private:
   static thread_local inline uint32_t fixedFileCapacity = 0;
   static thread_local inline uint32_t fixedFileReserveLimit = 0;
   static thread_local inline bytell_hash_set<int> vacantFixedFileSlots;
+  static thread_local inline bytell_hash_set<int> vacantAcceptedFixedFileSlots;
   static thread_local inline bytell_hash_set<void *> isClosing;
-  static thread_local inline bytell_hash_map<void *, int> closingObjectToSlot; // we need to access slot after it was type erased, and we set it to -1 in queueClose
+  static thread_local inline bytell_hash_map<void *, uint8_t> closingGenerationByIdentity;
 
   static thread_local inline bytell_hash_map<int, int> fdToRingSlot;
 
   static thread_local inline bool fixedFilesWereRegistered = false;
 
-  static int installFDIntoFixedFileSlot(int fd, bool relinquishProcessFD = true)
+  static int installFDIntoPool(int fd,
+                               bytell_hash_set<int>& vacantSlots,
+                               const char *slotPool,
+                               bool relinquishProcessFD = true)
   {
-    if (vacantFixedFileSlots.empty())
+    if (vacantSlots.empty())
     {
+      basics_log("Ring::installFDIntoPool no-vacant-slots pool=%s fd=%d fixedCapacity=%u reserveLimit=%u fixedRegistered=%d vacantReserved=%u vacantAccepted=%u\n",
+                 (slotPool ? slotPool : "unknown"),
+                 fd,
+                 fixedFileCapacity,
+                 fixedFileReserveLimit,
+                 int(fixedFilesWereRegistered),
+                 unsigned(vacantFixedFileSlots.size()),
+                 unsigned(vacantAcceptedFixedFileSlots.size()));
       return -1;
     }
 
-    int slot = vacantFixedFileSlots.pop();
+    int slot = vacantSlots.pop();
     if (slot < 0 || static_cast<uint32_t>(slot) >= fixedFileCapacity)
     {
+      basics_log("Ring::installFDIntoPool invalid-slot pool=%s fd=%d slot=%d fixedCapacity=%u reserveLimit=%u fixedRegistered=%d\n",
+                 (slotPool ? slotPool : "unknown"),
+                 fd,
+                 slot,
+                 fixedFileCapacity,
+                 fixedFileReserveLimit,
+                 int(fixedFilesWereRegistered));
       return -1;
     }
 
@@ -847,8 +931,16 @@ private:
       int result = io_uring_register_files_update(&ring, slot, &fixedfiles[slot], 1);
       if (result < 0)
       {
+        basics_log("Ring::installFDIntoPool register-files-update-failed pool=%s fd=%d slot=%d result=%d errno=%d fixedCapacity=%u reserveLimit=%u\n",
+                   (slotPool ? slotPool : "unknown"),
+                   fd,
+                   slot,
+                   result,
+                   errno,
+                   fixedFileCapacity,
+                   fixedFileReserveLimit);
         fixedfiles[slot] = -1;
-        vacantFixedFileSlots.insert(slot);
+        vacantSlots.insert(slot);
         return -1;
       }
     }
@@ -864,20 +956,31 @@ private:
     return slot;
   }
 
-  static void claimKernelAllocatedFixedSlot(int slot)
+  static int installFDIntoFixedFileSlot(int fd, bool relinquishProcessFD = true)
   {
-    if (slot < 0 || static_cast<uint32_t>(slot) >= fixedFileCapacity)
+    return installFDIntoPool(fd, vacantFixedFileSlots, "reserved", relinquishProcessFD);
+  }
+
+  static int installFDIntoAcceptedFixedFileSlot(int fd, bool relinquishProcessFD = true)
+  {
+    return installFDIntoPool(fd, vacantAcceptedFixedFileSlots, "accepted", relinquishProcessFD);
+  }
+
+  static int adoptAcceptedProcessFDIntoFixedFileSlot(int fd)
+  {
+    if (fd < 0)
     {
-      return;
+      return fd;
     }
 
-    // accept-direct may still allocate from reserved slots on kernels/configurations where
-    // file allocation ranges are unsupported or ignored. If that happens, remove the slot
-    // from our local reserved pool to prevent aliasing a future installFDIntoFixedFileSlot().
-    if (static_cast<uint32_t>(slot) < fixedFileReserveLimit)
+    int slot = installFDIntoAcceptedFixedFileSlot(fd);
+    if (slot >= 0)
     {
-      vacantFixedFileSlots.erase(slot);
+      return slot;
     }
+
+    ::close(fd);
+    return -ENFILE;
   }
 
 public:
@@ -929,20 +1032,41 @@ public:
   {
     // Explicitly tear down io_uring so fixed-file
     // references do not survive into the new binary and pin listener ports.
-    if (ring.ring_fd <= 0)
+    if (ring.ring_fd > 0)
     {
-      return;
+      if (fixedFilesWereRegistered)
+      {
+        io_uring_unregister_files(&ring);
+        fixedFilesWereRegistered = false;
+      }
+
+      io_uring_unregister_ring_fd(&ring);
+      io_uring_queue_exit(&ring);
+      ring.ring_fd = -1;
     }
 
-    if (fixedFilesWereRegistered)
+    for (auto& [bgid, bufferRing] : bufferRingsByBgid)
     {
-      io_uring_unregister_files(&ring);
-      fixedFilesWereRegistered = false;
+      (void)bgid;
+      if (bufferRing.ring != nullptr)
+      {
+        munmap(bufferRing.ring, (sizeof(struct io_uring_buf) + bufferRing.bufferSize) * bufferRing.count);
+      }
     }
+    bufferRingsByBgid.clear();
 
-    io_uring_unregister_ring_fd(&ring);
-    io_uring_queue_exit(&ring);
-    ring.ring_fd = -1;
+    delete[] fixedfiles;
+    fixedfiles = nullptr;
+    fixedFileCapacity = 0;
+    fixedFileReserveLimit = 0;
+    vacantFixedFileSlots.clear();
+    vacantAcceptedFixedFileSlots.clear();
+    isClosing.clear();
+    closingGenerationByIdentity.clear();
+    closeSlotByUserData.clear();
+    fdToRingSlot.clear();
+    socketGenerationByIdentity.clear();
+    memset(signals, 0xff, sizeof(signals));
   }
 
   static int getFDFromFixedFileSlot(int slot)
@@ -973,13 +1097,22 @@ public:
       return true;
     }
 
+    basics_log("Ring::bindSourceAddressBeforeFixedFileInstall bind-failed fd=%d errno=%d saddrLen=%u daddrLen=%u sFamily=%u dFamily=%u isFixed=%d fslot=%d\n",
+               socket->fd,
+               errno,
+               unsigned(socket->saddrLen),
+               unsigned(socket->daddrLen),
+               unsigned(socket->template saddr<struct sockaddr>()->sa_family),
+               unsigned(socket->template daddr<struct sockaddr>()->sa_family),
+               int(socket->isFixedFile),
+               socket->fslot);
     return false;
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
   static void uninstallFromFixedFileSlot(T *socket)
   {
-    if (socket->fslot < 0 || static_cast<uint32_t>(socket->fslot) >= fixedFileReserveLimit)
+    if (socket->fslot <= 0 || static_cast<uint32_t>(socket->fslot) >= fixedFileReserveLimit)
     {
       std::abort();
     }
@@ -992,17 +1125,84 @@ public:
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
-  static void installFDIntoFixedFileSlot(T *socket)
+  static bool tryInstallFDIntoFixedFileSlot(T *socket)
   {
-    bindSourceAddressBeforeFixedFileInstall(socket);
+    if (socket == nullptr)
+    {
+      return false;
+    }
+
+    if (fixedfiles == nullptr || fixedFileCapacity == 0)
+    {
+      socket->isFixedFile = false;
+      bool bound = bindSourceAddressBeforeFixedFileInstall(socket);
+      if (bound == false)
+      {
+        basics_log("Ring::tryInstallFDIntoFixedFileSlot no-fixedfiles-bind-failed fd=%d fslot=%d saddrLen=%u daddrLen=%u\n",
+                   socket->fd,
+                   socket->fslot,
+                   unsigned(socket->saddrLen),
+                   unsigned(socket->daddrLen));
+      }
+      return bound;
+    }
+
+    // Socket recreation can leave the previous reserved slot attached to this
+    // object while the new socket is still only a process fd. Reclaim that
+    // reserved slot before installing the replacement fd so reconnect/TFO
+    // fallback reuses its original slot instead of leaking the pool.
+    if (fixedfiles != nullptr &&
+        socket->fslot > 0 &&
+        static_cast<uint32_t>(socket->fslot) < fixedFileReserveLimit &&
+        static_cast<uint32_t>(socket->fslot) < fixedFileCapacity &&
+        fixedfiles[socket->fslot] != -1)
+    {
+      uninstallFromFixedFileSlot(socket);
+    }
+
+    if (bindSourceAddressBeforeFixedFileInstall(socket) == false)
+    {
+      basics_log("Ring::tryInstallFDIntoFixedFileSlot continuing-after-bind-failure fd=%d fslot=%d fixedCapacity=%u reserveLimit=%u fixedRegistered=%d vacantReserved=%u vacantAccepted=%u\n",
+                 socket->fd,
+                 socket->fslot,
+                 fixedFileCapacity,
+                 fixedFileReserveLimit,
+                 int(fixedFilesWereRegistered),
+                 unsigned(vacantFixedFileSlots.size()),
+                 unsigned(vacantAcceptedFixedFileSlots.size()));
+    }
     int slot = installFDIntoFixedFileSlot(socket->fd);
     if (slot < 0)
     {
-      std::abort();
+      basics_log("Ring::tryInstallFDIntoFixedFileSlot install-failed fd=%d fslot=%d isFixed=%d saddrLen=%u daddrLen=%u sFamily=%u dFamily=%u fixedCapacity=%u reserveLimit=%u fixedRegistered=%d vacantReserved=%u vacantAccepted=%u\n",
+                 socket->fd,
+                 socket->fslot,
+                 int(socket->isFixedFile),
+                 unsigned(socket->saddrLen),
+                 unsigned(socket->daddrLen),
+                 unsigned(socket->template saddr<struct sockaddr>()->sa_family),
+                 unsigned(socket->template daddr<struct sockaddr>()->sa_family),
+                 fixedFileCapacity,
+                 fixedFileReserveLimit,
+                 int(fixedFilesWereRegistered),
+                 unsigned(vacantFixedFileSlots.size()),
+                 unsigned(vacantAcceptedFixedFileSlots.size()));
+      socket->isFixedFile = false;
+      return false;
     }
 
     socket->fslot = slot;
     socket->isFixedFile = true;
+    return true;
+  }
+
+  template <typename T> requires (std::is_base_of_v<SocketBase, T>)
+  static void installFDIntoFixedFileSlot(T *socket)
+  {
+    if (tryInstallFDIntoFixedFileSlot(socket) == false)
+    {
+      std::abort();
+    }
   }
 
   static int registerSiblingRing(int ringFD) // maybe delete this
@@ -1040,12 +1240,16 @@ public:
 
     io_uring_buf_ring_init(bufferRing.ring);
 
-    struct io_uring_buf_reg buf_reg;
+    struct io_uring_buf_reg buf_reg = {};
     buf_reg.ring_addr = (unsigned long)bufferRing.ring;
     buf_reg.ring_entries = count;
     buf_reg.bgid = bgid;
 
-    io_uring_register_buf_ring(&ring, &buf_reg, 0);
+    int registerResult = io_uring_register_buf_ring(&ring, &buf_reg, 0);
+    if (registerResult != 0)
+    {
+      std::abort();
+    }
 
     for (uint32_t index = 0; index < count; index++)
     {
@@ -1110,6 +1314,13 @@ public:
     for (uint32_t index = 1; index < nReserveFixedFiles; index++)
     {
       vacantFixedFileSlots.insert(index);
+    }
+
+    // Accepted and other runtime-adopted sockets live in the dynamic pool above
+    // the explicitly reserved socket range.
+    for (uint32_t index = nReserveFixedFiles; index < nFixedFiles; index++)
+    {
+      vacantAcceptedFixedFileSlots.insert(index);
     }
     writeCreateRingStage("worker:ring-after-fixed-slot-init");
 
@@ -1209,12 +1420,6 @@ public:
     writeCreateRingStage("worker:ring-after-register-files");
 
     fixedFilesWereRegistered = true;
-
-    int registerFileAllocRange = io_uring_register_file_alloc_range(&ring, nReserveFixedFiles, nFixedFiles - nReserveFixedFiles);
-    if (registerFileAllocRange < 0)
-    {
-    }
-    writeCreateRingStage("worker:ring-after-register-file-range");
 
     if (lifecycler)
     {
@@ -1323,7 +1528,7 @@ public:
           case Operation::recvmsg:
             {
               MsghdrPackage *package = static_cast<MsghdrPackage *>(object);
-              if (package == nullptr)
+              if (shouldIgnoreMissingMsghdrCompletion(package))
               {
                 continue;
               }
@@ -1392,6 +1597,10 @@ public:
 
               break;
             }
+          case Operation::cancel:
+            {
+              break;
+            }
           case Operation::waitid:
             {
               if (result < 0)
@@ -1408,20 +1617,14 @@ public:
             }
           case Operation::accept:
             {
-              if (result >= 0)
-              {
-                claimKernelAllocatedFixedSlot(result);
-              }
+              result = adoptAcceptedProcessFDIntoFixedFileSlot(result);
               interfacer->acceptHandler(object, result);
               break;
             }
           case Operation::acceptMultishot:
             {
-              // ENFILE if no empty file slots
-              if (result >= 0)
-              {
-                claimKernelAllocatedFixedSlot(result);
-              }
+              // ENFILE if no empty dynamic fixed-file slots remain.
+              result = adoptAcceptedProcessFDIntoFixedFileSlot(result);
 
               interfacer->acceptMultishotHandler(object, result, !(cqe->flags & IORING_CQE_F_MORE));
               break;
@@ -1446,35 +1649,46 @@ public:
             }
           case Operation::linkTimeout:
             {
+              LinkTimeoutPackage *package = static_cast<LinkTimeoutPackage *>(object);
+              if (package == nullptr)
+              {
+                break;
+              }
 
               // Linked timeouts complete with -ECANCELED when the guarded operation
               // finishes in time. Only dispatch real timeout/error completions.
               if (result == -ECANCELED)
               {
+                delete package;
                 break;
               }
 
-              Operation linkedOp = static_cast<Operation>(tag);
-              switch (linkedOp)
+              if (isClosing.contains(package->socket) || socketGenerationMatches(package->socket, package->generation) == false)
+              {
+                delete package;
+                break;
+              }
+
+              switch (package->linkedOp)
               {
                 case Operation::connect:
                   {
-                    interfacer->connectHandler(object, result);
+                    interfacer->connectHandler(package->socket, result);
                     break;
                   }
                 case Operation::recv:
                   {
-                    interfacer->recvHandler(object, result);
+                    interfacer->recvHandler(package->socket, result);
                     break;
                   }
                 case Operation::send:
                   {
-                    interfacer->sendHandler(object, result);
+                    interfacer->sendHandler(package->socket, result);
                     break;
                   }
                 case Operation::poll:
                   {
-                    interfacer->pollHandler(object, result);
+                    interfacer->pollHandler(package->socket, result);
                     break;
                   }
                 default:
@@ -1482,36 +1696,45 @@ public:
                     break;
                   }
               }
+
+              delete package;
               break;
             }
           case Operation::close:
             {
-
-              if (isClosing.contains(object))
+              void *socketKey = object;
+              int slot = -1;
+              if (resolveTrackedCloseSlot(user_data, socketKey, tag, slot) == false)
               {
-                isClosing.erase(object);
-                auto it = closingObjectToSlot.find(object);
-                if (it != closingObjectToSlot.end())
-                {
-                  int slot = it->second;
-                  closingObjectToSlot.erase(it);
-                  if (slot < 0 || static_cast<uint32_t>(slot) >= fixedFileCapacity)
-                  {
-                    std::abort();
-                  }
-
-                  // Slots in the reserved range are managed by our local pool.
-                  // Slots in the allocator range come from io_uring accept-direct allocation and must not be pooled here.
-                  if (static_cast<uint32_t>(slot) < fixedFileReserveLimit)
-                  {
-                    vacantFixedFileSlots.insert(slot);
-                  }
-
-                  fixedfiles[slot] = -1;
-                }
+                break;
               }
 
-              interfacer->closeHandler(object);
+              if (slot >= 0)
+              {
+                if (slot < 0 || static_cast<uint32_t>(slot) >= fixedFileCapacity)
+                {
+                  std::abort();
+                }
+
+                if (slot > 0 && static_cast<uint32_t>(slot) < fixedFileReserveLimit)
+                {
+                  vacantFixedFileSlots.insert(slot);
+                }
+                else if (slot > 0)
+                {
+                  vacantAcceptedFixedFileSlots.insert(slot);
+                }
+
+                fixedfiles[slot] = -1;
+              }
+
+              auto it = closingGenerationByIdentity.find(socketKey);
+              if (it != closingGenerationByIdentity.end() && it->second == tag)
+              {
+                isClosing.erase(socketKey);
+                closingGenerationByIdentity.erase(it);
+                interfacer->closeHandler(socketKey);
+              }
               break;
             }
           case Operation::closeRaw:
@@ -1523,9 +1746,13 @@ public:
                 std::abort();
               }
 
-              if (static_cast<uint32_t>(slot) < fixedFileReserveLimit)
+              if (slot > 0 && static_cast<uint32_t>(slot) < fixedFileReserveLimit)
               {
                 vacantFixedFileSlots.insert(slot);
+              }
+              else if (slot > 0)
+              {
+                vacantAcceptedFixedFileSlots.insert(slot);
               }
 
               fixedfiles[slot] = -1;
@@ -1576,11 +1803,21 @@ public:
 
               if (cqe->flags & IORING_CQE_F_BUFFER) // IORING_CQE_F_BUFFER	If set, the upper 16 bits are the buffer ID
               {
-                RecvmsgMultishoter *shoter = static_cast<RecvmsgMultishoter *>(object);
-
-                BufferRing& bufferRing = bufferRingsByBgid[shoter->bgid];
-
-                message = io_uring_recvmsg_validate(bufferRing.bufferAtIndex(cqe->flags >> IORING_CQE_BUFFER_SHIFT), cqe->res, &shoter->msgh);
+                auto shoterIt = recvmsgMultishoterByIdentity.find(object);
+                if (shoterIt != recvmsgMultishoterByIdentity.end() && shoterIt->second != nullptr)
+                {
+                  RecvmsgMultishoter *shoter = shoterIt->second;
+                  BufferRing& bufferRing = bufferRingsByBgid[shoter->bgid];
+                  buffer = bufferRing.bufferAtIndex(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+                  message = io_uring_recvmsg_validate(buffer, cqe->res, &shoter->msgh);
+                  if (message == nullptr && cqe->res >= 0)
+                  {
+                    // The kernel already consumed a provided buffer for this CQE.
+                    // If validation fails, recycle it immediately instead of leaking
+                    // the buffer ring into a permanent -ENOBUFS loop.
+                    relinquishBufferToRing(shoter, buffer);
+                  }
+                }
               }
 
               interfacer->recvmsgMultishotHandler(object, message, result, !(cqe->flags & IORING_CQE_F_MORE));

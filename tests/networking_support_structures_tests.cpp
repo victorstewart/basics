@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "tests/test_support.h"
 
+#include <atomic>
 #include <cstdint>
 #include <sys/mman.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -15,6 +17,18 @@
 #include "networking/timerwheel.h"
 #include "networking/coroutinestack.h"
 #include "networking/multiplexer.h"
+#include "networking/socket.h"
+#include "networking/stream.h"
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wkeyword-macro"
+#endif
+#define private public
+#include "networking/ring.h"
+#undef private
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 namespace {
 
@@ -157,6 +171,14 @@ struct DestructionProbe {
   }
 };
 
+static void clearRingCloseTrackingState(void)
+{
+  Ring::closeSlotByUserData.clear();
+  Ring::isClosing.clear();
+  Ring::closingGenerationByIdentity.clear();
+  Ring::socketGenerationByIdentity.clear();
+}
+
 static void singleSuspend(CoroutineStack& stack, std::vector<int>& steps, int id)
 {
   steps.push_back((id * 10) + 1);
@@ -255,6 +277,24 @@ static void testPoolReuseAndOutstandingTracking(TestSuite& suite)
   overflowing.relinquish(baseItem);
   overflowing.relinquish(overflowItem);
   EXPECT_EQ(suite, overflowing.outstandingCount(), uint32_t(0));
+
+  Pool<int, true, true> reinitialized(1);
+  int *firstGeneration = reinitialized.get();
+  EXPECT_TRUE(suite, firstGeneration != nullptr);
+  reinitialized.relinquish(firstGeneration);
+  reinitialized.initialize(2);
+  EXPECT_EQ(suite, reinitialized.outstandingCount(), uint32_t(0));
+  int *reinitializedA = reinitialized.get();
+  int *reinitializedB = reinitialized.get();
+  int *reinitializedOverflow = reinitialized.get();
+  EXPECT_TRUE(suite, reinitializedA != nullptr);
+  EXPECT_TRUE(suite, reinitializedB != nullptr);
+  EXPECT_TRUE(suite, reinitializedOverflow != nullptr);
+  EXPECT_FALSE(suite, reinitializedA == reinitializedB);
+  reinitialized.relinquish(reinitializedA);
+  reinitialized.relinquish(reinitializedB);
+  reinitialized.relinquish(reinitializedOverflow);
+  EXPECT_EQ(suite, reinitialized.outstandingCount(), uint32_t(0));
 }
 
 static void testMemoryPoolsReuseBuffers(TestSuite& suite)
@@ -446,6 +486,39 @@ static void testRingDispatcherRoutesHandlers(TestSuite& suite)
   EXPECT_EQ(suite, interfaceTarget.closeCalls, 0);
 }
 
+static void testRingDispatcherIsThreadLocal(TestSuite& suite)
+{
+  DispatcherScope scope;
+
+  RecordingRingInterface mainTarget;
+  int mainToken = 17;
+  RingDispatcher::installMultiplexee(&mainToken, &mainTarget);
+
+  RecordingRingInterface workerTarget;
+  int workerToken = 29;
+  std::atomic<bool> workerUsedMainDispatcher = true;
+
+  std::thread worker([&]() {
+    RingDispatcher::installMultiplexee(&workerToken, &workerTarget);
+    workerUsedMainDispatcher.store(RingDispatcher::dispatcher == &scope.localDispatcher, std::memory_order_release);
+    RingDispatcher::dispatcher->recvHandler(&workerToken, 123);
+  });
+  worker.join();
+
+  EXPECT_FALSE(suite, workerUsedMainDispatcher.load(std::memory_order_acquire));
+  EXPECT_EQ(suite, workerTarget.recvCalls, 1);
+  EXPECT_TRUE(suite, workerTarget.lastSocket == &workerToken);
+  EXPECT_EQ(suite, workerTarget.lastRecvResult, 123);
+
+  scope.localDispatcher.recvHandler(&workerToken, 77);
+  EXPECT_EQ(suite, workerTarget.recvCalls, 1);
+
+  scope.localDispatcher.recvHandler(&mainToken, 41);
+  EXPECT_EQ(suite, mainTarget.recvCalls, 1);
+  EXPECT_TRUE(suite, mainTarget.lastSocket == &mainToken);
+  EXPECT_EQ(suite, mainTarget.lastRecvResult, 41);
+}
+
 static void testCoroutineStackScheduling(TestSuite& suite)
 {
   {
@@ -534,6 +607,73 @@ static void testCoroutineStackScheduling(TestSuite& suite)
   }
 }
 
+static void testResolveTrackedCloseSlotIgnoresStaleMissingCompletion(TestSuite& suite)
+{
+  clearRingCloseTrackingState();
+
+  UnixStream stream;
+  void *socketKey = Ring::socketIdentity(&stream);
+  stream.ioGeneration = 124;
+  Ring::noteSocketGeneration(&stream);
+  Ring::isClosing.insert(socketKey);
+  Ring::closingGenerationByIdentity.insert_or_assign(socketKey, stream.ioGeneration);
+
+  const uint64_t staleUserData = Ring::getUserDataFor(Ring::Operation::close, socketKey, stream.ioGeneration);
+  Ring::closeSlotByUserData.insert_or_assign(staleUserData, 9);
+  Ring::closeSlotByUserData.erase(staleUserData);
+
+  Ring::isClosing.erase(socketKey);
+  Ring::closingGenerationByIdentity.erase(socketKey);
+  stream.ioGeneration = 183;
+  Ring::noteSocketGeneration(&stream);
+
+  int slot = -1;
+  EXPECT_TRUE(suite, Ring::shouldIgnoreMissingCloseCompletion(socketKey, 124));
+  EXPECT_FALSE(suite, Ring::resolveTrackedCloseSlot(staleUserData, socketKey, 124, slot));
+  EXPECT_EQ(suite, slot, -1);
+
+  clearRingCloseTrackingState();
+}
+
+static void testResolveTrackedCloseSlotReturnsTrackedSlot(TestSuite& suite)
+{
+  clearRingCloseTrackingState();
+
+  UnixStream stream;
+  void *socketKey = Ring::socketIdentity(&stream);
+  stream.ioGeneration = 42;
+  Ring::noteSocketGeneration(&stream);
+  Ring::isClosing.insert(socketKey);
+  Ring::closingGenerationByIdentity.insert_or_assign(socketKey, stream.ioGeneration);
+
+  const uint64_t userData = Ring::getUserDataFor(Ring::Operation::close, socketKey, stream.ioGeneration);
+  Ring::closeSlotByUserData.insert_or_assign(userData, 37);
+
+  int slot = -1;
+  EXPECT_FALSE(suite, Ring::shouldIgnoreMissingCloseCompletion(socketKey, stream.ioGeneration));
+  EXPECT_TRUE(suite, Ring::resolveTrackedCloseSlot(userData, socketKey, stream.ioGeneration, slot));
+  EXPECT_EQ(suite, slot, 37);
+  EXPECT_TRUE(suite, Ring::closeSlotByUserData.find(userData) == Ring::closeSlotByUserData.end());
+
+  clearRingCloseTrackingState();
+}
+
+static void testMissingMsghdrCompletionIsIgnored(TestSuite& suite)
+{
+  Ring::msghdrPackagePool.initialize(4);
+
+  Ring::MsghdrPackage *package = Ring::msghdrPackagePool.get();
+  EXPECT_TRUE(suite, package != nullptr);
+  EXPECT_TRUE(suite, Ring::msghdrPackagePool.contains(package));
+  EXPECT_FALSE(suite, Ring::shouldIgnoreMissingMsghdrCompletion(package));
+  EXPECT_TRUE(suite, Ring::shouldIgnoreMissingMsghdrCompletion(nullptr));
+
+  Ring::msghdrPackagePool.relinquish(package);
+
+  EXPECT_FALSE(suite, Ring::msghdrPackagePool.contains(package));
+  EXPECT_TRUE(suite, Ring::shouldIgnoreMissingMsghdrCompletion(package));
+}
+
 } // namespace
 
 int main()
@@ -543,6 +683,10 @@ int main()
   testMemoryPoolsReuseBuffers(suite);
   testTimerWheelSchedulingAndCancellation(suite);
   testRingDispatcherRoutesHandlers(suite);
+  testRingDispatcherIsThreadLocal(suite);
   testCoroutineStackScheduling(suite);
+  testResolveTrackedCloseSlotIgnoresStaleMissingCompletion(suite);
+  testResolveTrackedCloseSlotReturnsTrackedSlot(suite);
+  testMissingMsghdrCompletionIsIgnored(suite);
   return suite.finish("networking_support_structures_tests");
 }

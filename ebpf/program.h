@@ -4,7 +4,9 @@
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <cstdarg>
 #include <cstring>
+#include <fcntl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <vector>
@@ -82,14 +84,112 @@ private:
 	int attachidx = -1;
 	enum bpf_attach_type attachtype = static_cast<enum bpf_attach_type>(0);
 	bool progFDOwnedByObject = false;
+	bool loadedFromPreattached = false;
+	__u32 expectedPreattachedMapCount = 0;
 
 	struct PreattachedMapFD
 	{
 		char name[BPF_OBJ_NAME_LEN];
+		enum bpf_map_type type;
+		__u32 keySize;
+		__u32 valueSize;
+		__u32 maxEntries;
+		__u32 mapFlags;
+		__u32 btfKeyTypeID;
+		__u32 btfValueTypeID;
+		__u32 btfVMLinuxValueTypeID;
 		int fd;
 	};
 
 	std::vector<PreattachedMapFD> preattachedMapFDs;
+
+	static bool objectNameMatches(const char *requestedName, const char *candidateName)
+	{
+		if (requestedName == nullptr || candidateName == nullptr)
+		{
+			return false;
+		}
+
+		size_t requestedLen = strnlen(requestedName, BPF_OBJ_NAME_LEN);
+		size_t candidateLen = strnlen(candidateName, BPF_OBJ_NAME_LEN);
+		bool exactMatch = (requestedLen == candidateLen && memcmp(requestedName, candidateName, requestedLen) == 0);
+		bool requestedIsPrefix = (requestedLen >= candidateLen && memcmp(requestedName, candidateName, candidateLen) == 0);
+		bool candidateIsPrefix = (candidateLen >= requestedLen && memcmp(candidateName, requestedName, requestedLen) == 0);
+
+		// Kernel-side BPF object names are capped to BPF_OBJ_NAME_LEN, so accept
+		// both exact and truncated-prefix matches when reopening a preattached
+		// program or map from its persisted kernel identity.
+		return exactMatch || requestedIsPrefix || candidateIsPrefix;
+	}
+
+	static struct bpf_program *findProgramByKernelName(struct bpf_object *object, const char *requestedName)
+	{
+		if (object == nullptr || requestedName == nullptr)
+		{
+			return nullptr;
+		}
+
+		struct bpf_program *candidate = nullptr;
+		bpf_object__for_each_program(candidate, object)
+		{
+			const char *candidateName = bpf_program__name(candidate);
+			if (objectNameMatches(requestedName, candidateName))
+			{
+				return candidate;
+			}
+		}
+
+		return nullptr;
+	}
+
+	static void appendPreattachedTracef(const char *format, ...)
+	{
+		int fd = ::open("/switchboard.attach.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+		if (fd < 0)
+		{
+			return;
+		}
+
+		char line[768] = {};
+		va_list args;
+		va_start(args, format);
+		(void)vsnprintf(line, sizeof(line), format, args);
+		va_end(args);
+
+		(void)::write(fd, line, strlen(line));
+		(void)::write(fd, "\n", 1);
+		(void)::close(fd);
+	}
+
+	static bool metadataMatchesRequestedMap(const PreattachedMapFD& preattachedMap, const struct bpf_map *requestedMap)
+	{
+		if (requestedMap == nullptr)
+		{
+			return false;
+		}
+
+		if (preattachedMap.type != bpf_map__type(requestedMap)
+			|| preattachedMap.keySize != bpf_map__key_size(requestedMap)
+			|| preattachedMap.valueSize != bpf_map__value_size(requestedMap)
+			|| preattachedMap.maxEntries != bpf_map__max_entries(requestedMap)
+			|| preattachedMap.mapFlags != bpf_map__map_flags(requestedMap))
+		{
+			return false;
+		}
+
+		__u32 requestedBTFKeyTypeID = bpf_map__btf_key_type_id(requestedMap);
+		__u32 requestedBTFValueTypeID = bpf_map__btf_value_type_id(requestedMap);
+		if (requestedBTFKeyTypeID != 0 && preattachedMap.btfKeyTypeID != 0 && preattachedMap.btfKeyTypeID != requestedBTFKeyTypeID)
+		{
+			return false;
+		}
+		if (requestedBTFValueTypeID != 0 && preattachedMap.btfValueTypeID != 0 && preattachedMap.btfValueTypeID != requestedBTFValueTypeID)
+		{
+			return false;
+		}
+
+		return true;
+	}
 
 	void closePreattachedMapFDs(void)
 	{
@@ -103,6 +203,133 @@ private:
 		}
 
 		preattachedMapFDs.clear();
+	}
+
+	bool refreshPreattachedMapFDs(__u32 *recoveredMapCount = nullptr)
+	{
+		closePreattachedMapFDs();
+
+		if (prog_fd < 0)
+		{
+			return false;
+		}
+
+		struct bpf_prog_info progInfo = {};
+		__u32 progInfoLen = sizeof(progInfo);
+		if (bpf_prog_get_info_by_fd(prog_fd, &progInfo, &progInfoLen) != 0)
+		{
+			basics_log("BPFProgram::refreshPreattachedMapFDs bpf_prog_get_info_by_fd failed prog_fd=%d errno=%d\n",
+				prog_fd,
+				errno);
+			return false;
+		}
+
+		appendPreattachedTracef("BPFProgram refresh prog_fd=%d prog_name=%s nr_map_ids=%u ifindex=%u",
+			prog_fd,
+			progInfo.name,
+			unsigned(progInfo.nr_map_ids),
+			unsigned(progInfo.ifindex));
+
+		if (recoveredMapCount != nullptr)
+		{
+			*recoveredMapCount = progInfo.nr_map_ids;
+		}
+
+		if (progInfo.nr_map_ids == 0)
+		{
+			return true;
+		}
+
+		std::vector<__u32> mapIDs;
+		mapIDs.resize(progInfo.nr_map_ids);
+
+		struct bpf_prog_info mapInfoRequest = {};
+		mapInfoRequest.nr_map_ids = static_cast<__u32>(mapIDs.size());
+		mapInfoRequest.map_ids = reinterpret_cast<__u64>(mapIDs.data());
+		progInfoLen = sizeof(mapInfoRequest);
+		if (bpf_prog_get_info_by_fd(prog_fd, &mapInfoRequest, &progInfoLen) != 0)
+		{
+			basics_log("BPFProgram::refreshPreattachedMapFDs map-id query failed prog_fd=%d expected=%u errno=%d\n",
+				prog_fd,
+				unsigned(mapIDs.size()),
+				errno);
+			closePreattachedMapFDs();
+			return false;
+		}
+
+		if (mapInfoRequest.nr_map_ids != mapIDs.size())
+		{
+			basics_log("BPFProgram::refreshPreattachedMapFDs map-id count drifted prog_fd=%d requested=%u actual=%u\n",
+				prog_fd,
+				unsigned(mapIDs.size()),
+				unsigned(mapInfoRequest.nr_map_ids));
+			closePreattachedMapFDs();
+			return false;
+		}
+
+		for (__u32 mapID : mapIDs)
+		{
+			int mapFD = bpf_map_get_fd_by_id(mapID);
+			if (mapFD < 0)
+			{
+				basics_log("BPFProgram::refreshPreattachedMapFDs bpf_map_get_fd_by_id failed prog_fd=%d map_id=%u errno=%d\n",
+					prog_fd,
+					mapID,
+					errno);
+				closePreattachedMapFDs();
+				return false;
+			}
+
+			struct bpf_map_info mapInfo = {};
+			__u32 mapInfoLen = sizeof(mapInfo);
+			if (bpf_map_get_info_by_fd(mapFD, &mapInfo, &mapInfoLen) != 0)
+			{
+				basics_log("BPFProgram::refreshPreattachedMapFDs bpf_map_get_info_by_fd failed prog_fd=%d map_id=%u fd=%d errno=%d\n",
+					prog_fd,
+					mapID,
+					mapFD,
+					errno);
+				::close(mapFD);
+				closePreattachedMapFDs();
+				return false;
+			}
+
+			PreattachedMapFD mapEntry = {};
+			memcpy(mapEntry.name, mapInfo.name, sizeof(mapEntry.name));
+			mapEntry.type = static_cast<enum bpf_map_type>(mapInfo.type);
+			mapEntry.keySize = mapInfo.key_size;
+			mapEntry.valueSize = mapInfo.value_size;
+			mapEntry.maxEntries = mapInfo.max_entries;
+			mapEntry.mapFlags = mapInfo.map_flags;
+			mapEntry.btfKeyTypeID = mapInfo.btf_key_type_id;
+			mapEntry.btfValueTypeID = mapInfo.btf_value_type_id;
+			mapEntry.btfVMLinuxValueTypeID = mapInfo.btf_vmlinux_value_type_id;
+			mapEntry.fd = mapFD;
+			preattachedMapFDs.push_back(mapEntry);
+			appendPreattachedTracef("BPFProgram recovered map prog_fd=%d map_id=%u name=%s type=%u key=%u value=%u max=%u flags=0x%x btf_key=%u btf_value=%u",
+				prog_fd,
+				unsigned(mapInfo.id),
+				mapInfo.name,
+				unsigned(mapInfo.type),
+				unsigned(mapInfo.key_size),
+				unsigned(mapInfo.value_size),
+				unsigned(mapInfo.max_entries),
+				unsigned(mapInfo.map_flags),
+				unsigned(mapInfo.btf_key_type_id),
+				unsigned(mapInfo.btf_value_type_id));
+		}
+
+		if (preattachedMapFDs.size() != mapIDs.size())
+		{
+			basics_log("BPFProgram::refreshPreattachedMapFDs recovered incomplete map set prog_fd=%d expected=%u actual=%u\n",
+				prog_fd,
+				unsigned(mapIDs.size()),
+				unsigned(preattachedMapFDs.size()));
+			closePreattachedMapFDs();
+			return false;
+		}
+
+		return true;
 	}
 
 public:
@@ -164,7 +391,7 @@ public:
 	struct bpf_program *prog = nullptr;
 	int prog_fd = -1;
 
-	bool loadPreattached(enum bpf_attach_type progtype, uint32_t prog_id, StringType auto&& progpath)
+	bool loadPreattached(enum bpf_attach_type progtype, int attachedIfidx, uint32_t prog_id, StringType auto&& progpath)
 	{
 		close();
 
@@ -172,6 +399,9 @@ public:
 
 		if (prog_fd < 0) 
 		{
+			basics_log("BPFProgram::loadPreattached bpf_prog_get_fd_by_id failed prog_id=%u errno=%d\n",
+				prog_id,
+				errno);
 			return false;
 		}
 
@@ -180,59 +410,68 @@ public:
 
 		if (bpf_prog_get_info_by_fd(prog_fd, &prog_info, &info_len) != 0)
 		{
+			basics_log("BPFProgram::loadPreattached bpf_prog_get_info_by_fd failed prog_id=%u fd=%d errno=%d\n",
+				prog_id,
+				prog_fd,
+				errno);
 			close();
 			return false;
 		}
 
-		if (prog_info.nr_map_ids > 0)
+		appendPreattachedTracef("BPFProgram loadPreattached prog_id=%u prog_fd=%d name=%s nr_map_ids=%u ifindex=%u path=%s",
+			prog_id,
+			prog_fd,
+			prog_info.name,
+			unsigned(prog_info.nr_map_ids),
+			unsigned(prog_info.ifindex),
+			progpath.c_str());
+
+		if (refreshPreattachedMapFDs(&expectedPreattachedMapCount) == false)
 		{
-			std::vector<__u32> mapIDs;
-			mapIDs.resize(prog_info.nr_map_ids);
-
-			prog_info.map_ids = reinterpret_cast<__u64>(mapIDs.data());
-			info_len = sizeof(prog_info);
-			if (bpf_prog_get_info_by_fd(prog_fd, &prog_info, &info_len) == 0)
-			{
-				for (__u32 mapID : mapIDs)
-				{
-					int mapFD = bpf_map_get_fd_by_id(mapID);
-					if (mapFD < 0)
-					{
-						continue;
-					}
-
-					struct bpf_map_info mapInfo = {};
-					__u32 mapInfoLen = sizeof(mapInfo);
-					if (bpf_map_get_info_by_fd(mapFD, &mapInfo, &mapInfoLen) != 0)
-					{
-						::close(mapFD);
-						continue;
-					}
-
-					PreattachedMapFD mapEntry = {};
-					memcpy(mapEntry.name, mapInfo.name, sizeof(mapEntry.name));
-					mapEntry.fd = mapFD;
-					preattachedMapFDs.push_back(mapEntry);
-				}
-			}
+			basics_log("BPFProgram::loadPreattached failed to recover map FDs prog_id=%u fd=%d errno=%d\n",
+				prog_id,
+				prog_fd,
+				errno);
+			close();
+			return false;
 		}
 
-	    	attachidx = prog_info.ifindex;
+	    	attachidx = (prog_info.ifindex > 0 ? int(prog_info.ifindex) : attachedIfidx);
 	    	attachtype = progtype;
+	    	loadedFromPreattached = true;
 	    	
 		obj = bpf_object__open(progpath.c_str());
 
 		if (libbpf_get_error(obj))
 		{
+			int error = -libbpf_get_error(obj);
+			basics_log("BPFProgram::loadPreattached bpf_object__open failed prog_id=%u path=%s error=%d errno=%d\n",
+				prog_id,
+				progpath.c_str(),
+				error,
+				errno);
 			obj = nullptr;
 			close();
 			return false;
 		}
 
-		prog = bpf_object__find_program_by_name(obj, prog_info.name);
+		prog = findProgramByKernelName(obj, prog_info.name);
 
 		if (!prog)
 		{
+			basics_log("BPFProgram::loadPreattached unable to resolve program prog_id=%u kernel_name=%s path=%s\n",
+				prog_id,
+				prog_info.name,
+				progpath.c_str());
+			struct bpf_program *candidate = nullptr;
+			bpf_object__for_each_program(candidate, obj)
+			{
+				const char *candidateName = bpf_program__name(candidate);
+				if (candidateName)
+				{
+					basics_log("BPFProgram::loadPreattached candidate program name=%s\n", candidateName);
+				}
+			}
 			close();
 			return false;
 		}
@@ -345,29 +584,122 @@ public:
 	void openMap(StringType auto&& map_name, Lambda&& lambda)
 	{
 		const char *requestedName = map_name.c_str();
-		if (requestedName != nullptr && preattachedMapFDs.empty() == false)
-		{
-			size_t requestedLen = strlen(requestedName);
-
-			for (const PreattachedMapFD& preattachedMap : preattachedMapFDs)
+		auto tryOpenPreattachedMap = [&] (bool allowRefresh) -> int {
+			if (loadedFromPreattached == false)
 			{
-				if (preattachedMap.fd < 0)
+				return -1;
+			}
+
+			auto tryResolveFromCurrentState = [&] (void) -> int {
+				appendPreattachedTracef("BPFProgram openMap request=%s prog_fd=%d expected=%u recovered=%u allowRefresh=%d",
+					(requestedName ? requestedName : "<null>"),
+					prog_fd,
+					unsigned(expectedPreattachedMapCount),
+					unsigned(preattachedMapFDs.size()),
+					int(allowRefresh));
+
+				if (requestedName == nullptr || preattachedMapFDs.empty())
 				{
-					continue;
+					return -1;
 				}
 
-				size_t existingLen = strnlen(preattachedMap.name, sizeof(preattachedMap.name));
-				bool exactMatch = (requestedLen == existingLen && memcmp(requestedName, preattachedMap.name, requestedLen) == 0);
-				bool requestedIsPrefix = (requestedLen >= existingLen && memcmp(requestedName, preattachedMap.name, existingLen) == 0);
-				bool existingIsPrefix = (existingLen >= requestedLen && memcmp(preattachedMap.name, requestedName, requestedLen) == 0);
-
-				// BPF map names are capped to BPF_OBJ_NAME_LEN, so accept both exact and
-				// truncated-prefix matches when resolving preattached map descriptors.
-				if (exactMatch || requestedIsPrefix || existingIsPrefix)
+				const struct bpf_map *requestedMap = nullptr;
+				if (obj != nullptr)
 				{
-					lambda(preattachedMap.fd);
-					return;
+					requestedMap = bpf_object__find_map_by_name(obj, requestedName);
 				}
+
+				if (requestedMap != nullptr)
+				{
+					const PreattachedMapFD *metadataMatch = nullptr;
+					uint32_t metadataMatchCount = 0;
+
+					for (const PreattachedMapFD& preattachedMap : preattachedMapFDs)
+					{
+						if (preattachedMap.fd < 0 || metadataMatchesRequestedMap(preattachedMap, requestedMap) == false)
+						{
+							continue;
+						}
+
+						metadataMatch = &preattachedMap;
+						metadataMatchCount += 1;
+					}
+
+					if (metadataMatchCount > 1)
+					{
+						metadataMatch = nullptr;
+						metadataMatchCount = 0;
+
+						for (const PreattachedMapFD& preattachedMap : preattachedMapFDs)
+						{
+							if (preattachedMap.fd < 0
+								|| metadataMatchesRequestedMap(preattachedMap, requestedMap) == false
+								|| objectNameMatches(requestedName, preattachedMap.name) == false)
+							{
+								continue;
+							}
+
+							metadataMatch = &preattachedMap;
+							metadataMatchCount += 1;
+						}
+					}
+
+					if (metadataMatchCount == 1 && metadataMatch != nullptr)
+					{
+						appendPreattachedTracef("BPFProgram openMap metadata match request=%s fd=%d name=%s",
+							requestedName,
+							metadataMatch->fd,
+							metadataMatch->name);
+						return metadataMatch->fd;
+					}
+				}
+
+				for (const PreattachedMapFD& preattachedMap : preattachedMapFDs)
+				{
+					if (preattachedMap.fd >= 0 && objectNameMatches(requestedName, preattachedMap.name))
+					{
+						appendPreattachedTracef("BPFProgram openMap name match request=%s fd=%d name=%s",
+							requestedName,
+							preattachedMap.fd,
+							preattachedMap.name);
+						return preattachedMap.fd;
+					}
+				}
+
+				return -1;
+			};
+
+			int fd = tryResolveFromCurrentState();
+			if (fd >= 0 || allowRefresh == false)
+			{
+				return fd;
+			}
+
+			__u32 refreshedMapCount = expectedPreattachedMapCount;
+			if (refreshPreattachedMapFDs(&refreshedMapCount))
+			{
+				expectedPreattachedMapCount = refreshedMapCount;
+				return tryResolveFromCurrentState();
+			}
+
+			return -1;
+		};
+
+		if (loadedFromPreattached)
+		{
+			int preattachedFD = tryOpenPreattachedMap(true);
+			if (preattachedFD >= 0 || prog_fd >= 0)
+			{
+				if (preattachedFD < 0)
+				{
+					basics_log("BPFProgram::openMap missing reopened map name=%s prog_fd=%d expected_preattached_maps=%u recovered=%u\n",
+						(requestedName ? requestedName : "<null>"),
+						prog_fd,
+						unsigned(expectedPreattachedMapCount),
+						unsigned(preattachedMapFDs.size()));
+				}
+				lambda(preattachedFD);
+				return;
 			}
 		}
 
@@ -484,6 +816,8 @@ public:
 
 		prog_fd = -1;
 		progFDOwnedByObject = false;
+		loadedFromPreattached = false;
+		expectedPreattachedMapCount = 0;
 		attachidx = -1;
 	}
 };

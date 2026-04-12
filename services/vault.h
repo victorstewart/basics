@@ -12,6 +12,7 @@
 
 #include <openssl/ec.h> // EVP_EC_gen
 #include <openssl/evp.h> // EVP_PKEY_get_raw_public_key, EVP_PKEY_new_raw_public_key
+#include <openssl/crypto.h>
 #include <openssl/x509v3.h>
 #include <openssl/param_build.h>
 #include <openssl/core_names.h> // OSSL_PKEY_PARAM_PRIV_KEY, OSSL_PKEY_PARAM_PUB_KEY
@@ -146,67 +147,16 @@ static bool vaultGenerateKeyPair(CryptoScheme scheme, EVP_PKEY*& privateKey, EVP
                 return false;
             }
 
-            size_t rawkeylen = 0;
-            unsigned char rawkey[64] = {};
+            privateKey = keypair;
+            if (EVP_PKEY_up_ref(keypair) != 1)
+            {
+                EVP_PKEY_free(keypair);
+                privateKey = nullptr;
+                return false;
+            }
 
-            auto extractKey = [&] (const char *selectionA, int selectionB) -> EVP_PKEY* {
-
-                EVP_PKEY *key = nullptr;
-                if (EVP_PKEY_get_octet_string_param(keypair, selectionA, rawkey, sizeof(rawkey), &rawkeylen) != 1)
-                {
-                    return nullptr;
-                }
-
-                EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
-                if (ctx == nullptr)
-                {
-                    return nullptr;
-                }
-
-                EVP_PKEY *generated = nullptr;
-                if (EVP_PKEY_fromdata_init(ctx) == 1)
-                {
-                    OSSL_PARAM_BLD *param_bld = OSSL_PARAM_BLD_new();
-                    if (param_bld)
-                    {
-                        if (std::strcmp(OSSL_PKEY_PARAM_PRIV_KEY, selectionA) == 0 && selectionB == EVP_PKEY_KEYPAIR)
-                        {
-                            OSSL_PARAM_BLD_push_utf8_string(param_bld, "group", "prime256v1", 0);
-                            OSSL_PARAM_BLD_push_octet_string(param_bld, selectionA, rawkey, rawkeylen);
-                        }
-                        else
-                        {
-                            OSSL_PARAM_BLD_push_utf8_string(param_bld, "group", "prime256v1", 0);
-                            OSSL_PARAM_BLD_push_octet_string(param_bld, selectionA, rawkey, rawkeylen);
-                        }
-
-                        OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(param_bld);
-                        if (params)
-                        {
-                            if (EVP_PKEY_fromdata(ctx, &generated, selectionB, params) != 1)
-                            {
-                                if (generated)
-                                {
-                                    EVP_PKEY_free(generated);
-                                    generated = nullptr;
-                                }
-                            }
-
-                            OSSL_PARAM_free(params);
-                        }
-
-                        OSSL_PARAM_BLD_free(param_bld);
-                    }
-                }
-
-                EVP_PKEY_CTX_free(ctx);
-                return generated;
-            };
-
-            privateKey = extractKey(OSSL_PKEY_PARAM_PRIV_KEY, EVP_PKEY_KEYPAIR);
-            publicKey = extractKey(OSSL_PKEY_PARAM_PUB_KEY, EVP_PKEY_PUBLIC_KEY);
-            EVP_PKEY_free(keypair);
-            return (privateKey != nullptr && publicKey != nullptr);
+            publicKey = keypair;
+            return true;
         }
         case CryptoScheme::ed25519:
         {
@@ -1155,6 +1105,24 @@ static bool extractTransportCertificateUUID(X509 *cert, uint128_t& uuid)
     return parseNodeCommonName(encoded, uuid);
 }
 
+static inline void secureScrubBytes(void *data, uint64_t size)
+{
+    if (data != nullptr && size > 0)
+    {
+        OPENSSL_cleanse(data, size_t(size));
+    }
+}
+
+static inline void secureClearString(String& value)
+{
+    if (value.size() > 0)
+    {
+        secureScrubBytes(value.data(), value.size());
+    }
+
+    value.reset();
+}
+
 class SSHKeyPackage
 {
 public:
@@ -1162,10 +1130,15 @@ public:
     String privateKeyOpenSSH = {};
     String publicKeyOpenSSH = {};
 
+    ~SSHKeyPackage()
+    {
+        clear();
+    }
+
     void clear(void)
     {
-        privateKeyOpenSSH.clear();
-        publicKeyOpenSSH.clear();
+        secureClearString(privateKeyOpenSSH);
+        secureClearString(publicKeyOpenSSH);
     }
 };
 
@@ -1587,6 +1560,17 @@ static bool validateSSHKeyPackageEd25519(const String& privateKeyOpenSSH,
 static bool validateSSHKeyPackageEd25519(const SSHKeyPackage& package, String *failure = nullptr)
 {
     return validateSSHKeyPackageEd25519(package.privateKeyOpenSSH, package.publicKeyOpenSSH, failure);
+}
+
+static bool validateSSHEd25519PublicKey(const String& publicKeyOpenSSH, String *failure = nullptr)
+{
+    if (failure != nullptr)
+    {
+        failure->clear();
+    }
+
+    std::array<uint8_t, 32> publicKey = {};
+    return parseSSHEd25519PublicKeyLine(publicKeyOpenSSH, publicKey, failure);
 }
 
 static bool generateSSHKeyPackageEd25519(SSHKeyPackage& package,

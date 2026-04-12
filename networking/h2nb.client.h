@@ -324,18 +324,25 @@ private:
       request->dataProvider.read_callback = nghttp2_data_source_read_callback;
     }
 
-    if (isTLSNegotiated() == true)
-    {
-      submitRequest(request);
-      send(true);
-    }
+	    if (isTLSNegotiated() == true)
+	    {
+	      submitRequest(request);
+	      send(true);
+	    }
 
-    requests.insert(request);
-  }
+	    requests.insert(request);
+
+	    if (isTLSNegotiated() == false && connectQueued == false)
+	    {
+	      connectQueued = true;
+	      Ring::queueConnect(this);
+	    }
+	  }
 
   bytell_hash_set<Request *> requests;
   nghttp2_session *session = nullptr;
   SSL_CTX *tlsctx = nullptr;
+  bool connectQueued = false;
 
   template <typename Path, typename... Headers>
   void queuePost(Path&& path, Buffer *data, Ticket *ticket, CleanUpHandler&& cleanUp, Headers&&...headers)
@@ -399,6 +406,8 @@ public:
 
   void connectionBroke(void)
   {
+    connectQueued = false;
+
     if (session)
     {
       nghttp2_session_del(session);
@@ -565,6 +574,8 @@ public:
 
   void connectHandler(void *socket, int result)
   {
+    connectQueued = false;
+
     if (result == 0)
     {
       sendTLSClientHello();
@@ -617,7 +628,12 @@ public:
     isFailed = false;
     recreateSocket();
     Ring::installFDIntoFixedFileSlot(this);
-    Ring::queueConnect(this);
+
+    if (requests.size())
+    {
+      connectQueued = true;
+      Ring::queueConnect(this);
+    }
   }
 
   H2NonBlockingClient()

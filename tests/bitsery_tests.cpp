@@ -29,12 +29,25 @@ struct FixedBinaryBlob {
   uint8_t tag = 0;
 };
 
+struct NestedStringRecord {
+
+  String name;
+  bytell_hash_map<uint32_t, String> labels;
+};
+
 template <typename S>
 static void serialize(S& serializer, FixedBinaryBlob& blob)
 {
   uint8_t *bytes = blob.bytes;
   serializer.ext(bytes, bitsery::ext::FixedBinarySequence<16> {});
   serializer.value1b(blob.tag);
+}
+
+template <typename S>
+static void serialize(S& serializer, NestedStringRecord& record)
+{
+  serializer.text1b(record.name, UINT32_MAX);
+  serializer.object(record.labels);
 }
 
 template <typename T>
@@ -132,6 +145,43 @@ static void testExternalByteViewDeserialize(TestSuite& suite)
   EXPECT_STRING_EQ(suite, decoded, source);
 }
 
+static void testPointerPairRoundTrip(TestSuite& suite)
+{
+  NestedStringRecord source;
+  source.name.assign("brain-config"_ctv);
+  source.labels.insert_or_assign(1, String("alpha"));
+  source.labels.insert_or_assign(2, String("beta"));
+
+  String serialized = serializeObject(suite, source);
+  EXPECT_TRUE(suite, serialized.size() > 0);
+  if (serialized.size() == 0)
+  {
+    return;
+  }
+
+  NestedStringRecord decoded = {};
+  EXPECT_TRUE(suite, BitseryEngine::deserialize(serialized.data(), serialized.data() + serialized.size(), decoded));
+  EXPECT_STRING_EQ(suite, decoded.name, source.name);
+  EXPECT_EQ(suite, decoded.labels.size(), source.labels.size());
+  EXPECT_STRING_EQ(suite, decoded.labels.find(1)->second, "alpha"_ctv);
+  EXPECT_STRING_EQ(suite, decoded.labels.find(2)->second, "beta"_ctv);
+
+  uint8_t raw[1024] {};
+  uint32_t written = BitseryEngine::serialize(raw, raw + sizeof(raw), source);
+  EXPECT_TRUE(suite, written > 0);
+  if (written == 0)
+  {
+    return;
+  }
+
+  NestedStringRecord decodedFromRaw = {};
+  EXPECT_TRUE(suite, BitseryEngine::deserialize(raw, raw + written, decodedFromRaw));
+  EXPECT_STRING_EQ(suite, decodedFromRaw.name, source.name);
+  EXPECT_EQ(suite, decodedFromRaw.labels.size(), source.labels.size());
+  EXPECT_STRING_EQ(suite, decodedFromRaw.labels.find(1)->second, "alpha"_ctv);
+  EXPECT_STRING_EQ(suite, decodedFromRaw.labels.find(2)->second, "beta"_ctv);
+}
+
 static void testVectorRoundTripAndFailures(TestSuite& suite)
 {
   Vector<uint32_t> source;
@@ -221,6 +271,7 @@ int main()
   testFixedBinarySequenceRoundTrip(suite);
   testStringRoundTripAndFailures(suite);
   testExternalByteViewDeserialize(suite);
+  testPointerPairRoundTrip(suite);
   testVectorRoundTripAndFailures(suite);
   testBytellHashMapRoundTripAndFailures(suite);
   testBytellHashSetRoundTripAndFailures(suite);

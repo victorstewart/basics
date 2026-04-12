@@ -6,6 +6,7 @@
 #include <openssl/err.h>
 
 #include <limits>
+#include <cstdio>
 
 #pragma once
 
@@ -36,6 +37,45 @@ protected:
 public:
 
   SSL *ssl = nullptr;
+
+  static const char *sslErrorName(int error)
+  {
+    switch (error)
+    {
+      case SSL_ERROR_NONE:
+        return "SSL_ERROR_NONE";
+      case SSL_ERROR_ZERO_RETURN:
+        return "SSL_ERROR_ZERO_RETURN";
+      case SSL_ERROR_WANT_READ:
+        return "SSL_ERROR_WANT_READ";
+      case SSL_ERROR_WANT_WRITE:
+        return "SSL_ERROR_WANT_WRITE";
+      case SSL_ERROR_WANT_CONNECT:
+        return "SSL_ERROR_WANT_CONNECT";
+      case SSL_ERROR_WANT_ACCEPT:
+        return "SSL_ERROR_WANT_ACCEPT";
+      case SSL_ERROR_WANT_X509_LOOKUP:
+        return "SSL_ERROR_WANT_X509_LOOKUP";
+      case SSL_ERROR_SYSCALL:
+        return "SSL_ERROR_SYSCALL";
+      case SSL_ERROR_SSL:
+        return "SSL_ERROR_SSL";
+#ifdef SSL_ERROR_WANT_ASYNC
+      case SSL_ERROR_WANT_ASYNC:
+        return "SSL_ERROR_WANT_ASYNC";
+#endif
+#ifdef SSL_ERROR_WANT_ASYNC_JOB
+      case SSL_ERROR_WANT_ASYNC_JOB:
+        return "SSL_ERROR_WANT_ASYNC_JOB";
+#endif
+#ifdef SSL_ERROR_WANT_CLIENT_HELLO_CB
+      case SSL_ERROR_WANT_CLIENT_HELLO_CB:
+        return "SSL_ERROR_WANT_CLIENT_HELLO_CB";
+#endif
+      default:
+        return "SSL_ERROR_UNKNOWN";
+    }
+  }
 
   static struct ssl_ctx_st *generateCtx(const char *tls_chain, const char *tls_cert, const char *tls_key)
   {
@@ -473,12 +513,24 @@ public:
         }
         else
         {
-          switch (SSL_get_error(ssl, bytesRead))
+          int sslError = SSL_get_error(ssl, bytesRead);
+          switch (sslError)
           {
             case SSL_ERROR_SYSCALL:
             case SSL_ERROR_SSL:
             case SSL_ERROR_ZERO_RETURN:
               {
+                unsigned long opensslError = ERR_peek_last_error();
+                std::fprintf(stderr,
+                    "tls decryptFrom failed bytesRead=%d sslError=%s(%d) pendingBio=%ld pendingSSL=%d opensslError=%lu reason=%s\n",
+                    bytesRead,
+                    sslErrorName(sslError),
+                    sslError,
+                    long(BIO_ctrl_pending(wbio)),
+                    int(SSL_has_pending(ssl)),
+                    opensslError,
+                    (opensslError ? ERR_reason_error_string(opensslError) : "none"));
+                std::fflush(stderr);
                 rBuffer.resize(originalSize);
                 return false;
               }

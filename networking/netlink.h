@@ -1669,21 +1669,52 @@ public:
   // we can only get the full info from the .o file
   BPFProgram *loadPreattachedProgram(enum bpf_attach_type progtype, StringType auto&& progpath)
   {
-    uint32_t prog_id = 0;
-    uint32_t prog_cnt = 1;
+      uint32_t prog_id = 0;
+      if (progtype == BPF_XDP)
+      {
+        static constexpr uint32_t xdpQueryModes[] = {
+          XDP_FLAGS_DRV_MODE,
+          XDP_FLAGS_SKB_MODE,
+          0
+        };
 
-    struct bpf_prog_query_opts opts = {};
-    opts.sz = sizeof(opts);
-    opts.prog_ids = &prog_id;
-    opts.prog_cnt = prog_cnt;
+        bool foundXDP = false;
+        for (uint32_t queryFlags : xdpQueryModes)
+        {
+          prog_id = 0;
+          if (bpf_xdp_query_id(ifidx, queryFlags, &prog_id) == 0 && prog_id != 0)
+          {
+            xdp_flags = (queryFlags & XDP_FLAGS_MODES);
+            foundXDP = true;
+            break;
+          }
+        }
 
-    if (bpf_prog_query_opts(ifidx, progtype, &opts) != 0)
-    {
-      return nullptr;
-    }
+        if (foundXDP == false)
+        {
+          basics_log("NetDevice::loadPreattachedProgram XDP query failed ifidx=%u errno=%d\n",
+            ifidx,
+            errno);
+          return nullptr;
+        }
+      }
+      else
+      {
+        uint32_t prog_cnt = 1;
+
+        struct bpf_prog_query_opts opts = {};
+        opts.sz = sizeof(opts);
+        opts.prog_ids = &prog_id;
+        opts.prog_cnt = prog_cnt;
+
+        if (bpf_prog_query_opts(ifidx, progtype, &opts) != 0 || prog_id == 0)
+        {
+          return nullptr;
+        }
+      }
 
     BPFProgram *prog = new BPFProgram();
-    if (prog->loadPreattached(progtype, prog_id, progpath) == false)
+    if (prog->loadPreattached(progtype, ifidx, prog_id, progpath) == false)
     {
       delete prog;
       return nullptr;

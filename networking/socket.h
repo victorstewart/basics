@@ -562,7 +562,6 @@ protected:
   }
 
 public:
-
   void setIPVersion(int ip_version) // AF_INET or AF_INET6
   {
     domain = ip_version;

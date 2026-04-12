@@ -31,40 +31,23 @@ private:
 
 public:
 
-  static inline RingDispatcher *dispatcher = nullptr; // auto initialzes itself
+  static inline thread_local RingDispatcher *dispatcher = nullptr; // auto initialzes itself per thread
+
+  static RingDispatcher& current();
 
   static void installMultiplexer(RingMultiplexer *multiplexer)
   {
-    if (dispatcher == nullptr)
-    {
-      (void)multiplexer;
-      std::abort();
-    }
-
-    dispatcher->multiplexers.insert(multiplexer);
+    current().multiplexers.insert(multiplexer);
   }
 
   static void installMultiplexee(void *object, RingInterface *target)
   {
-    if (dispatcher == nullptr)
-    {
-      (void)object;
-      (void)target;
-      std::abort();
-    }
-
-    dispatcher->multiplexees.insert_or_assign(object, target);
+    current().multiplexees.insert_or_assign(object, target);
   }
 
   static void eraseMultiplexee(void *object)
   {
-    if (dispatcher == nullptr)
-    {
-      (void)object;
-      std::abort();
-    }
-
-    dispatcher->multiplexees.erase(object);
+    current().multiplexees.erase(object);
   }
 
   void beforeRing(void)
@@ -217,9 +200,31 @@ public:
   RingDispatcher()
   {
     dispatcher = this;
-    ringInterfacer = this;
-    ringLifecycler = this;
+    if (ringInterfacer == nullptr)
+    {
+      ringInterfacer = this;
+    }
+
+    if (ringLifecycler == nullptr)
+    {
+      ringLifecycler = this;
+    }
   }
 };
 
-inline RingDispatcher globalRingDispatcher;
+inline thread_local RingDispatcher globalRingDispatcher;
+
+inline RingDispatcher& RingDispatcher::current()
+{
+  if (dispatcher == nullptr)
+  {
+    (void)globalRingDispatcher;
+  }
+
+  if (dispatcher == nullptr)
+  {
+    std::abort();
+  }
+
+  return *dispatcher;
+}

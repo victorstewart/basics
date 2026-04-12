@@ -1879,6 +1879,7 @@ private:
   uint16_t port_ = 0;
   pid_t pid_ = -1;
   std::string hostKeyPath_;
+  std::string hostPublicKey_;
   std::string clientKeyPath_;
   std::string authorizedKeysPath_;
   std::string configPath_;
@@ -1979,6 +1980,8 @@ public:
       return;
     }
 
+    hostPublicKey_.assign(reinterpret_cast<const char *>(hostKeys.publicKeyOpenSSH.data()), size_t(hostKeys.publicKeyOpenSSH.size()));
+
     if (!writeFile(std::string_view(authorizedKeysPath_),
                    std::string_view(reinterpret_cast<const char *>(clientKeys.publicKeyOpenSSH.data()),
                                     size_t(clientKeys.publicKeyOpenSSH.size()))))
@@ -2060,6 +2063,11 @@ public:
   const std::string& clientKeyPath() const
   {
     return clientKeyPath_;
+  }
+
+  const std::string& hostPublicKey() const
+  {
+    return hostPublicKey_;
   }
 
   std::string remoteFilePath(std::string_view leaf) const
@@ -2466,6 +2474,7 @@ static void testSSHClientLoopback(TestSuite& suite, bool& skipped)
   AsyncSSHClientScenario client;
   client.setIPVersion(AF_INET);
   client.setDaddr("127.0.0.1"_ctv, sshd.port());
+  client.configureExpectedHostKey("127.0.0.1"_ctv, sshd.port(), String(sshd.hostPublicKey().c_str()));
 
   restoreRingDispatcher();
   Ring::exit = false;
@@ -2490,6 +2499,52 @@ static void testSSHClientLoopback(TestSuite& suite, bool& skipped)
   EXPECT_TRUE(suite, stringViewOf(client.failingCommandMessage).find("boom") != std::string_view::npos);
 }
 
+static void testSSHClientRejectsMismatchedHostKey(TestSuite& suite, bool& skipped)
+{
+  if (!ringSupported())
+  {
+    skipped = true;
+    std::cout << "protocol client tests: skipping SSH host-key mismatch coverage because required io_uring features are unavailable.\n";
+    return;
+  }
+
+  ScopedSSHD sshd;
+  if (!sshd.ready())
+  {
+    skipped = true;
+    std::cout << "protocol client tests: skipping SSH host-key mismatch coverage because sshd could not be started: " << sshd.failure() << '\n';
+    return;
+  }
+
+  AsyncSSHClientScenario client;
+  client.setIPVersion(AF_INET);
+  client.setDaddr("127.0.0.1"_ctv, sshd.port());
+  String mismatchedHostKey = {};
+  {
+    std::string mismatchedHostKeyText = readFile(sshd.clientKeyPath() + ".pub");
+    mismatchedHostKey.assign(mismatchedHostKeyText.data(), mismatchedHostKeyText.size());
+  }
+  client.configureExpectedHostKey("127.0.0.1"_ctv, sshd.port(), mismatchedHostKey);
+
+  restoreRingDispatcher();
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(128, 256, 16, 4, -1, -1, 16);
+
+  client.run("root"_ctv, String(sshd.clientKeyPath().c_str()), String(sshd.remoteFilePath("uploaded.txt").c_str()));
+
+  Ring::start();
+  Ring::shutdownForExec();
+
+  restoreRingDispatcher();
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  EXPECT_TRUE(suite, client.finished);
+  EXPECT_TRUE(suite, client.failed);
+  EXPECT_TRUE(suite, stringViewOf(client.lastFailure).find("host key mismatch") != std::string_view::npos);
+}
+
 } // namespace
 
 int main()
@@ -2509,6 +2564,7 @@ int main()
   testH2BlockingClientJSONAndParseFailure(suite, tls);
   testH2NonBlockingClientFlows(suite, tls, skipped);
   testSSHClientLoopback(suite, skipped);
+  testSSHClientRejectsMismatchedHostKey(suite, skipped);
 
   if (skipped)
   {

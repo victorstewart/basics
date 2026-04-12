@@ -475,6 +475,16 @@ public:
     return tfoData;
   }
 
+  virtual void resetSubscriberTransportState(void)
+  {
+    pendingBuffer.clear();
+    inboundQueuedAtNs.clear();
+    inboundQueuedAtHead = 0;
+
+    Stream::reset();
+    SocketBase::reset();
+  }
+
   void reset(void)
   {
     secret = 0;

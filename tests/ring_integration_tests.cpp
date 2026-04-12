@@ -35,6 +35,8 @@
 
 namespace {
 
+static constexpr int kDynamicFixedSlotBegin = 5;
+
 static uint16_t boundPortForFD(int fd)
 {
   sockaddr_in address = {};
@@ -149,6 +151,7 @@ struct RingScenarioInterface : RingInterface {
 
     accepted = true;
     suite->expectTrue(fslot >= 0, "accept fixed-file slot is valid", __FILE__, __LINE__);
+    suite->expectTrue(fslot >= kDynamicFixedSlotBegin, "accept fixed-file slot stays out of reserved range", __FILE__, __LINE__);
 
     acceptedStream.fslot = fslot;
     acceptedStream.isFixedFile = true;
@@ -166,6 +169,7 @@ struct RingScenarioInterface : RingInterface {
     acceptMultishotReceived = true;
     acceptMultishotMustRearm = mustRearm;
     suite->expectTrue(fslot >= 0, "acceptMultishot fixed-file slot is valid", __FILE__, __LINE__);
+    suite->expectTrue(fslot >= kDynamicFixedSlotBegin, "acceptMultishot fixed-file slot stays out of reserved range", __FILE__, __LINE__);
 
     timedOutStream.fslot = fslot;
     timedOutStream.isFixedFile = true;
@@ -261,6 +265,109 @@ struct RingScenarioInterface : RingInterface {
 
     deadlineFired = true;
     suite->expectTrue(false, "ring scenario completed before deadline timeout", __FILE__, __LINE__);
+    Ring::exit = true;
+  }
+};
+
+struct DuplicateCloseInterface : RingInterface {
+  TestSuite *suite = nullptr;
+  UnixSocket socket;
+  TimeoutPacket deadline;
+  int closeCalls = 0;
+  bool deadlineFired = false;
+
+  explicit DuplicateCloseInterface(TestSuite& testSuite)
+      : suite(&testSuite)
+  {
+    deadline.setTimeoutMs(1000);
+  }
+
+  void closeHandler(void *closedSocket) override
+  {
+    if (closedSocket != &socket)
+    {
+      return;
+    }
+
+    closeCalls += 1;
+    Ring::exit = true;
+  }
+
+  void timeoutHandler(TimeoutPacket *packet, int result) override
+  {
+    if (packet != &deadline)
+    {
+      return;
+    }
+
+    deadlineFired = true;
+    suite->expectEqual(result, -ETIME, "result", "-ETIME", __FILE__, __LINE__);
+    Ring::exit = true;
+  }
+};
+
+struct AcceptCloseRawInterface : RingInterface {
+  TestSuite *suite = nullptr;
+  TCPSocket listener;
+  TimeoutPacket deadline;
+  int acceptCalls = 0;
+  int firstSlot = -1;
+  int secondSlot = -1;
+  bool listenerClosed = false;
+  bool deadlineFired = false;
+
+  explicit AcceptCloseRawInterface(TestSuite& testSuite)
+      : suite(&testSuite)
+  {
+    deadline.setTimeoutMs(1000);
+    configureLoopbackListener(listener);
+  }
+
+  void acceptHandler(void *socket, int fslot) override
+  {
+    if (socket != &listener)
+    {
+      return;
+    }
+
+    suite->expectTrue(fslot >= 0, "raw-close accept fixed-file slot is valid", __FILE__, __LINE__);
+    suite->expectTrue(fslot >= kDynamicFixedSlotBegin, "raw-close accept fixed-file slot stays out of reserved range", __FILE__, __LINE__);
+
+    if (acceptCalls == 0)
+    {
+      firstSlot = fslot;
+      acceptCalls += 1;
+      Ring::queueCloseRaw(fslot);
+      Ring::queueAccept(&listener);
+      return;
+    }
+
+    secondSlot = fslot;
+    acceptCalls += 1;
+    Ring::queueCloseRaw(fslot);
+    Ring::queueClose(&listener);
+  }
+
+  void closeHandler(void *closedSocket) override
+  {
+    if (closedSocket != &listener)
+    {
+      return;
+    }
+
+    listenerClosed = true;
+    Ring::exit = true;
+  }
+
+  void timeoutHandler(TimeoutPacket *packet, int result) override
+  {
+    if (packet != &deadline)
+    {
+      return;
+    }
+
+    deadlineFired = true;
+    suite->expectEqual(result, -ETIME, "result", "-ETIME", __FILE__, __LINE__);
     Ring::exit = true;
   }
 };
@@ -422,6 +529,88 @@ static void testRingletSendRecvAndTimeout(TestSuite& suite)
   ::close(fds[1]);
 }
 
+static void testDuplicateQueueCloseIsIdempotent(TestSuite& suite)
+{
+  int fds[2] = {-1, -1};
+  EXPECT_EQ(suite, socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds), 0);
+
+  DuplicateCloseInterface interfacer(suite);
+  interfacer.socket.fd = fds[0];
+
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  Ring::createRing(64, 64, 8, 4, -1, -1, 8);
+  Ring::installFDIntoFixedFileSlot(&interfacer.socket);
+  Ring::queueTimeout(&interfacer.deadline);
+  Ring::queueClose(&interfacer.socket);
+  Ring::queueClose(&interfacer.socket);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  ::close(fds[1]);
+
+  EXPECT_FALSE(suite, interfacer.deadlineFired);
+  EXPECT_EQ(suite, interfacer.closeCalls, 1);
+}
+
+static void testAcceptedCloseRawReturnsDynamicSlot(TestSuite& suite)
+{
+  AcceptCloseRawInterface interfacer(suite);
+  const uint16_t listenerPort = boundPortForFD(interfacer.listener.fd);
+  EXPECT_TRUE(suite, listenerPort != 0);
+
+  std::thread client([&]() {
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+      int fd = socket(AF_INET, SOCK_STREAM, 0);
+      if (fd < 0)
+      {
+        return;
+      }
+
+      sockaddr_in address = {};
+      address.sin_family = AF_INET;
+      address.sin_port = htons(listenerPort);
+      inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+
+      (void)connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address));
+      ::close(fd);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  });
+
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  Ring::createRing(32, 32, 5, 4, -1, -1, 8);
+  Ring::installFDIntoFixedFileSlot(&interfacer.listener);
+  Ring::queueTimeout(&interfacer.deadline);
+  Ring::queueAccept(&interfacer.listener);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  client.join();
+
+  EXPECT_FALSE(suite, interfacer.deadlineFired);
+  EXPECT_TRUE(suite, interfacer.listenerClosed);
+  EXPECT_EQ(suite, interfacer.acceptCalls, 2);
+  EXPECT_EQ(suite, interfacer.firstSlot, kDynamicFixedSlotBegin);
+  EXPECT_EQ(suite, interfacer.secondSlot, kDynamicFixedSlotBegin);
+}
+
 } // namespace
 
 int main()
@@ -435,5 +624,7 @@ int main()
   TestSuite suite;
   runRingScenario(suite);
   testRingletSendRecvAndTimeout(suite);
+  testDuplicateQueueCloseIsIdempotent(suite);
+  testAcceptedCloseRawReturnsDynamicSlot(suite);
   return suite.finish("ring integration tests");
 }

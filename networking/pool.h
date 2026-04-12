@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cstdlib>
+
 template <typename T, bool allowOverflow = false, bool storeOutstanding = false>
 class Pool {
 private:
@@ -38,6 +40,35 @@ public:
 
   void initialize(uint32_t count)
   {
+    if constexpr (allowOverflow == true)
+    {
+      for (T *item : available)
+      {
+        releaseOverflowItem(item);
+      }
+
+      if constexpr (storeOutstanding == true)
+      {
+        if (outstanding != nullptr)
+        {
+          for (T *item : *outstanding)
+          {
+            releaseOverflowItem(item);
+          }
+        }
+      }
+    }
+
+    available.clear();
+    delete[] base;
+    base = nullptr;
+
+    if constexpr (storeOutstanding == true)
+    {
+      delete outstanding;
+      outstanding = nullptr;
+    }
+
     capacity = count;
     watermark = 0;
     base = new T[count];
@@ -68,9 +99,12 @@ public:
 
       if constexpr (storeOutstanding == true)
       {
-        for (T *item : *outstanding)
+        if (outstanding != nullptr)
         {
-          releaseOverflowItem(item);
+          for (T *item : *outstanding)
+          {
+            releaseOverflowItem(item);
+          }
         }
       }
     }
@@ -163,12 +197,17 @@ public:
       return;
     }
 
-    available.push_back(item);
-
     if constexpr (storeOutstanding == true)
     {
+      if (outstanding == nullptr || outstanding->contains(item) == false)
+      {
+        std::abort();
+      }
+
       outstanding->erase(item);
     }
+
+    available.push_back(item);
   }
 };
 

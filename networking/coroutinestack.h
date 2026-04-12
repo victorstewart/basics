@@ -169,6 +169,7 @@ struct CoroutineGenerator {
   struct promise_type {
     // The most recently yielded value
     std::optional<T> currentValue;
+    bool blockedOnAwait = false;
 
     // Return the generator object
     CoroutineGenerator get_return_object()
@@ -202,12 +203,17 @@ struct CoroutineGenerator {
         // We'll define a small adapter to push the generator handle
         struct AwaitableAdapter {
           Cotask& c;
+          promise_type *promise = nullptr;
           bool await_ready()
           {
             return c.await_ready();
           }
           bool await_suspend(std::coroutine_handle<promise_type> h)
           {
+            promise = &h.promise();
+            promise->blockedOnAwait = true;
+            promise->currentValue.reset();
+
             // same logic as Cotask::await_suspend
             if (c.stack->overrideIndex != -1)
             {
@@ -223,6 +229,11 @@ struct CoroutineGenerator {
           }
           void await_resume()
           {
+            if (promise)
+            {
+              promise->blockedOnAwait = false;
+            }
+
             c.await_resume();
           }
         };
@@ -240,6 +251,7 @@ struct CoroutineGenerator {
     std::suspend_always yield_value(T value)
     {
       currentValue = std::move(value);
+      blockedOnAwait = false;
       return {};
     }
   };
@@ -292,6 +304,49 @@ struct CoroutineGenerator {
   std::default_sentinel_t end()
   {
     return {};
+  }
+
+  bool advance()
+  {
+    if (coro == nullptr || finished_)
+    {
+      return false;
+    }
+
+    coro.promise().currentValue.reset();
+    coro.promise().blockedOnAwait = false;
+
+    coro.resume();
+    if (coro.done())
+    {
+      finished_ = true;
+      return false;
+    }
+
+    return coro.promise().currentValue.has_value();
+  }
+
+  bool hasValue() const
+  {
+    return (coro != nullptr && coro.promise().currentValue.has_value());
+  }
+
+  bool blocked() const
+  {
+    return (coro != nullptr && coro.promise().blockedOnAwait);
+  }
+
+  const T& value() const
+  {
+    return *coro.promise().currentValue;
+  }
+
+  void clearValue()
+  {
+    if (coro)
+    {
+      coro.promise().currentValue.reset();
+    }
   }
 
   // Clean up the coroutine if not finished

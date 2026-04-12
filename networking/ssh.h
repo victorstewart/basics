@@ -20,6 +20,164 @@
 #include <limits>
 #include <string>
 
+static inline bool renderOpenSSHKnownHostLine(const String& host, uint16_t port, const String& publicKeyOpenSSH, String& line, String *failure = nullptr)
+{
+  line.clear();
+  if (failure != nullptr)
+  {
+    failure->clear();
+  }
+
+  if (host.size() == 0)
+  {
+    if (failure != nullptr)
+    {
+      failure->assign("ssh host verification requires host address"_ctv);
+    }
+    return false;
+  }
+
+  if (port == 0)
+  {
+    if (failure != nullptr)
+    {
+      failure->assign("ssh host verification requires host port"_ctv);
+    }
+    return false;
+  }
+
+  if (Vault::validateSSHEd25519PublicKey(publicKeyOpenSSH, failure) == false)
+  {
+    return false;
+  }
+
+  line.snprintf<"[{}]:{itoa} {}"_ctv>(host, uint64_t(port), publicKeyOpenSSH);
+  return true;
+}
+
+static inline bool verifySSHSessionHostKey(const String& host, uint16_t port, const String& publicKeyOpenSSH, LIBSSH2_SESSION *session, String *failure = nullptr)
+{
+  if (failure != nullptr)
+  {
+    failure->clear();
+  }
+
+  if (session == nullptr)
+  {
+    if (failure != nullptr)
+    {
+      failure->assign("ssh host verification requires session"_ctv);
+    }
+    return false;
+  }
+
+  String knownHostLine = {};
+  if (renderOpenSSHKnownHostLine(host, port, publicKeyOpenSSH, knownHostLine, failure) == false)
+  {
+    return false;
+  }
+
+  LIBSSH2_KNOWNHOSTS *knownHosts = libssh2_knownhost_init(session);
+  if (knownHosts == nullptr)
+  {
+    if (failure != nullptr)
+    {
+      failure->assign("failed to initialize ssh known-host collection"_ctv);
+    }
+    return false;
+  }
+
+  String knownHostLineText = {};
+  knownHostLineText.assign(knownHostLine);
+  int addResult = libssh2_knownhost_readline(
+     knownHosts,
+     knownHostLineText.c_str(),
+     size_t(knownHostLineText.size()),
+     LIBSSH2_KNOWNHOST_FILE_OPENSSH);
+  if (addResult != 0)
+  {
+    libssh2_knownhost_free(knownHosts);
+    if (failure != nullptr)
+    {
+      failure->assign("failed to load pinned ssh known-host entry"_ctv);
+    }
+    return false;
+  }
+
+  size_t sessionHostKeyLength = 0;
+  int sessionHostKeyType = LIBSSH2_HOSTKEY_TYPE_UNKNOWN;
+  const char *sessionHostKey = libssh2_session_hostkey(session, &sessionHostKeyLength, &sessionHostKeyType);
+  if (sessionHostKey == nullptr || sessionHostKeyLength == 0)
+  {
+    libssh2_knownhost_free(knownHosts);
+    if (failure != nullptr)
+    {
+      failure->assign("ssh server did not present a host key"_ctv);
+    }
+    return false;
+  }
+
+  int checkTypeMask = LIBSSH2_KNOWNHOST_TYPE_PLAIN | LIBSSH2_KNOWNHOST_KEYENC_RAW;
+  switch (sessionHostKeyType)
+  {
+    case LIBSSH2_HOSTKEY_TYPE_ED25519:
+    {
+      checkTypeMask |= LIBSSH2_KNOWNHOST_KEY_ED25519;
+      break;
+    }
+    default:
+    {
+      libssh2_knownhost_free(knownHosts);
+      if (failure != nullptr)
+      {
+        failure->assign("ssh server host key algorithm is not supported; only ed25519 is accepted"_ctv);
+      }
+      return false;
+    }
+  }
+
+  String hostText = {};
+  hostText.assign(host);
+  int checkResult = libssh2_knownhost_checkp(
+     knownHosts,
+     hostText.c_str(),
+     int(port),
+     sessionHostKey,
+     sessionHostKeyLength,
+     checkTypeMask,
+     nullptr);
+  libssh2_knownhost_free(knownHosts);
+
+  if (checkResult == LIBSSH2_KNOWNHOST_CHECK_MATCH)
+  {
+    return true;
+  }
+
+  if (failure != nullptr)
+  {
+    switch (checkResult)
+    {
+      case LIBSSH2_KNOWNHOST_CHECK_MISMATCH:
+      {
+        failure->snprintf<"ssh host key mismatch for {}:{itoa}"_ctv>(host, uint64_t(port));
+        break;
+      }
+      case LIBSSH2_KNOWNHOST_CHECK_NOTFOUND:
+      {
+        failure->snprintf<"ssh host key missing pinned entry for {}:{itoa}"_ctv>(host, uint64_t(port));
+        break;
+      }
+      default:
+      {
+        failure->snprintf<"ssh host key verification failed for {}:{itoa}"_ctv>(host, uint64_t(port));
+        break;
+      }
+    }
+  }
+
+  return false;
+}
+
 class SSHCommandResult {
 public:
 
@@ -143,10 +301,25 @@ private:
     if (readKeyFile(publicKeyPath.c_str(), publicKeyFile) == false)
     {
       error.assign("ssh ed25519 public key file could not be read"_ctv);
+      Vault::secureClearString(privateKeyFile);
       return false;
     }
 
-    if (Vault::validateSSHKeyPackageEd25519(privateKeyFile, publicKeyFile, &error) == false)
+    bool valid = Vault::validateSSHKeyPackageEd25519(privateKeyFile, publicKeyFile, &error);
+    Vault::secureClearString(privateKeyFile);
+    Vault::secureClearString(publicKeyFile);
+    if (valid == false)
+    {
+      return false;
+    }
+
+    return true;
+  }
+
+  static bool validateSSHKeyPackage(const Vault::SSHKeyPackage& package, String& error)
+  {
+    error.clear();
+    if (Vault::validateSSHKeyPackageEd25519(package, &error) == false)
     {
       return false;
     }
@@ -759,6 +932,23 @@ public:
 
   bool failed = false;
   String lastFailure = {};
+  String expectedHostAddress = {};
+  uint16_t expectedHostPort = 0;
+  String expectedHostPublicKeyOpenSSH = {};
+
+  void configureExpectedHostKey(const String& host, uint16_t port, const String& publicKeyOpenSSH)
+  {
+    expectedHostAddress.assign(host);
+    expectedHostPort = port;
+    expectedHostPublicKeyOpenSSH.assign(publicKeyOpenSSH);
+  }
+
+  void clearExpectedHostKey(void)
+  {
+    expectedHostAddress.clear();
+    expectedHostPort = 0;
+    expectedHostPublicKeyOpenSSH.clear();
+  }
 
   void connectHandler(void *socket, int result) override
   {
@@ -831,6 +1021,14 @@ private:
       co_return;
     }
 
+    if (expectedHostAddress.size() == 0 || expectedHostPort == 0 || expectedHostPublicKeyOpenSSH.size() == 0)
+    {
+      failed = true;
+      lastFailure.assign("ssh host verification must be configured before authentication"_ctv);
+      releaseSession();
+      co_return;
+    }
+
     if (userText.size() > uint64_t(std::numeric_limits<unsigned int>::max()))
     {
       failed = true;
@@ -876,12 +1074,127 @@ private:
       }
     }
 
+    if (verifySSHSessionHostKey(expectedHostAddress, expectedHostPort, expectedHostPublicKeyOpenSSH, session, &lastFailure) == false)
+    {
+      failed = true;
+      releaseSession();
+      co_return;
+    }
+
     while ((rc = libssh2_userauth_publickey_fromfile_ex(session,
                                                         userTextCopy.c_str(),
                                                         static_cast<unsigned int>(userTextCopy.size()),
                                                         publicKeyPathText.c_str(),
                                                         privateKeyPathCopy.c_str(),
                                                         nullptr)) != 0)
+    {
+      if (rc != LIBSSH2_ERROR_EAGAIN)
+      {
+        failWithSessionError("ssh ed25519 auth failed");
+        releaseSession();
+        co_return;
+      }
+
+      uint32_t suspendIndex = nextSuspendIndex();
+      awaitSessionIO(deadlineMs);
+      if (suspendIndex < nextSuspendIndex())
+      {
+        co_await suspendAtIndex(suspendIndex);
+      }
+
+      if (failed)
+      {
+        releaseSession();
+        co_return;
+      }
+    }
+  }
+
+  void authenticateWithDeadline(const String& userText, const Vault::SSHKeyPackage& package, int64_t deadlineMs)
+  {
+    resetFailure();
+    if (session == nullptr)
+    {
+      initializeSession();
+    }
+
+    if (failed || session == nullptr)
+    {
+      co_return;
+    }
+
+    if (ensureSocketNonBlocking() == false)
+    {
+      releaseSession();
+      co_return;
+    }
+
+    if (expectedHostAddress.size() == 0 || expectedHostPort == 0 || expectedHostPublicKeyOpenSSH.size() == 0)
+    {
+      failed = true;
+      lastFailure.assign("ssh host verification must be configured before authentication"_ctv);
+      releaseSession();
+      co_return;
+    }
+
+    if (userText.size() > uint64_t(std::numeric_limits<unsigned int>::max()))
+    {
+      failed = true;
+      lastFailure.assign("ssh username is too long"_ctv);
+      releaseSession();
+      co_return;
+    }
+
+    String userTextCopy = {};
+    userTextCopy.assign(userText);
+    if (validateSSHKeyPackage(package, lastFailure) == false)
+    {
+      failed = true;
+      releaseSession();
+      co_return;
+    }
+
+    int rc = 0;
+
+    while ((rc = libssh2_session_handshake(session, fd)) != 0)
+    {
+      if (rc != LIBSSH2_ERROR_EAGAIN)
+      {
+        failWithSessionError("ssh handshake failed");
+        releaseSession();
+        co_return;
+      }
+
+      uint32_t suspendIndex = nextSuspendIndex();
+      awaitSessionIO(deadlineMs);
+      if (suspendIndex < nextSuspendIndex())
+      {
+        co_await suspendAtIndex(suspendIndex);
+      }
+
+      if (failed)
+      {
+        releaseSession();
+        co_return;
+      }
+    }
+
+    if (verifySSHSessionHostKey(expectedHostAddress, expectedHostPort, expectedHostPublicKeyOpenSSH, session, &lastFailure) == false)
+    {
+      failed = true;
+      releaseSession();
+      co_return;
+    }
+
+    while ((rc = libssh2_userauth_publickey_frommemory(
+                session,
+                userTextCopy.c_str(),
+                userTextCopy.size(),
+                reinterpret_cast<const char *>(package.publicKeyOpenSSH.data()),
+                package.publicKeyOpenSSH.size(),
+                reinterpret_cast<const char *>(package.privateKeyOpenSSH.data()),
+                package.privateKeyOpenSSH.size(),
+                nullptr)) != 0)
     {
       if (rc != LIBSSH2_ERROR_EAGAIN)
       {
@@ -947,6 +1260,47 @@ public:
     }
   }
 
+  void authenticate(StringType auto&& user, const Vault::SSHKeyPackage& package, int timeoutMs = 120'000)
+  {
+    String userText = {};
+    userText.assign(user);
+    Vault::SSHKeyPackage keyPackage = package;
+
+    if (beginExclusiveOperation() == false)
+    {
+      co_return;
+    }
+
+    OperationScope operation(this);
+
+    if (session == nullptr)
+    {
+      initializeSession();
+    }
+
+    if (failed || session == nullptr)
+    {
+      co_return;
+    }
+
+    if (ensureDispatcherRegistration() == false)
+    {
+      releaseSession();
+      co_return;
+    }
+
+    uint32_t suspendIndex = nextSuspendIndex();
+    authenticateWithDeadline(userText,
+                             keyPackage,
+                             deadlineFromTimeoutMs(timeoutMs));
+    if (suspendIndex < nextSuspendIndex())
+    {
+      co_await suspendAtIndex(suspendIndex);
+    }
+
+    keyPackage.clear();
+  }
+
   void connectAndAuthenticate(StringType auto&& user, StringType auto&& privkeyPath, int timeoutMs = 120'000)
   {
     String userText = {};
@@ -1007,6 +1361,69 @@ public:
     {
       co_await suspendAtIndex(suspendIndex);
     }
+  }
+
+  void connectAndAuthenticate(StringType auto&& user, const Vault::SSHKeyPackage& package, int timeoutMs = 120'000)
+  {
+    String userText = {};
+    userText.assign(user);
+    Vault::SSHKeyPackage keyPackage = package;
+
+    if (beginExclusiveOperation() == false)
+    {
+      co_return;
+    }
+
+    OperationScope operation(this);
+
+    if (session == nullptr)
+    {
+      initializeSession();
+    }
+
+    if (failed || session == nullptr)
+    {
+      co_return;
+    }
+
+    if (ensureDispatcherRegistration() == false || ensureSocketNonBlocking() == false)
+    {
+      releaseSession();
+      co_return;
+    }
+
+    if (daddrLen == 0)
+    {
+      failed = true;
+      lastFailure.assign("ssh tcp destination not configured"_ctv);
+      releaseSession();
+      co_return;
+    }
+
+    int64_t deadlineMs = deadlineFromTimeoutMs(timeoutMs);
+    uint32_t suspendIndex = nextSuspendIndex();
+    awaitConnect(deadlineMs);
+    if (suspendIndex < nextSuspendIndex())
+    {
+      co_await suspendAtIndex(suspendIndex);
+    }
+
+    if (failed)
+    {
+      releaseSession();
+      co_return;
+    }
+
+    suspendIndex = nextSuspendIndex();
+    authenticateWithDeadline(userText,
+                             keyPackage,
+                             deadlineMs);
+    if (suspendIndex < nextSuspendIndex())
+    {
+      co_await suspendAtIndex(suspendIndex);
+    }
+
+    keyPackage.clear();
   }
 
 private:

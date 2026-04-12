@@ -427,7 +427,8 @@ public:
   static uint32_t serialize(uint8_t *buffer, uint8_t *terminal, T&& object)
   {
     reusableBufferView.setInvariant(buffer, terminal - buffer);
-    return serialize(reusableBufferView, std::forward<T>(object));
+    String& view = reusableBufferView;
+    return serialize(view, std::forward<T>(object));
   }
 
   template <typename T>
@@ -490,12 +491,19 @@ public:
   template <typename T>
   static bool deserialize(const uint8_t *buffer, const uint8_t *terminal, T&& object)
   {
-    reusableBufferView.setInvariant(buffer, terminal - buffer);
-    return deserialize(reusableBufferView, std::forward<T>(object));
+    if (likely(terminal > buffer))
+    {
+      Context context;
+      Deserializer deserializer(context, buffer, terminal - buffer);
+      deserializer.object(object);
+      return deserializer.adapter().isCompletedSuccessfully();
+    }
+
+    return false;
   }
 
   template <typename BufferLike, typename T>
-  requires (ByteViewableType<BufferLike>)
+  requires (ByteViewableType<BufferLike> && !decay_equiv_v<BufferLike, String>)
   static bool deserialize(BufferLike&& buffer, T&& object)
   {
     const ByteStringView view = basics_byte_string_view(buffer);
