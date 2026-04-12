@@ -11,7 +11,7 @@
 #include <sys/un.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
-#include <linux/tcp.h> // TCP_NODELAY
+#include <netinet/tcp.h> // TCP_NODELAY
 #include <fcntl.h>
 #include <sys/sendfile.h>
 #include <unistd.h> // unlink
@@ -520,8 +520,6 @@ public:
       : SocketBase(_domain, _type, _protocol, shouldCreate)
   {}
 };
-
-#include <linux/tcp.h>
 
 class TCPSocket : public IPSocket {
 private:
