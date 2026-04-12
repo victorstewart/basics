@@ -197,9 +197,17 @@ public:
     });
   }
 
-  RingDispatcher()
+  explicit RingDispatcher(bool installAsCurrentDispatcher = true)
   {
-    dispatcher = this;
+    // The thread-local fallback dispatcher can initialize lazily the first time
+    // other thread-local ring pointers are touched. That fallback must not
+    // clobber a deliberate live dispatcher (for example an application server
+    // object) that was already installed earlier in the same thread.
+    if (installAsCurrentDispatcher || dispatcher == nullptr)
+    {
+      dispatcher = this;
+    }
+
     if (ringInterfacer == nullptr)
     {
       ringInterfacer = this;
@@ -212,7 +220,7 @@ public:
   }
 };
 
-inline thread_local RingDispatcher globalRingDispatcher;
+inline thread_local RingDispatcher globalRingDispatcher(false);
 
 inline RingDispatcher& RingDispatcher::current()
 {

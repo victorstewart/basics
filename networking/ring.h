@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <array>
 #include <cstdlib>
 
 #include "networking/ring.interfaces.h"
@@ -21,6 +22,18 @@ public:
 
   struct msghdr msgh = {};
   uint32_t bgid = 0;
+  uint64_t recvmsgMultishotSerial = 0;
+
+  uint64_t bumpRecvmsgMultishotSerial(void)
+  {
+    recvmsgMultishotSerial += 1;
+    if (recvmsgMultishotSerial == 0)
+    {
+      recvmsgMultishotSerial = 1;
+    }
+
+    return recvmsgMultishotSerial;
+  }
 };
 
 class WaitableProcess {
@@ -102,6 +115,21 @@ private:
     Operation linkedOp = Operation::timeout;
   };
 
+  struct CloseCompletionTracking {
+
+    void *socket = nullptr;
+    int slot = -1;
+    uint64_t serial = 0;
+    uint8_t generation = 0;
+  };
+
+  struct RecvmsgMultishotTracking {
+
+    void *socket = nullptr;
+    uint8_t generation = 0;
+    uint64_t serial = 0;
+  };
+
   static thread_local inline Pool<MsghdrPackage, true, true> msghdrPackagePool;
   struct FileBufferPackage {
     int fslot;
@@ -118,7 +146,10 @@ private:
   static thread_local inline bytell_hash_map<uint32_t, BufferRing> bufferRingsByBgid;
   static thread_local inline bytell_hash_map<void *, uint8_t> socketGenerationByIdentity;
   static thread_local inline bytell_hash_map<void *, RecvmsgMultishoter *> recvmsgMultishoterByIdentity;
-  static thread_local inline bytell_hash_map<uint64_t, int> closeSlotByUserData;
+  static thread_local inline bytell_hash_map<uint64_t, CloseCompletionTracking> closeTrackingByUserData;
+  static thread_local inline bytell_hash_set<uint64_t> retiredCloseTrackingUserData;
+  static thread_local inline bytell_hash_map<uint64_t, RecvmsgMultishotTracking> recvmsgMultishotTrackingByUserData;
+  static thread_local inline bytell_hash_set<uint64_t> retiredRecvmsgMultishotTrackingUserData;
 
   static uint8_t getTagFromUserData(uint64_t user_data)
   {
@@ -175,6 +206,139 @@ private:
   static void noteSocketGeneration(T *socket)
   {
     socketGenerationByIdentity[socketIdentity(socket)] = socket->ioGeneration;
+  }
+
+  static uint64_t allocateCloseTicket(void)
+  {
+    uint64_t ticket = nextCloseTicket++;
+    ticket &= 0x0000FFFFFFFFFFFFULL;
+    if (ticket == 0)
+    {
+      ticket = 1;
+      nextCloseTicket = 2;
+    }
+
+    return ticket;
+  }
+
+  static uint64_t issueCloseTracking(void *socketKey, int slot, uint64_t serial, uint8_t generation)
+  {
+    uint64_t userData = 0;
+
+    do
+    {
+      userData = getUserDataFor(Operation::close, allocateCloseTicket());
+    }
+    while (closeTrackingByUserData.contains(userData));
+
+    CloseCompletionTracking tracking = {};
+    tracking.socket = socketKey;
+    tracking.slot = slot;
+    tracking.serial = serial;
+    tracking.generation = generation;
+    closeTrackingByUserData.insert_or_assign(userData, tracking);
+    return userData;
+  }
+
+  static bool recvmsgMultishotSerialMatches(void *socketKey, uint64_t serial)
+  {
+    auto it = recvmsgMultishoterByIdentity.find(socketKey);
+    if (it == recvmsgMultishoterByIdentity.end() || it->second == nullptr)
+    {
+      return false;
+    }
+
+    return (it->second->recvmsgMultishotSerial == serial);
+  }
+
+  static uint64_t allocateRecvmsgMultishotTicket(void)
+  {
+    uint64_t ticket = nextRecvmsgMultishotTicket++;
+    ticket &= 0x0000FFFFFFFFFFFFULL;
+    if (ticket == 0)
+    {
+      ticket = 1;
+      nextRecvmsgMultishotTicket = 2;
+    }
+
+    return ticket;
+  }
+
+  static uint64_t issueRecvmsgMultishotTracking(void *socketKey, uint8_t generation, uint64_t serial)
+  {
+    uint64_t userData = 0;
+
+    do
+    {
+      userData = getUserDataFor(Operation::recvmsgMultishot, allocateRecvmsgMultishotTicket());
+    }
+    while (recvmsgMultishotTrackingByUserData.contains(userData));
+
+    RecvmsgMultishotTracking tracking = {};
+    tracking.socket = socketKey;
+    tracking.generation = generation;
+    tracking.serial = serial;
+    recvmsgMultishotTrackingByUserData.insert_or_assign(userData, tracking);
+    return userData;
+  }
+
+  static void noteRetiredCloseTracking(uint64_t userData)
+  {
+    constexpr size_t retainedCloseCompletions = 4096;
+
+    if (retiredCloseTrackingUserDataCount == retainedCloseCompletions)
+    {
+      retiredCloseTrackingUserData.erase(retiredCloseTrackingHistory[retiredCloseTrackingHead]);
+    }
+    else
+    {
+      ++retiredCloseTrackingUserDataCount;
+    }
+
+    retiredCloseTrackingHistory[retiredCloseTrackingHead] = userData;
+    retiredCloseTrackingUserData.insert(userData);
+    retiredCloseTrackingHead = (retiredCloseTrackingHead + 1) % retainedCloseCompletions;
+  }
+
+  static void noteRetiredRecvmsgMultishotTracking(uint64_t userData)
+  {
+    constexpr size_t retainedRecvmsgMultishotCompletions = 4096;
+
+    if (retiredRecvmsgMultishotTrackingUserDataCount == retainedRecvmsgMultishotCompletions)
+    {
+      retiredRecvmsgMultishotTrackingUserData.erase(retiredRecvmsgMultishotTrackingHistory[retiredRecvmsgMultishotTrackingHead]);
+    }
+    else
+    {
+      ++retiredRecvmsgMultishotTrackingUserDataCount;
+    }
+
+    retiredRecvmsgMultishotTrackingHistory[retiredRecvmsgMultishotTrackingHead] = userData;
+    retiredRecvmsgMultishotTrackingUserData.insert(userData);
+    retiredRecvmsgMultishotTrackingHead = (retiredRecvmsgMultishotTrackingHead + 1) % retainedRecvmsgMultishotCompletions;
+  }
+
+  static bool resolveTrackedRecvmsgMultishot(uint64_t userData, RecvmsgMultishotTracking& tracking)
+  {
+    auto it = recvmsgMultishotTrackingByUserData.find(userData);
+    if (it == recvmsgMultishotTrackingByUserData.end())
+    {
+      return false;
+    }
+
+    tracking = it->second;
+    return true;
+  }
+
+  static void retireTrackedRecvmsgMultishot(uint64_t userData)
+  {
+    auto it = recvmsgMultishotTrackingByUserData.find(userData);
+    if (it != recvmsgMultishotTrackingByUserData.end())
+    {
+      recvmsgMultishotTrackingByUserData.erase(it);
+    }
+
+    noteRetiredRecvmsgMultishotTracking(userData);
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
@@ -360,13 +524,15 @@ public:
     requireFixedFileSocket(socket, "queueRecvmsgMultishot");
     void *socketKey = socketIdentity(socket);
     noteSocketGeneration(socket);
-    recvmsgMultishoterByIdentity[socketKey] = static_cast<RecvmsgMultishoter *>(socket);
+    RecvmsgMultishoter *shoter = static_cast<RecvmsgMultishoter *>(socket);
+    recvmsgMultishoterByIdentity[socketKey] = shoter;
+    uint64_t serial = shoter->bumpRecvmsgMultishotSerial();
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_recvmsg_multishot(sqe, socket->fslot, &socket->msgh, flags);
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT);
     sqe->buf_group = socket->bgid;
     sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
-    setUserData(sqe, Operation::recvmsgMultishot, socketKey, socket->ioGeneration);
+    sqe->user_data = issueRecvmsgMultishotTracking(socketKey, socket->ioGeneration, serial);
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T> && !std::is_base_of_v<RecvmsgMultishoter, T>)
@@ -652,7 +818,13 @@ public:
     }
 
     isClosing.insert(socketKey);
-    closingGenerationByIdentity.insert_or_assign(socketKey, socket->ioGeneration);
+    uint64_t closeSerial = nextCloseSerial++;
+    if (closeSerial == 0)
+    {
+      closeSerial = nextCloseSerial++;
+    }
+
+    closingSerialByIdentity.insert_or_assign(socketKey, closeSerial);
 
     if (socket->isFixedFile)
     {
@@ -678,25 +850,8 @@ public:
       socket->isFixedFile = false;
     }
 
-    uint64_t userData = getUserDataFor(Operation::close, socketKey, socket->ioGeneration);
+    uint64_t userData = issueCloseTracking(socketKey, closeSlot, closeSerial, socket->ioGeneration);
     sqe->user_data = userData;
-    closeSlotByUserData.insert_or_assign(userData, closeSlot);
-  }
-
-  static bool shouldIgnoreMissingCloseCompletion(void *socketKey, uint8_t tag)
-  {
-    if (isClosing.contains(socketKey) == false)
-    {
-      return true;
-    }
-
-    auto closingIt = closingGenerationByIdentity.find(socketKey);
-    if (closingIt == closingGenerationByIdentity.end())
-    {
-      return false;
-    }
-
-    return (closingIt->second != tag);
   }
 
   static bool shouldIgnoreMissingMsghdrCompletion(MsghdrPackage *package)
@@ -704,12 +859,12 @@ public:
     return (package == nullptr || msghdrPackagePool.contains(package) == false);
   }
 
-  static bool resolveTrackedCloseSlot(uint64_t user_data, void *socketKey, uint8_t tag, int& slot)
+  static bool resolveTrackedCloseCompletion(uint64_t user_data, CloseCompletionTracking& tracking)
   {
-    auto slotIt = closeSlotByUserData.find(user_data);
-    if (slotIt == closeSlotByUserData.end())
+    auto trackingIt = closeTrackingByUserData.find(user_data);
+    if (trackingIt == closeTrackingByUserData.end())
     {
-      if (shouldIgnoreMissingCloseCompletion(socketKey, tag))
+      if (retiredCloseTrackingUserData.contains(user_data))
       {
         return false;
       }
@@ -717,9 +872,24 @@ public:
       std::abort();
     }
 
-    slot = slotIt->second;
-    closeSlotByUserData.erase(slotIt);
+    tracking = trackingIt->second;
+    closeTrackingByUserData.erase(trackingIt);
+    noteRetiredCloseTracking(user_data);
     return true;
+  }
+
+  static bool shouldDispatchTrackedCloseCompletion(void *socketKey, uint64_t serial, uint8_t generation)
+  {
+    auto closingIt = closingSerialByIdentity.find(socketKey);
+    if (closingIt == closingSerialByIdentity.end() || closingIt->second != serial)
+    {
+      return false;
+    }
+
+    bool dispatchCloseHandler = socketGenerationMatches(socketKey, generation);
+    isClosing.erase(socketKey);
+    closingSerialByIdentity.erase(closingIt);
+    return dispatchCloseHandler;
   }
 
   static void queueCloseRaw(int fslot) // maybe you accepted direct, but want to reject it
@@ -878,6 +1048,12 @@ public:
     setUserData(sqe, Operation::fsyncFile, (uint64_t)fslot);
   }
 
+  template <typename T> requires (std::is_base_of_v<SocketBase, T> && std::is_base_of_v<RecvmsgMultishoter, T>)
+  static bool recvmsgMultishotTrackingMatchesCurrent(T *socket, uint64_t serial)
+  {
+    return recvmsgMultishotSerialMatches(socketIdentity(socket), serial);
+  }
+
 private:
 
   static thread_local inline struct signalfd_siginfo sigInfo; // we don't actually read it so overwrite who cares
@@ -888,7 +1064,16 @@ private:
   static thread_local inline bytell_hash_set<int> vacantFixedFileSlots;
   static thread_local inline bytell_hash_set<int> vacantAcceptedFixedFileSlots;
   static thread_local inline bytell_hash_set<void *> isClosing;
-  static thread_local inline bytell_hash_map<void *, uint8_t> closingGenerationByIdentity;
+  static thread_local inline bytell_hash_map<void *, uint64_t> closingSerialByIdentity;
+  static thread_local inline uint64_t nextCloseSerial = 1;
+  static thread_local inline uint64_t nextCloseTicket = 1;
+  static thread_local inline std::array<uint64_t, 4096> retiredCloseTrackingHistory = {};
+  static thread_local inline size_t retiredCloseTrackingHead = 0;
+  static thread_local inline size_t retiredCloseTrackingUserDataCount = 0;
+  static thread_local inline uint64_t nextRecvmsgMultishotTicket = 1;
+  static thread_local inline std::array<uint64_t, 4096> retiredRecvmsgMultishotTrackingHistory = {};
+  static thread_local inline size_t retiredRecvmsgMultishotTrackingHead = 0;
+  static thread_local inline size_t retiredRecvmsgMultishotTrackingUserDataCount = 0;
 
   static thread_local inline bytell_hash_map<int, int> fdToRingSlot;
 
@@ -1062,10 +1247,23 @@ public:
     vacantFixedFileSlots.clear();
     vacantAcceptedFixedFileSlots.clear();
     isClosing.clear();
-    closingGenerationByIdentity.clear();
-    closeSlotByUserData.clear();
+    closingSerialByIdentity.clear();
+    closeTrackingByUserData.clear();
+    retiredCloseTrackingUserData.clear();
+    recvmsgMultishotTrackingByUserData.clear();
+    retiredRecvmsgMultishotTrackingUserData.clear();
     fdToRingSlot.clear();
     socketGenerationByIdentity.clear();
+    recvmsgMultishoterByIdentity.clear();
+    nextCloseSerial = 1;
+    nextCloseTicket = 1;
+    retiredCloseTrackingHistory.fill(0);
+    retiredCloseTrackingHead = 0;
+    retiredCloseTrackingUserDataCount = 0;
+    nextRecvmsgMultishotTicket = 1;
+    retiredRecvmsgMultishotTrackingHistory.fill(0);
+    retiredRecvmsgMultishotTrackingHead = 0;
+    retiredRecvmsgMultishotTrackingUserDataCount = 0;
     memset(signals, 0xff, sizeof(signals));
   }
 
@@ -1487,7 +1685,6 @@ public:
           case Operation::acceptMultishot:
           case Operation::send:
           case Operation::recv:
-          case Operation::recvmsgMultishot:
           case Operation::tcpFastOpen:
             {
               // ignore the cqe if we've closed the slot
@@ -1521,6 +1718,38 @@ public:
               if ((op == Operation::connect || op == Operation::send || op == Operation::recv || op == Operation::poll) && result == -ECANCELED)
               {
                 continue;
+              }
+              break;
+            }
+          case Operation::recvmsgMultishot:
+            {
+              RecvmsgMultishotTracking tracking = {};
+              if (resolveTrackedRecvmsgMultishot(user_data, tracking) == false)
+              {
+                continue;
+              }
+
+              object = tracking.socket;
+
+              if (isClosing.contains(object))
+              {
+                if (!(cqe->flags & IORING_CQE_F_MORE))
+                {
+                  retireTrackedRecvmsgMultishot(user_data);
+                }
+                continue;
+              }
+              if (socketGenerationMatches(object, tracking.generation) == false || recvmsgMultishotSerialMatches(object, tracking.serial) == false)
+              {
+                if (!(cqe->flags & IORING_CQE_F_MORE))
+                {
+                  retireTrackedRecvmsgMultishot(user_data);
+                }
+                continue;
+              }
+              if (!(cqe->flags & IORING_CQE_F_MORE))
+              {
+                retireTrackedRecvmsgMultishot(user_data);
               }
               break;
             }
@@ -1702,12 +1931,13 @@ public:
             }
           case Operation::close:
             {
-              void *socketKey = object;
-              int slot = -1;
-              if (resolveTrackedCloseSlot(user_data, socketKey, tag, slot) == false)
+              CloseCompletionTracking tracking = {};
+              if (resolveTrackedCloseCompletion(user_data, tracking) == false)
               {
                 break;
               }
+              void *socketKey = tracking.socket;
+              int slot = tracking.slot;
 
               if (slot >= 0)
               {
@@ -1728,11 +1958,8 @@ public:
                 fixedfiles[slot] = -1;
               }
 
-              auto it = closingGenerationByIdentity.find(socketKey);
-              if (it != closingGenerationByIdentity.end() && it->second == tag)
+              if (shouldDispatchTrackedCloseCompletion(socketKey, tracking.serial, tracking.generation))
               {
-                isClosing.erase(socketKey);
-                closingGenerationByIdentity.erase(it);
                 interfacer->closeHandler(socketKey);
               }
               break;

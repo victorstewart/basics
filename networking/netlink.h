@@ -426,6 +426,23 @@ public:
     request->setAddrLen(0);
   }
 
+  void setInterfaceMTU(NetlinkMessage *request, uint32_t seq, int ifidx, uint32_t mtu)
+  {
+    struct nl_req *nlreq = new (request->data) nl_req();
+    nlreq->h->nlmsg_type = RTM_NEWLINK;
+    nlreq->h->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nlreq->h->nlmsg_seq = seq;
+
+    struct ifinfomsg *ifm = nlreq->appendStruct<struct ifinfomsg>();
+    ifm->ifi_family = AF_UNSPEC;
+    ifm->ifi_index = ifidx;
+
+    nlreq->appendAttribute(IFLA_MTU, &mtu, sizeof(mtu));
+
+    request->setPayloadLen(nlreq->h->nlmsg_len);
+    request->setAddrLen(0);
+  }
+
   // mode == NETKIT_L2 or NETKIT_L3
   void createNetkitPair(NetlinkMessage *request, uint32_t seq, uint32_t mode, StringType auto&& hostname, StringType auto&& peername, int peerpid)
   {
@@ -1607,6 +1624,7 @@ public:
 
   String name;
   uint32_t ifidx;
+  uint32_t mtu = 0;
   uint8_t mac[6];
 
   template <StringType T, StringType X, typename MapOfMapsSeeder>
@@ -1776,6 +1794,26 @@ public:
     flushDiscard();
   }
 
+  bool setMTU(uint32_t value)
+  {
+    if (ifidx == 0 || value == 0)
+    {
+      return false;
+    }
+
+    generateRequest([&](NetlinkMessage *request) -> void {
+      socket.setInterfaceMTU(request, 0, ifidx, value);
+    });
+
+    if (flushDiscardChecked() == false)
+    {
+      return false;
+    }
+
+    mtu = value;
+    return true;
+  }
+
   void addIP(StringType auto&& address, uint8_t cidr, int ip_version)
   {
     generateRequest([&](NetlinkMessage *request) -> void {
@@ -1861,6 +1899,7 @@ public:
   void getInfo(void)
   {
     ifidx = 0;
+    mtu = 0;
     memset(mac, 0, sizeof(mac));
 
     if (name.size() > 0)
@@ -1884,6 +1923,10 @@ public:
             if (type == IFLA_ADDRESS)
             {
               memcpy(mac, data, 6);
+            }
+            else if (type == IFLA_MTU)
+            {
+              mtu = *reinterpret_cast<uint32_t *>(data);
             }
           });
         }

@@ -628,9 +628,17 @@ public:
     setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &tcpKeepIntvlVal, sizeof(tcpKeepIntvlVal));
 
     // For TCP_USER_TIMEOUT
-    // then fail after this amount of idle time (not necessary to add this but might as well)
-    // the maximum amount of time in milliseconds that transmitted data may remain unacknowledged, or bufferred data may remain untransmitted (due to zero window size) before TCP will forcibly close the corresponding connection and return  ETIMEDOUT to the application. Increasing user timeouts allows a TCP connection to survive extended periods without end-to-end connectivity. Decreasing user timeouts allows applications to "fail fast", if so desired.
+    // Keepalives can be aggressive, but applying the same tiny budget directly to
+    // unacknowledged in-flight data can make large control-plane transfers fail
+    // with ETIMEDOUT on otherwise healthy peers. Clamp the user-timeout floor so
+    // multi-megabyte sends survive short ACK stalls while idle dead-peer
+    // detection still comes from the keepalive probes above.
     unsigned int timeoutMs = timeoutAfterSeconds * 1000;
+    constexpr unsigned int minimumUserTimeoutMs = 30000;
+    if (timeoutMs < minimumUserTimeoutMs)
+    {
+      timeoutMs = minimumUserTimeoutMs;
+    }
     setsockopt(fd, SOL_TCP, TCP_USER_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
   }
 
