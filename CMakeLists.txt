@@ -3,7 +3,7 @@
 
 cmake_minimum_required(VERSION 3.21)
 
-project(basics VERSION 0.2.5 LANGUAGES CXX)
+project(basics VERSION 0.2.6 LANGUAGES CXX)
 
 include(CTest)
 include("${CMAKE_CURRENT_SOURCE_DIR}/.depos.cmake")
@@ -340,4 +340,11 @@ add_test(
       "-DBASICS_PACKAGE_DEPOFILE=${_basics_self_depofile}"
       "-DEXPECT_TIDESDB=$<IF:$<BOOL:${BASICS_ENABLE_TIDESDB}>,ON,OFF>"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_tidesdb_package_contract.cmake"
+)
+
+add_test(
+  NAME basics_codex_slot_workflow
+  COMMAND
+    bash
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_codex_slot_workflow.sh"
 )
