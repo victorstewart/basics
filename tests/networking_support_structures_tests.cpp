@@ -8,6 +8,7 @@
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -173,13 +174,19 @@ struct DestructionProbe {
 
 static void clearRingCloseTrackingState(void)
 {
+  Ring::linkTimeoutTrackingByUserData.clear();
+  Ring::retiredLinkTimeoutTrackingUserData.clear();
   Ring::closeTrackingByUserData.clear();
   Ring::retiredCloseTrackingUserData.clear();
   Ring::isClosing.clear();
   Ring::closingSerialByIdentity.clear();
   Ring::socketGenerationByIdentity.clear();
+  Ring::nextLinkTimeoutTicket = 1;
   Ring::nextCloseSerial = 1;
   Ring::nextCloseTicket = 1;
+  Ring::retiredLinkTimeoutTrackingHistory.fill(0);
+  Ring::retiredLinkTimeoutTrackingHead = 0;
+  Ring::retiredLinkTimeoutTrackingUserDataCount = 0;
   Ring::retiredCloseTrackingHistory.fill(0);
   Ring::retiredCloseTrackingHead = 0;
   Ring::retiredCloseTrackingUserDataCount = 0;
@@ -683,6 +690,36 @@ static void testTrackedCloseCompletionSkipsReusedGeneration(TestSuite& suite)
   clearRingCloseTrackingState();
 }
 
+static void testTrackedCloseCompletionSkipsRecycledPointerAfterGenerationRepublish(TestSuite& suite)
+{
+  clearRingCloseTrackingState();
+
+  UnixStream stream;
+  void *socketKey = Ring::socketIdentity(&stream);
+  stream.ioGeneration = 9;
+  Ring::publishSocketGeneration(&stream);
+  Ring::isClosing.insert(socketKey);
+  Ring::closingSerialByIdentity.insert_or_assign(socketKey, uint64_t(6));
+
+  const uint64_t userData = Ring::issueCloseTracking(socketKey, 23, 6, stream.ioGeneration);
+
+  // A recycled allocation can restart from a lower/default generation while
+  // retaining the same identity address. Republish that fresh generation before
+  // the first recv/send arm so stale close CQEs cannot match the old transport.
+  stream.ioGeneration = 1;
+  Ring::publishSocketGeneration(&stream);
+
+  Ring::CloseCompletionTracking tracking = {};
+  EXPECT_TRUE(suite, Ring::resolveTrackedCloseCompletion(userData, tracking));
+  EXPECT_EQ(suite, tracking.serial, uint64_t(6));
+  EXPECT_EQ(suite, tracking.generation, uint8_t(9));
+  EXPECT_FALSE(suite, Ring::shouldDispatchTrackedCloseCompletion(socketKey, tracking.serial, tracking.generation));
+  EXPECT_TRUE(suite, Ring::isClosing.contains(socketKey) == false);
+  EXPECT_TRUE(suite, Ring::closingSerialByIdentity.find(socketKey) == Ring::closingSerialByIdentity.end());
+
+  clearRingCloseTrackingState();
+}
+
 static void testTrackedCloseCompletionSkipsSupersededSerialAfterGenerationWrap(TestSuite& suite)
 {
   clearRingCloseTrackingState();
@@ -753,6 +790,49 @@ static void testTrackedCloseCompletionIgnoresRetiredDuplicate(TestSuite& suite)
   clearRingCloseTrackingState();
 }
 
+static void testTrackedLinkTimeoutIgnoresRetiredDuplicate(TestSuite& suite)
+{
+  clearRingCloseTrackingState();
+
+  UnixStream stream;
+  void *socketKey = Ring::socketIdentity(&stream);
+  stream.ioGeneration = 17;
+  Ring::noteSocketGeneration(&stream);
+
+  const uint64_t userData = Ring::issueLinkTimeoutTracking(socketKey, stream.ioGeneration, Ring::Operation::recv);
+  Ring::LinkTimeoutTracking tracking = {};
+  EXPECT_TRUE(suite, Ring::resolveTrackedLinkTimeout(userData, tracking));
+  EXPECT_TRUE(suite, tracking.socket == socketKey);
+  EXPECT_EQ(suite, tracking.generation, uint8_t(17));
+  EXPECT_TRUE(suite, tracking.linkedOp == Ring::Operation::recv);
+  EXPECT_TRUE(suite, Ring::retiredLinkTimeoutTrackingUserData.contains(userData));
+  EXPECT_FALSE(suite, Ring::resolveTrackedLinkTimeout(userData, tracking));
+
+  clearRingCloseTrackingState();
+}
+
+static void testTrackedLinkTimeoutSkipsRecycledPointerAfterGenerationRepublish(TestSuite& suite)
+{
+  clearRingCloseTrackingState();
+
+  UnixStream stream;
+  void *socketKey = Ring::socketIdentity(&stream);
+  stream.ioGeneration = 9;
+  Ring::publishSocketGeneration(&stream);
+
+  const uint64_t userData = Ring::issueLinkTimeoutTracking(socketKey, stream.ioGeneration, Ring::Operation::recv);
+
+  stream.ioGeneration = 1;
+  Ring::publishSocketGeneration(&stream);
+
+  Ring::LinkTimeoutTracking tracking = {};
+  EXPECT_TRUE(suite, Ring::resolveTrackedLinkTimeout(userData, tracking));
+  EXPECT_EQ(suite, tracking.generation, uint8_t(9));
+  EXPECT_FALSE(suite, Ring::socketGenerationMatches(socketKey, tracking.generation));
+
+  clearRingCloseTrackingState();
+}
+
 static void testMissingMsghdrCompletionIsIgnored(TestSuite& suite)
 {
   Ring::msghdrPackagePool.initialize(4);
@@ -794,8 +874,7 @@ struct FixedFileSlotFixture
         previousReserveLimit(Ring::fixedFileReserveLimit),
         previousRegistered(Ring::fixedFilesWereRegistered),
         previousVacantReserved(std::move(Ring::vacantFixedFileSlots)),
-        previousVacantAccepted(std::move(Ring::vacantAcceptedFixedFileSlots)),
-        previousFdToRingSlot(std::move(Ring::fdToRingSlot))
+        previousVacantAccepted(std::move(Ring::vacantAcceptedFixedFileSlots))
   {
     Ring::fixedfiles = new int[capacity];
     Ring::fixedFileCapacity = capacity;
@@ -805,7 +884,6 @@ struct FixedFileSlotFixture
 
     Ring::vacantFixedFileSlots.clear();
     Ring::vacantAcceptedFixedFileSlots.clear();
-    Ring::fdToRingSlot.clear();
 
     for (uint32_t index = 1; index < reserveLimit; ++index)
     {
@@ -827,7 +905,6 @@ struct FixedFileSlotFixture
     Ring::fixedFilesWereRegistered = previousRegistered;
     Ring::vacantFixedFileSlots = std::move(previousVacantReserved);
     Ring::vacantAcceptedFixedFileSlots = std::move(previousVacantAccepted);
-    Ring::fdToRingSlot = std::move(previousFdToRingSlot);
   }
 
   int *previousFixedFiles = nullptr;
@@ -836,7 +913,6 @@ struct FixedFileSlotFixture
   bool previousRegistered = false;
   bytell_hash_set<int> previousVacantReserved = {};
   bytell_hash_set<int> previousVacantAccepted = {};
-  bytell_hash_map<int, int> previousFdToRingSlot = {};
 };
 
 static void testFreshProcessFdAliasDoesNotUninstallOccupiedReservedSlot(TestSuite& suite)
@@ -858,6 +934,55 @@ static void testFreshProcessFdAliasDoesNotUninstallOccupiedReservedSlot(TestSuit
   EXPECT_EQ(suite, Ring::getFDFromFixedFileSlot(stream.fslot), 177);
 }
 
+static void testQueueRecvGrowsFullBufferBeforeArming(TestSuite& suite)
+{
+  bool createdRing = false;
+  if (Ring::getRingFD() <= 0)
+  {
+    Ring::interfacer = nullptr;
+    Ring::lifecycler = nullptr;
+    Ring::exit = false;
+    Ring::shuttingDown = false;
+    Ring::createRing(8, 8, 32, 32, -1, -1, 0);
+    createdRing = (Ring::getRingFD() > 0);
+  }
+
+  EXPECT_TRUE(suite, Ring::getRingFD() > 0);
+  if (Ring::getRingFD() <= 0)
+  {
+    return;
+  }
+
+  int fds[2] = {-1, -1};
+  const bool pairCreated = (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds) == 0);
+  EXPECT_TRUE(suite, pairCreated);
+  if (pairCreated)
+  {
+    UnixStream stream;
+    stream.setUnixPairHalf(fds[0]);
+    stream.rBuffer.reserve(16);
+    std::memset(stream.rBuffer.pTail(), 0xAB, size_t(stream.rBuffer.remainingCapacity()));
+    stream.rBuffer.advance(stream.rBuffer.remainingCapacity());
+
+    const uint64_t capacityBefore = stream.rBuffer.tentativeCapacity();
+    EXPECT_EQ(suite, stream.rBuffer.remainingCapacity(), uint64_t(0));
+
+    Ring::queueRecv(&stream);
+
+    EXPECT_TRUE(suite, stream.pendingRecv);
+    EXPECT_TRUE(suite, stream.rBuffer.remainingCapacity() > 0);
+    EXPECT_TRUE(suite, stream.rBuffer.tentativeCapacity() > capacityBefore);
+
+    close(fds[0]);
+    close(fds[1]);
+  }
+
+  if (createdRing)
+  {
+    Ring::shutdownForExec();
+  }
+}
+
 } // namespace
 
 int main()
@@ -872,11 +997,15 @@ int main()
   testCoroutineStackScheduling(suite);
   testResolveTrackedCloseCompletionReturnsTracking(suite);
   testTrackedCloseCompletionSkipsReusedGeneration(suite);
+  testTrackedCloseCompletionSkipsRecycledPointerAfterGenerationRepublish(suite);
   testTrackedCloseCompletionSkipsSupersededSerialAfterGenerationWrap(suite);
   testTrackedCloseCompletionDispatchesCurrentGeneration(suite);
   testTrackedCloseCompletionIgnoresRetiredDuplicate(suite);
+  testTrackedLinkTimeoutIgnoresRetiredDuplicate(suite);
+  testTrackedLinkTimeoutSkipsRecycledPointerAfterGenerationRepublish(suite);
   testMissingMsghdrCompletionIsIgnored(suite);
   testKeepaliveTimeoutClampsTcpUserTimeoutFloor(suite);
   testFreshProcessFdAliasDoesNotUninstallOccupiedReservedSlot(suite);
+  testQueueRecvGrowsFullBufferBeforeArming(suite);
   return suite.finish("networking_support_structures_tests");
 }

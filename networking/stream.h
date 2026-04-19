@@ -59,18 +59,20 @@ public:
       }
 
       const uint64_t preservedHead = head;
+      const uint64_t preservedLength = boundedLength((lengthToCopy > 0) ? lengthToCopy : length, capacity);
       other.clear();
       other.reserve(newCapacity);
 
-      if (length > 0)
+      if (preservedLength > 0)
       {
-        other.append(string, length);
+        other.append(string, preservedLength);
       }
 
       // Preserve logical consume position when mirroring into the expansion buffer.
-      // We copy full bytes (not only outstanding) to keep in-progress message
-      // header offsets valid, but head must track the same consumed prefix.
-      other.head = preservedHead;
+      // We may need to preserve bytes beyond the current logical length when a
+      // serializer is writing directly into reserved tail space, so use the
+      // requested copy length instead of only the committed length.
+      other.head = preservedHead > preservedLength ? preservedLength : preservedHead;
       length = 0;
       head = 0;
 

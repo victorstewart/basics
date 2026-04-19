@@ -443,6 +443,32 @@ public:
     request->setAddrLen(0);
   }
 
+  void setInterfacePacketBudget(NetlinkMessage *request, uint32_t seq, int ifidx, uint32_t mtu, uint32_t gsoMaxSegs = 0)
+  {
+    struct nl_req *nlreq = new (request->data) nl_req();
+    nlreq->h->nlmsg_type = RTM_NEWLINK;
+    nlreq->h->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nlreq->h->nlmsg_seq = seq;
+
+    struct ifinfomsg *ifm = nlreq->appendStruct<struct ifinfomsg>();
+    ifm->ifi_family = AF_UNSPEC;
+    ifm->ifi_index = ifidx;
+
+    nlreq->appendAttribute(IFLA_MTU, &mtu, sizeof(mtu));
+    nlreq->appendAttribute(IFLA_GSO_MAX_SIZE, &mtu, sizeof(mtu));
+    nlreq->appendAttribute(IFLA_GRO_MAX_SIZE, &mtu, sizeof(mtu));
+    nlreq->appendAttribute(IFLA_GSO_IPV4_MAX_SIZE, &mtu, sizeof(mtu));
+    nlreq->appendAttribute(IFLA_GRO_IPV4_MAX_SIZE, &mtu, sizeof(mtu));
+
+    if (gsoMaxSegs > 0)
+    {
+      nlreq->appendAttribute(IFLA_GSO_MAX_SEGS, &gsoMaxSegs, sizeof(gsoMaxSegs));
+    }
+
+    request->setPayloadLen(nlreq->h->nlmsg_len);
+    request->setAddrLen(0);
+  }
+
   // mode == NETKIT_L2 or NETKIT_L3
   void createNetkitPair(NetlinkMessage *request, uint32_t seq, uint32_t mode, StringType auto&& hostname, StringType auto&& peername, int peerpid)
   {
@@ -1811,6 +1837,26 @@ public:
     }
 
     mtu = value;
+    return true;
+  }
+
+  bool setPacketBudget(uint32_t mtuValue, uint32_t gsoMaxSegs = 0)
+  {
+    if (ifidx == 0 || mtuValue == 0)
+    {
+      return false;
+    }
+
+    generateRequest([&](NetlinkMessage *request) -> void {
+      socket.setInterfacePacketBudget(request, 0, ifidx, mtuValue, gsoMaxSegs);
+    });
+
+    if (flushDiscardChecked() == false)
+    {
+      return false;
+    }
+
+    mtu = mtuValue;
     return true;
   }
 

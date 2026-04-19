@@ -11,6 +11,7 @@ class Reconnector : public virtual SocketBase {
 public:
 
   uint32_t nConnectionAttempts = 0;
+  bool pendingConnect = false;
   bool reconnectAfterClose = true;
 
   int64_t connectTimeoutMs = 0; // must set this
@@ -22,14 +23,25 @@ public:
   void reset(void) override
   {
     nConnectionAttempts = 0;
+    pendingConnect = false;
     nAttemptsBudget = 0;
     attemptDeadlineMs = 0;
     reconnectAfterClose = true;
   }
 
+  bool connectAttemptPending(void) const
+  {
+    return pendingConnect;
+  }
+
+  void cancelPendingConnect(void)
+  {
+    pendingConnect = false;
+  }
+
   void attemptConnect(void)
   {
-    Ring::queueConnect(this, connectTimeoutMs);
+    pendingConnect = Ring::queueConnect(this, connectTimeoutMs);
   }
 
   void attemptForMs(int64_t ms)
@@ -74,6 +86,7 @@ public:
 
   void connectAttemptSucceded(void)
   {
+    pendingConnect = false;
     nConnectionAttempts = 0;
     nAttemptsBudget = 0;
     attemptDeadlineMs = 0;
@@ -81,6 +94,7 @@ public:
 
   bool connectAttemptFailed(void)
   {
+    pendingConnect = false;
     nConnectionAttempts += 1;
 
     if (attemptDeadlineMs > 0)

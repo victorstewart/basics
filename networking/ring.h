@@ -15,6 +15,7 @@
 
 #include "networking/ring.interfaces.h"
 #include "networking/guardian.h"
+#include "networking/message.h"
 #include "networking/pool.h"
 
 class RecvmsgMultishoter {
@@ -108,7 +109,7 @@ private:
     alignas(uint64_t) uint8_t optval[32] = {0};
   };
 
-  struct LinkTimeoutPackage {
+  struct LinkTimeoutTracking {
 
     void *socket = nullptr;
     uint8_t generation = 0;
@@ -145,6 +146,8 @@ private:
 
   static thread_local inline bytell_hash_map<uint32_t, BufferRing> bufferRingsByBgid;
   static thread_local inline bytell_hash_map<void *, uint8_t> socketGenerationByIdentity;
+  static thread_local inline bytell_hash_map<uint64_t, LinkTimeoutTracking> linkTimeoutTrackingByUserData;
+  static thread_local inline bytell_hash_set<uint64_t> retiredLinkTimeoutTrackingUserData;
   static thread_local inline bytell_hash_map<void *, RecvmsgMultishoter *> recvmsgMultishoterByIdentity;
   static thread_local inline bytell_hash_map<uint64_t, CloseCompletionTracking> closeTrackingByUserData;
   static thread_local inline bytell_hash_set<uint64_t> retiredCloseTrackingUserData;
@@ -219,6 +222,37 @@ private:
     }
 
     return ticket;
+  }
+
+  static uint64_t allocateLinkTimeoutTicket(void)
+  {
+    uint64_t ticket = nextLinkTimeoutTicket++;
+    ticket &= 0x0000FFFFFFFFFFFFULL;
+    if (ticket == 0)
+    {
+      ticket = 1;
+      nextLinkTimeoutTicket = 2;
+    }
+
+    return ticket;
+  }
+
+  static uint64_t issueLinkTimeoutTracking(void *socketKey, uint8_t generation, Operation linkedOp)
+  {
+    uint64_t userData = 0;
+
+    do
+    {
+      userData = getUserDataFor(Operation::linkTimeout, allocateLinkTimeoutTicket());
+    }
+    while (linkTimeoutTrackingByUserData.contains(userData));
+
+    LinkTimeoutTracking tracking = {};
+    tracking.socket = socketKey;
+    tracking.generation = generation;
+    tracking.linkedOp = linkedOp;
+    linkTimeoutTrackingByUserData.insert_or_assign(userData, tracking);
+    return userData;
   }
 
   static uint64_t issueCloseTracking(void *socketKey, int slot, uint64_t serial, uint8_t generation)
@@ -300,6 +334,24 @@ private:
     retiredCloseTrackingHead = (retiredCloseTrackingHead + 1) % retainedCloseCompletions;
   }
 
+  static void noteRetiredLinkTimeoutTracking(uint64_t userData)
+  {
+    constexpr size_t retainedLinkTimeoutCompletions = 4096;
+
+    if (retiredLinkTimeoutTrackingUserDataCount == retainedLinkTimeoutCompletions)
+    {
+      retiredLinkTimeoutTrackingUserData.erase(retiredLinkTimeoutTrackingHistory[retiredLinkTimeoutTrackingHead]);
+    }
+    else
+    {
+      ++retiredLinkTimeoutTrackingUserDataCount;
+    }
+
+    retiredLinkTimeoutTrackingHistory[retiredLinkTimeoutTrackingHead] = userData;
+    retiredLinkTimeoutTrackingUserData.insert(userData);
+    retiredLinkTimeoutTrackingHead = (retiredLinkTimeoutTrackingHead + 1) % retainedLinkTimeoutCompletions;
+  }
+
   static void noteRetiredRecvmsgMultishotTracking(uint64_t userData)
   {
     constexpr size_t retainedRecvmsgMultishotCompletions = 4096;
@@ -327,6 +379,58 @@ private:
     }
 
     tracking = it->second;
+    return true;
+  }
+
+  static bool resolveTrackedLinkTimeout(uint64_t userData, LinkTimeoutTracking& tracking)
+  {
+    auto it = linkTimeoutTrackingByUserData.find(userData);
+    if (it == linkTimeoutTrackingByUserData.end())
+    {
+      if (std::getenv("BASICS_RING_TRACE_LINK_TIMEOUT"))
+      {
+        std::fprintf(
+          stderr,
+          "Ring::resolveTrackedLinkTimeout miss userData=%llu active=%zu retired=%u\n",
+          (unsigned long long)userData,
+          size_t(linkTimeoutTrackingByUserData.size()),
+          unsigned(retiredLinkTimeoutTrackingUserData.contains(userData)));
+      }
+
+      if (retiredLinkTimeoutTrackingUserData.contains(userData))
+      {
+        return false;
+      }
+
+      std::abort();
+    }
+
+    if (std::getenv("BASICS_RING_TRACE_LINK_TIMEOUT"))
+    {
+      std::fprintf(
+        stderr,
+        "Ring::resolveTrackedLinkTimeout precopy userData=%llu active=%zu\n",
+        (unsigned long long)userData,
+        size_t(linkTimeoutTrackingByUserData.size()));
+    }
+
+    tracking = it->second;
+    linkTimeoutTrackingByUserData.erase(it);
+    noteRetiredLinkTimeoutTracking(userData);
+
+    if (std::getenv("BASICS_RING_TRACE_LINK_TIMEOUT"))
+    {
+      std::fprintf(
+        stderr,
+        "Ring::resolveTrackedLinkTimeout postcopy userData=%llu socket=%p generation=%u linkedOp=%u active=%zu retired=%zu\n",
+        (unsigned long long)userData,
+        tracking.socket,
+        unsigned(tracking.generation),
+        unsigned(tracking.linkedOp),
+        size_t(linkTimeoutTrackingByUserData.size()),
+        size_t(retiredLinkTimeoutTrackingUserData.size()));
+    }
+
     return true;
   }
 
@@ -445,17 +549,35 @@ private:
   static void appendTimeoutMs(T *socket, uint64_t timeoutMs, Operation linkedOp)
   {
     socket->timeout.setTimeoutMs(timeoutMs);
-    LinkTimeoutPackage *package = new LinkTimeoutPackage();
-    package->socket = socketIdentity(socket);
-    package->generation = socket->ioGeneration;
-    package->linkedOp = linkedOp;
-
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_link_timeout(sqe, (struct __kernel_timespec *)&(socket->timeout), 0);
-    setUserData(sqe, Operation::linkTimeout, package);
+    sqe->user_data = issueLinkTimeoutTracking(socketIdentity(socket), socket->ioGeneration, linkedOp);
+
+    if (std::getenv("BASICS_RING_TRACE_LINK_TIMEOUT"))
+    {
+      std::fprintf(
+        stderr,
+        "Ring::appendTimeoutMs issue userData=%llu socket=%p generation=%u linkedOp=%u timeoutMs=%llu active=%zu retired=%zu\n",
+        (unsigned long long)sqe->user_data,
+        socketIdentity(socket),
+        unsigned(socket->ioGeneration),
+        unsigned(linkedOp),
+        (unsigned long long)timeoutMs,
+        size_t(linkTimeoutTrackingByUserData.size()),
+        size_t(retiredLinkTimeoutTrackingUserData.size()));
+    }
   }
 
 public:
+
+  template <typename T> requires (std::is_base_of_v<SocketBase, T>)
+  static void publishSocketGeneration(T *socket)
+  {
+    // Accepted/adopted sockets can receive stale close completions before their
+    // first recv/send arm publishes a new generation. Let callers republish the
+    // fresh generation as soon as a new transport incarnation owns the identity.
+    noteSocketGeneration(socket);
+  }
 
   template <typename T> requires (std::is_base_of_v<WaitableProcess, T>)
   static void queueWaitid(T *waiter, idtype_t idtype, id_t id)
@@ -623,7 +745,7 @@ public:
         {
           stream->rBuffer.shiftHeadToZero();
         }
-        else
+        if (stream->rBuffer.remainingCapacity() == 0 && stream->rBuffer.growCapacityByExponentialDecay() == false)
         {
           return;
         }
@@ -665,19 +787,19 @@ public:
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
-  static void queueConnect(T *socket, uint64_t timeoutMs = 0)
+  static bool queueConnect(T *socket, uint64_t timeoutMs = 0)
   {
     void *socketKey = socketIdentity(socket);
     if (isClosing.contains(socketKey))
     {
-      return;
+      return false;
     }
 
     int submitFD = -1;
     bool useFixedFile = false;
     if (resolveSocketSubmitFD(socket, "queueConnect", submitFD, useFixedFile) == false)
     {
-      return;
+      return false;
     }
 
     noteSocketGeneration(socket);
@@ -702,6 +824,7 @@ public:
     }
 
     setUserData(sqe, Operation::connect, socketKey, socket->ioGeneration);
+    return true;
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
@@ -1006,25 +1129,23 @@ public:
     setUserData(sqe, Operation::poll, socket, socket->ioGeneration);
   }
 
-  static void queueRingMessage(uint32_t ringSlot, String *container)
-  {
-    requireFixedFileSlot(static_cast<int>(ringSlot), "queueRingMessage");
-    // we could also use io_uring_prep_msg_ring_cqe_flags and get another 4 bytes if we needed
-    struct io_uring_sqe *sqe = getSQESafe();
-    io_uring_prep_msg_ring(sqe, ringSlot, ring.ring_fd, getUserDataFor(Operation::ringMessage, container), 0);
-    sqe->flags |= IOSQE_FIXED_FILE;
-  }
-
   static void queueRingMessageToRingFD(int ringFD, String *container)
   {
-    int ringSlot = registerSiblingRing(ringFD);
-    if (ringSlot < 0)
+    if (ringFD < 0)
     {
       delete container;
       return;
     }
 
-    queueRingMessage(static_cast<uint32_t>(ringSlot), container);
+    // MSG_RING targets are io_uring fds, not normal data sockets. Routing them
+    // through the fixed-file table broke cross-thread ring delivery in the
+    // Radar worker path. Submit against the raw ring fd directly.
+    struct io_uring_sqe *sqe = getSQESafe();
+    uint64_t ringMessageUserData = getUserDataFor(Operation::ringMessage, container);
+    io_uring_prep_msg_ring(sqe, ringFD, ring.ring_fd, ringMessageUserData, 0);
+    // The target CQE gets len/off from io_uring, but sender-side completions
+    // still key off sqe->user_data like any other op.
+    sqe->user_data = ringMessageUserData;
   }
 
   // Submit a fixed-file write (fd must be registered as fixed file; pass its slot)
@@ -1067,15 +1188,17 @@ private:
   static thread_local inline bytell_hash_map<void *, uint64_t> closingSerialByIdentity;
   static thread_local inline uint64_t nextCloseSerial = 1;
   static thread_local inline uint64_t nextCloseTicket = 1;
+  static thread_local inline uint64_t nextLinkTimeoutTicket = 1;
   static thread_local inline std::array<uint64_t, 4096> retiredCloseTrackingHistory = {};
   static thread_local inline size_t retiredCloseTrackingHead = 0;
   static thread_local inline size_t retiredCloseTrackingUserDataCount = 0;
+  static thread_local inline std::array<uint64_t, 4096> retiredLinkTimeoutTrackingHistory = {};
+  static thread_local inline size_t retiredLinkTimeoutTrackingHead = 0;
+  static thread_local inline size_t retiredLinkTimeoutTrackingUserDataCount = 0;
   static thread_local inline uint64_t nextRecvmsgMultishotTicket = 1;
   static thread_local inline std::array<uint64_t, 4096> retiredRecvmsgMultishotTrackingHistory = {};
   static thread_local inline size_t retiredRecvmsgMultishotTrackingHead = 0;
   static thread_local inline size_t retiredRecvmsgMultishotTrackingUserDataCount = 0;
-
-  static thread_local inline bytell_hash_map<int, int> fdToRingSlot;
 
   static thread_local inline bool fixedFilesWereRegistered = false;
 
@@ -1248,18 +1371,23 @@ public:
     vacantAcceptedFixedFileSlots.clear();
     isClosing.clear();
     closingSerialByIdentity.clear();
+    linkTimeoutTrackingByUserData.clear();
     closeTrackingByUserData.clear();
+    retiredLinkTimeoutTrackingUserData.clear();
     retiredCloseTrackingUserData.clear();
     recvmsgMultishotTrackingByUserData.clear();
     retiredRecvmsgMultishotTrackingUserData.clear();
-    fdToRingSlot.clear();
     socketGenerationByIdentity.clear();
     recvmsgMultishoterByIdentity.clear();
     nextCloseSerial = 1;
     nextCloseTicket = 1;
+    nextLinkTimeoutTicket = 1;
     retiredCloseTrackingHistory.fill(0);
     retiredCloseTrackingHead = 0;
     retiredCloseTrackingUserDataCount = 0;
+    retiredLinkTimeoutTrackingHistory.fill(0);
+    retiredLinkTimeoutTrackingHead = 0;
+    retiredLinkTimeoutTrackingUserDataCount = 0;
     nextRecvmsgMultishotTicket = 1;
     retiredRecvmsgMultishotTrackingHistory.fill(0);
     retiredRecvmsgMultishotTrackingHead = 0;
@@ -1402,27 +1530,6 @@ public:
     {
       std::abort();
     }
-  }
-
-  static int registerSiblingRing(int ringFD) // maybe delete this
-  {
-    int slot = -1;
-
-    if (fdToRingSlot.find(ringFD) == fdToRingSlot.end())
-    {
-      slot = installFDIntoFixedFileSlot(ringFD, false);
-      if (slot < 0)
-      {
-        return -1;
-      }
-      fdToRingSlot.insert_or_assign(ringFD, slot);
-    }
-    else
-    {
-      slot = fdToRingSlot[ringFD];
-    }
-
-    return slot;
   }
 
   static uint32_t createBufferRing(uint32_t bufferSize, uint32_t count)
@@ -1788,7 +1895,29 @@ public:
               // IORING_OP_MSG_RING also completes on the sender ring with res=0 (or <0 on error).
               // Only receiver-side CQEs carry a positive source ring fd and should dispatch.
               // The payload is owned by the receiver path and is deleted there.
-              if (result <= 0)
+              if (result < 0)
+              {
+                Message *message = nullptr;
+                if (object)
+                {
+                  String *container = static_cast<String *>(object);
+                  if (container->size() >= sizeof(Message))
+                  {
+                    message = reinterpret_cast<Message *>(container->data());
+                  }
+                }
+
+                std::fprintf(
+                  stderr,
+                  "Ring msg_ring sender-error res=%d topic=%u bytes=%u object=%p\n",
+                  result,
+                  unsigned(message ? message->topic : 0),
+                  unsigned(message ? message->size : 0),
+                  object);
+                break;
+              }
+
+              if (result == 0)
               {
                 break;
               }
@@ -1820,7 +1949,7 @@ public:
             {
 
               // returns false if program is ending
-              if (lifecycler->signalHandler(sigInfo))
+              if (lifecycler && lifecycler->signalHandler(sigInfo))
               {
                 waitForSignals();
               }
@@ -1879,8 +2008,8 @@ public:
             }
           case Operation::linkTimeout:
             {
-              LinkTimeoutPackage *package = static_cast<LinkTimeoutPackage *>(object);
-              if (package == nullptr)
+              LinkTimeoutTracking tracking = {};
+              if (resolveTrackedLinkTimeout(user_data, tracking) == false)
               {
                 break;
               }
@@ -1889,36 +2018,34 @@ public:
               // finishes in time. Only dispatch real timeout/error completions.
               if (result == -ECANCELED)
               {
-                delete package;
                 break;
               }
 
-              if (isClosing.contains(package->socket) || socketGenerationMatches(package->socket, package->generation) == false)
+              if (isClosing.contains(tracking.socket) || socketGenerationMatches(tracking.socket, tracking.generation) == false)
               {
-                delete package;
                 break;
               }
 
-              switch (package->linkedOp)
+              switch (tracking.linkedOp)
               {
                 case Operation::connect:
                   {
-                    interfacer->connectHandler(package->socket, result);
+                    interfacer->connectHandler(tracking.socket, result);
                     break;
                   }
                 case Operation::recv:
                   {
-                    interfacer->recvHandler(package->socket, result);
+                    interfacer->recvHandler(tracking.socket, result);
                     break;
                   }
                 case Operation::send:
                   {
-                    interfacer->sendHandler(package->socket, result);
+                    interfacer->sendHandler(tracking.socket, result);
                     break;
                   }
                 case Operation::poll:
                   {
-                    interfacer->pollHandler(package->socket, result);
+                    interfacer->pollHandler(tracking.socket, result);
                     break;
                   }
                 default:
@@ -1926,8 +2053,6 @@ public:
                     break;
                   }
               }
-
-              delete package;
               break;
             }
           case Operation::close:

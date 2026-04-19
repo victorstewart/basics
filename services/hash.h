@@ -30,9 +30,19 @@ private:
     return int64_t(Random::generateNumberWithNBits<64, uint64_t>());
   }
 
+public:
+
+  static constexpr int64_t defaultGlobalSeed(void)
+  {
+    // global_shared must stay stable across processes for routing contracts.
+    return 0x4D45534848415348LL;
+  }
+
+private:
+
   static std::atomic<int64_t>& globalSeedStorage(void)
   {
-    static std::atomic<int64_t> seed {makeRandomSeed()};
+    static std::atomic<int64_t> seed {defaultGlobalSeed()};
     return seed;
   }
 

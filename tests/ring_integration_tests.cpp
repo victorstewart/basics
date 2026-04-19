@@ -37,6 +37,47 @@ namespace {
 
 static constexpr int kDynamicFixedSlotBegin = 5;
 
+struct WaitableSigChldScope {
+  struct sigaction previous = {};
+  bool restore = false;
+
+  WaitableSigChldScope()
+  {
+    if (sigaction(SIGCHLD, nullptr, &previous) != 0)
+    {
+      return;
+    }
+
+    if (previous.sa_handler == SIG_IGN)
+    {
+      struct sigaction waitable = {};
+      sigemptyset(&waitable.sa_mask);
+      waitable.sa_handler = SIG_DFL;
+      sigaction(SIGCHLD, &waitable, nullptr);
+      restore = true;
+    }
+  }
+
+  ~WaitableSigChldScope()
+  {
+    if (restore)
+    {
+      sigaction(SIGCHLD, &previous, nullptr);
+    }
+  }
+};
+
+static String makeQueuedServiceLookupMessage(uint64_t requestID, float lat, float lon)
+{
+  String message;
+  uint32_t headerOffset = Message::appendHeader(message, uint16_t(2));
+  Message::append(message, requestID);
+  Message::append(message, lat);
+  Message::append(message, lon);
+  Message::finish(message, headerOffset);
+  return message;
+}
+
 static uint16_t boundPortForFD(int fd)
 {
   sockaddr_in address = {};
@@ -372,6 +413,229 @@ struct AcceptCloseRawInterface : RingInterface {
   }
 };
 
+struct QueuedSendDrainInterface : RingInterface {
+  TestSuite *suite = nullptr;
+  TCPSocket listener;
+  AegisStream acceptedStream;
+  TimeoutPacket deadline;
+
+  uint128_t secret = (uint128_t(0x13579bdf2468ace0ULL) << 64) | uint128_t(0x0fedcba987654321ULL);
+  uint64_t service = 0x0123456789abcdefULL;
+  uint64_t pairingHash = 0;
+  uint64_t expectedBytes = 0;
+  Vector<int> sendResults;
+  std::vector<String> plaintexts;
+
+  bool accepted = false;
+  bool streamClosed = false;
+  bool listenerClosed = false;
+  bool deadlineFired = false;
+
+  explicit QueuedSendDrainInterface(TestSuite& testSuite)
+      : suite(&testSuite)
+  {
+    deadline.setTimeoutMs(1000);
+    configureLoopbackListener(listener);
+    pairingHash = AegisStream::generateSecretServiceHash(secret, service);
+  }
+
+  void maybeStop()
+  {
+    if (streamClosed && listenerClosed)
+    {
+      Ring::exit = true;
+    }
+  }
+
+  void acceptHandler(void *socket, int fslot) override
+  {
+    if (socket != &listener)
+    {
+      return;
+    }
+
+    accepted = true;
+    suite->expectTrue(fslot >= 0, "queued-send accept fixed-file slot is valid", __FILE__, __LINE__);
+    suite->expectTrue(fslot >= kDynamicFixedSlotBegin, "queued-send accept fixed-file slot stays out of reserved range", __FILE__, __LINE__);
+
+    acceptedStream.secret = secret;
+    acceptedStream.service = service;
+    acceptedStream.fslot = fslot;
+    acceptedStream.isFixedFile = true;
+    acceptedStream.wBuffer.append(pairingHash);
+    expectedBytes = sizeof(pairingHash);
+    Ring::queueSend(&acceptedStream);
+
+    for (uint64_t requestID = 1; requestID <= 32; ++requestID)
+    {
+      String plaintext = makeQueuedServiceLookupMessage(requestID, 40.718266f, -74.00782f);
+      plaintexts.push_back(plaintext);
+      const uint32_t encryptedFrameBytes = uint32_t(((40u + uint32_t(plaintext.size()) + 15u) / 16u) * 16u);
+      expectedBytes += encryptedFrameBytes;
+      acceptedStream.encrypt(plaintext);
+    }
+  }
+
+  void sendHandler(void *socket, int result) override
+  {
+    if (socket != &acceptedStream)
+    {
+      return;
+    }
+
+    acceptedStream.pendingSend = false;
+    acceptedStream.pendingSendBytes = 0;
+    acceptedStream.wBuffer.noteSendCompleted();
+
+    suite->expectTrue(result > 0, "queued-send result positive", __FILE__, __LINE__);
+    if (result <= 0)
+    {
+      Ring::exit = true;
+      return;
+    }
+
+    sendResults.push_back(result);
+    acceptedStream.wBuffer.consume(uint64_t(result), true);
+
+    if (acceptedStream.wBuffer.outstandingBytes() > 0)
+    {
+      Ring::queueSend(&acceptedStream);
+    }
+    else
+    {
+      Ring::queueClose(&acceptedStream);
+      Ring::queueClose(&listener);
+    }
+  }
+
+  void closeHandler(void *socket) override
+  {
+    if (socket == &acceptedStream)
+    {
+      streamClosed = true;
+    }
+    else if (socket == &listener)
+    {
+      listenerClosed = true;
+    }
+
+    maybeStop();
+  }
+
+  void timeoutHandler(TimeoutPacket *packet, int result) override
+  {
+    if (packet != &deadline)
+    {
+      return;
+    }
+
+    deadlineFired = true;
+    suite->expectEqual(result, -ETIME, "result", "-ETIME", __FILE__, __LINE__);
+    Ring::exit = true;
+  }
+};
+
+struct TimedRecvCloseReuseStressInterface : RingInterface {
+  TestSuite *suite = nullptr;
+  TCPSocket listener;
+  TCPStream acceptedStream;
+  TimeoutPacket deadline;
+
+  int targetIterations = 512;
+  int acceptedCount = 0;
+  int closeCount = 0;
+  int eofCount = 0;
+  int timeoutCount = 0;
+  bool listenerClosed = false;
+  bool deadlineFired = false;
+
+  explicit TimedRecvCloseReuseStressInterface(TestSuite& testSuite)
+      : suite(&testSuite)
+  {
+    deadline.setTimeoutMs(5000);
+    configureLoopbackListener(listener);
+  }
+
+  void acceptHandler(void *socket, int fslot) override
+  {
+    if (socket != &listener)
+    {
+      return;
+    }
+
+    suite->expectTrue(fslot >= 0, "timed-recv-stress accept fixed-file slot is valid", __FILE__, __LINE__);
+    suite->expectTrue(fslot >= kDynamicFixedSlotBegin, "timed-recv-stress accept fixed-file slot stays out of reserved range", __FILE__, __LINE__);
+
+    acceptedStream.reset();
+    acceptedStream.fslot = fslot;
+    acceptedStream.isFixedFile = true;
+    suite->expectTrue(acceptedStream.rBuffer.reserve(64), "timed-recv-stress reserve acceptedStream", __FILE__, __LINE__);
+
+    acceptedCount += 1;
+    Ring::queueRecv(&acceptedStream, 2);
+  }
+
+  void recvHandler(void *socket, int result) override
+  {
+    if (socket != &acceptedStream)
+    {
+      return;
+    }
+
+    acceptedStream.pendingRecv = false;
+
+    if (result == 0)
+    {
+      eofCount += 1;
+    }
+    else if (result == -ETIME)
+    {
+      timeoutCount += 1;
+    }
+
+    if (Ring::socketIsClosing(&acceptedStream) == false)
+    {
+      Ring::queueCancelAll(&acceptedStream);
+      Ring::queueClose(&acceptedStream);
+    }
+  }
+
+  void closeHandler(void *socket) override
+  {
+    if (socket == &acceptedStream)
+    {
+      closeCount += 1;
+      if (closeCount >= targetIterations)
+      {
+        Ring::queueClose(&listener);
+      }
+      else
+      {
+        Ring::queueAccept(&listener);
+      }
+      return;
+    }
+
+    if (socket == &listener)
+    {
+      listenerClosed = true;
+      Ring::exit = true;
+    }
+  }
+
+  void timeoutHandler(TimeoutPacket *packet, int result) override
+  {
+    if (packet != &deadline)
+    {
+      return;
+    }
+
+    deadlineFired = true;
+    suite->expectEqual(result, -ETIME, "result", "-ETIME", __FILE__, __LINE__);
+    Ring::exit = true;
+  }
+};
+
 static void runRingScenario(TestSuite& suite)
 {
   RingScenarioInterface interfacer(suite);
@@ -611,6 +875,275 @@ static void testAcceptedCloseRawReturnsDynamicSlot(TestSuite& suite)
   EXPECT_EQ(suite, interfacer.secondSlot, kDynamicFixedSlotBegin);
 }
 
+static void testQueuedSendDrainsFramesBehindCompletedHandshake(TestSuite& suite)
+{
+  QueuedSendDrainInterface interfacer(suite);
+  const uint16_t listenerPort = boundPortForFD(interfacer.listener.fd);
+  EXPECT_TRUE(suite, listenerPort != 0);
+
+  String received;
+  std::thread client([&]() {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+      return;
+    }
+
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(listenerPort);
+    inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+
+    if (connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0)
+    {
+      ::close(fd);
+      return;
+    }
+
+    char buffer[4096] = {};
+    for (;;)
+    {
+      ssize_t nread = recv(fd, buffer, sizeof(buffer), 0);
+      if (nread <= 0)
+      {
+        break;
+      }
+
+      received.append(reinterpret_cast<const uint8_t *>(buffer), uint64_t(nread));
+    }
+
+    ::close(fd);
+  });
+
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  Ring::createRing(128, 256, 16, 4, -1, -1, 16);
+  Ring::installFDIntoFixedFileSlot(&interfacer.listener);
+  Ring::queueTimeout(&interfacer.deadline);
+  Ring::queueAccept(&interfacer.listener);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  client.join();
+
+  EXPECT_FALSE(suite, interfacer.deadlineFired);
+  EXPECT_TRUE(suite, interfacer.accepted);
+  EXPECT_TRUE(suite, interfacer.streamClosed);
+  EXPECT_TRUE(suite, interfacer.listenerClosed);
+  EXPECT_EQ(suite, received.size(), interfacer.expectedBytes);
+  EXPECT_TRUE(suite, interfacer.sendResults.size() >= size_t(2));
+  EXPECT_EQ(suite, interfacer.sendResults.front(), int(sizeof(uint64_t)));
+
+  uint64_t receivedHash = 0;
+  std::memcpy(&receivedHash, received.data(), sizeof(receivedHash));
+  EXPECT_EQ(suite, receivedHash, interfacer.pairingHash);
+
+  AegisStream receiver;
+  receiver.secret = interfacer.secret;
+  receiver.rBuffer.append(received.data() + sizeof(receivedHash), received.size() - sizeof(receivedHash));
+
+  bool failed = true;
+  size_t decryptedCount = 0;
+  String decrypted;
+  receiver.extractMessages<AegisMessage>([&](AegisMessage *message) -> void {
+    EXPECT_TRUE(suite, receiver.decrypt(message, decrypted));
+    EXPECT_STRING_EQ(suite, decrypted, interfacer.plaintexts[decryptedCount]);
+    decrypted.clear();
+    ++decryptedCount;
+  },
+                                       true, UINT32_MAX, AegisStream::minMessageSize, AegisStream::maxMessageSize, failed);
+
+  EXPECT_FALSE(suite, failed);
+  EXPECT_EQ(suite, decryptedCount, interfacer.plaintexts.size());
+  EXPECT_EQ(suite, receiver.rBuffer.outstandingBytes(), uint64_t(0));
+}
+
+static void testTimedRecvCloseReuseStress(TestSuite& suite)
+{
+  WaitableSigChldScope waitableSigChld;
+  pid_t child = fork();
+  if (child == 0)
+  {
+    TimedRecvCloseReuseStressInterface interfacer(suite);
+    const uint16_t listenerPort = boundPortForFD(interfacer.listener.fd);
+    if (listenerPort == 0)
+    {
+      _exit(2);
+    }
+
+    std::thread client([&]() {
+      for (int iteration = 0; iteration < interfacer.targetIterations; iteration++)
+      {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0)
+        {
+          continue;
+        }
+
+        sockaddr_in address = {};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(listenerPort);
+        inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+
+        if (connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0)
+        {
+          if ((iteration % 3) == 0)
+          {
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+          }
+        }
+
+        ::close(fd);
+
+        if ((iteration % 32) == 0)
+        {
+          std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+      }
+    });
+
+    Ring::interfacer = &interfacer;
+    Ring::lifecycler = nullptr;
+    Ring::exit = false;
+    Ring::shuttingDown = false;
+
+    Ring::createRing(128, 256, 16, 4, -1, -1, 16);
+    Ring::installFDIntoFixedFileSlot(&interfacer.listener);
+    Ring::queueTimeout(&interfacer.deadline);
+    Ring::queueAccept(&interfacer.listener);
+    Ring::start();
+    Ring::shutdownForExec();
+    Ring::interfacer = nullptr;
+    Ring::lifecycler = nullptr;
+    Ring::exit = false;
+    Ring::shuttingDown = false;
+
+    client.join();
+
+    if (interfacer.deadlineFired)
+    {
+      _exit(3);
+    }
+
+    if (interfacer.listenerClosed == false)
+    {
+      _exit(4);
+    }
+
+    if (interfacer.acceptedCount != interfacer.targetIterations || interfacer.closeCount != interfacer.targetIterations)
+    {
+      _exit(5);
+    }
+
+    if (interfacer.eofCount == 0 || interfacer.timeoutCount == 0)
+    {
+      _exit(6);
+    }
+
+    _exit(0);
+  }
+
+  EXPECT_TRUE(suite, child >= 0);
+  if (child < 0)
+  {
+    return;
+  }
+
+  int status = 0;
+  EXPECT_EQ(suite, waitpid(child, &status, 0), child);
+  EXPECT_TRUE(suite, WIFEXITED(status));
+  EXPECT_EQ(suite, WEXITSTATUS(status), 0);
+}
+
+static void testRingMessageSenderErrorReportsInvalidTarget(TestSuite& suite)
+{
+  WaitableSigChldScope waitableSigChld;
+  int stderrPipe[2] = {-1, -1};
+  EXPECT_EQ(suite, pipe(stderrPipe), 0);
+  if (stderrPipe[0] < 0 || stderrPipe[1] < 0)
+  {
+    return;
+  }
+
+  pid_t child = fork();
+  if (child == 0)
+  {
+    close(stderrPipe[0]);
+    dup2(stderrPipe[1], STDERR_FILENO);
+    close(stderrPipe[1]);
+
+    struct MsgRingSenderErrorInterface : RingInterface {
+      TimeoutPacket deadline;
+      bool timeoutFired = false;
+
+      MsgRingSenderErrorInterface()
+      {
+        deadline.setTimeoutMs(50);
+      }
+
+      void timeoutHandler(TimeoutPacket *packet, int result) override
+      {
+        (void)result;
+
+        if (packet != &deadline)
+        {
+          return;
+        }
+
+        timeoutFired = true;
+        Ring::exit = true;
+      }
+    } interfacer;
+
+    Ring::interfacer = &interfacer;
+    Ring::lifecycler = nullptr;
+    Ring::exit = false;
+    Ring::shuttingDown = false;
+
+    Ring::createRing(32, 32, 8, 2, -1, -1, 8);
+
+    String *message = new String();
+    Message::construct(*message, uint16_t(7), uint64_t(11));
+
+    Ring::queueTimeout(&interfacer.deadline);
+    Ring::queueRingMessageToRingFD(123456, message);
+    Ring::start();
+    Ring::shutdownForExec();
+
+    _exit(interfacer.timeoutFired ? 0 : 2);
+  }
+
+  close(stderrPipe[1]);
+
+  std::string captured;
+  char buffer[256] = {};
+  ssize_t nread = 0;
+  while ((nread = read(stderrPipe[0], buffer, sizeof(buffer))) > 0)
+  {
+    captured.append(buffer, size_t(nread));
+  }
+  close(stderrPipe[0]);
+
+  EXPECT_TRUE(suite, child >= 0);
+  if (child < 0)
+  {
+    return;
+  }
+
+  int status = 0;
+  EXPECT_EQ(suite, waitpid(child, &status, 0), child);
+  EXPECT_TRUE(suite, WIFEXITED(status));
+  EXPECT_EQ(suite, WEXITSTATUS(status), 0);
+  EXPECT_TRUE(suite, captured.find("Ring msg_ring sender-error") != std::string::npos);
+}
+
 } // namespace
 
 int main()
@@ -626,5 +1159,8 @@ int main()
   testRingletSendRecvAndTimeout(suite);
   testDuplicateQueueCloseIsIdempotent(suite);
   testAcceptedCloseRawReturnsDynamicSlot(suite);
+  testQueuedSendDrainsFramesBehindCompletedHandshake(suite);
+  testTimedRecvCloseReuseStress(suite);
+  testRingMessageSenderErrorReportsInvalidTarget(suite);
   return suite.finish("ring integration tests");
 }

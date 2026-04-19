@@ -57,6 +57,17 @@ static String makeEchoMessage(StreamTestTopic topic)
   return message;
 }
 
+static String makeServiceLookupMessage(uint64_t requestID, float lat, float lon)
+{
+  String message;
+  uint32_t headerOffset = Message::appendHeader(message, StreamTestTopic::second);
+  Message::append(message, requestID);
+  Message::append(message, lat);
+  Message::append(message, lon);
+  Message::finish(message, headerOffset);
+  return message;
+}
+
 static String makeEncryptedFrame(uint128_t secret, const String& plaintext)
 {
   AegisStream stream;
@@ -104,6 +115,49 @@ static void testStreamBufferDoesNotReplayQueuedBytesAfterGrowth(TestSuite& suite
 
   buffer.append("zz", 2);
   EXPECT_TRUE(suite, outstandingView(buffer) == std::string_view("zz"));
+}
+
+static void testStreamBufferPreservesConstructSerializedPayloadAcrossGrowth(TestSuite& suite)
+{
+  bytell_hash_map<uint32_t, String> payload;
+  String largeValue;
+  EXPECT_TRUE(suite, largeValue.reserve(256));
+  largeValue.resize(256);
+  std::memset(largeValue.data(), 'x', largeValue.size());
+  payload.insert_or_assign(uint32_t(0xb6), largeValue);
+
+  String directPayload;
+  BitseryEngine::serialize(directPayload, payload);
+
+  StreamBuffer messageBytes;
+  Message::constructSerialized(messageBytes, payload, StreamTestTopic::first);
+
+  auto *message = reinterpret_cast<Message *>(messageBytes.data());
+  EXPECT_TRUE(suite, message != nullptr);
+
+  if (message != nullptr)
+  {
+    uint8_t *payloadSizeCursor = message->args;
+    align(Alignment::four, payloadSizeCursor);
+    EXPECT_TRUE(suite, (payloadSizeCursor + sizeof(uint32_t)) <= messageBytes.pTail());
+
+    if ((payloadSizeCursor + sizeof(uint32_t)) <= messageBytes.pTail())
+    {
+      uint32_t payloadSize = 0;
+      std::memcpy(&payloadSize, payloadSizeCursor, sizeof(payloadSize));
+      payloadSizeCursor += sizeof(payloadSize);
+      align(Alignment::eight, payloadSizeCursor);
+      EXPECT_TRUE(suite, (payloadSizeCursor + payloadSize) <= messageBytes.pTail());
+
+      if ((payloadSizeCursor + payloadSize) <= messageBytes.pTail())
+      {
+        String extractedPayload;
+        extractedPayload.assign(payloadSizeCursor, payloadSize);
+        EXPECT_EQ(suite, extractedPayload.size(), directPayload.size());
+        EXPECT_TRUE(suite, extractedPayload == directPayload);
+      }
+    }
+  }
 }
 
 static void testCleartextFramingAndRangeExtraction(TestSuite& suite)
@@ -245,6 +299,60 @@ static void testAegisMalformedFramesAndTimestampSidecar(TestSuite& suite)
   EXPECT_FALSE(suite, stream.popInboundQueuedTimestamp(queuedAtNs));
 }
 
+static void testAegisQueuedFramesStaySaneBehindInFlightSubscriberHandshake(TestSuite& suite)
+{
+  constexpr uint128_t secret = (uint128_t(0x13579bdf2468ace0ULL) << 64) | uint128_t(0x0fedcba987654321ULL);
+  constexpr uint64_t service = 0x0123456789abcdefULL;
+
+  AegisStream sender;
+  sender.secret = secret;
+  sender.service = service;
+
+  const uint64_t pairingHash = AegisStream::generateSecretServiceHash(secret, service);
+  sender.wBuffer.append(pairingHash);
+  sender.wBuffer.noteSendQueued();
+
+  std::vector<String> plaintexts;
+  uint64_t expectedOutstanding = sizeof(pairingHash);
+
+  for (uint64_t requestID = 1; requestID <= 256; ++requestID)
+  {
+    String plaintext = makeServiceLookupMessage(requestID, 40.718266f, -74.00782f);
+    const uint32_t encryptedFrameBytes = roundUpTo16(40u + uint32_t(plaintext.size()));
+    expectedOutstanding += encryptedFrameBytes;
+
+    sender.encrypt(plaintext);
+    plaintexts.push_back(plaintext);
+
+    EXPECT_EQ(suite, sender.wBuffer.outstandingBytes(), expectedOutstanding);
+    EXPECT_EQ(suite, sender.wBuffer.head, uint64_t(0));
+    EXPECT_TRUE(suite, sender.wBuffer.pHead() != nullptr);
+  }
+
+  sender.wBuffer.noteSendCompleted();
+  sender.wBuffer.consume(sizeof(pairingHash), true);
+  EXPECT_EQ(suite, sender.wBuffer.outstandingBytes(), expectedOutstanding - sizeof(pairingHash));
+
+  AegisStream receiver;
+  receiver.secret = secret;
+  receiver.rBuffer.append(sender.wBuffer.pHead(), sender.wBuffer.outstandingBytes());
+
+  bool failed = true;
+  size_t decryptedCount = 0;
+  String decrypted;
+  receiver.extractMessages<AegisMessage>([&](AegisMessage *message) -> void {
+    EXPECT_TRUE(suite, receiver.decrypt(message, decrypted));
+    EXPECT_STRING_EQ(suite, decrypted, plaintexts[decryptedCount]);
+    decrypted.clear();
+    ++decryptedCount;
+  },
+                                       true, UINT32_MAX, AegisStream::minMessageSize, AegisStream::maxMessageSize, failed);
+
+  EXPECT_FALSE(suite, failed);
+  EXPECT_EQ(suite, decryptedCount, plaintexts.size());
+  EXPECT_EQ(suite, receiver.rBuffer.outstandingBytes(), uint64_t(0));
+}
+
 static void testAegisHelpersAndReset(TestSuite& suite)
 {
   AuxTFOStream stream;
@@ -289,11 +397,13 @@ int main()
 
   testStreamBufferPreservesHeadAcrossGrowth(suite);
   testStreamBufferDoesNotReplayQueuedBytesAfterGrowth(suite);
+  testStreamBufferPreservesConstructSerializedPayloadAcrossGrowth(suite);
   testCleartextFramingAndRangeExtraction(suite);
   testPartialAndMalformedHeadersFailClosed(suite);
   testExtractMessageRangeReportsOverflow(suite);
   testAegisEncryptDecryptAndLayout(suite);
   testAegisMalformedFramesAndTimestampSidecar(suite);
+  testAegisQueuedFramesStaySaneBehindInFlightSubscriberHandshake(suite);
   testAegisHelpersAndReset(suite);
 
   return suite.finish("stream tests");

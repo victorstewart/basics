@@ -58,6 +58,7 @@ public:
   Cotask awaiter;
   int32_t overrideIndex = -1;
   uint64_t suspensionGeneration = 0;
+  uint32_t explicitWakeBlocks = 0;
 
   bool hasSuspendedCoroutines(void)
   {
@@ -87,9 +88,9 @@ public:
 
   void cancelSuspended(void)
   {
-    for (auto& coroutine : suspended)
-    {
-      coroutine.destroy();
+     for (auto& coroutine : suspended)
+     {
+        coroutine.destroy();
     }
 
     suspended.clear();
@@ -98,6 +99,7 @@ public:
   virtual void reset(void)
   {
     cancelSuspended();
+    explicitWakeBlocks = 0;
   }
 
   uint32_t nextSuspendIndex(void)
@@ -130,6 +132,24 @@ public:
     uint64_t generation = suspensionGeneration;
     lambda();
     return (generation != suspensionGeneration);
+  }
+
+  void beginExplicitWakeBlock(void)
+  {
+    explicitWakeBlocks += 1;
+  }
+
+  void finishExplicitWakeBlock(void)
+  {
+    if (explicitWakeBlocks > 0)
+    {
+      explicitWakeBlocks -= 1;
+    }
+  }
+
+  bool waitingForExplicitWake(void) const
+  {
+    return explicitWakeBlocks > 0;
   }
 
   CoroutineStack()

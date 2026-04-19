@@ -3,6 +3,9 @@
 #include "tests/test_support.h"
 
 #include "types/types.containers.h"
+#include "services/threads.h"
+
+#include <thread>
 
 struct ForeignByteKey {
 
@@ -296,6 +299,55 @@ static void testAllocatorModeSensitivePath(TestSuite& suite)
   EXPECT_TRUE(suite, set.contains(5));
 }
 
+static void testSharedHashContainersUseGlobalSeed(TestSuite& suite)
+{
+  bytell_hash_map_shared<int, int> map;
+  bytell_hash_set_shared<int> set;
+
+  Hasher::setGlobalSeed(0x5152535455565758LL);
+
+  std::thread producer([&]() {
+    Hasher::setThreadSeed(0x101);
+    map.mtx.lock();
+    map.insert_or_assign(7, 70);
+    map.mtx.unlock();
+
+    set.mtx.lock();
+    set.insert(9);
+    set.mtx.unlock();
+  });
+  producer.join();
+
+  bool mapFound = false;
+  int mapValue = 0;
+  bool setFound = false;
+  std::thread consumer([&]() {
+    Hasher::setThreadSeed(0x202);
+
+    map.mtx.lock();
+    auto mapIt = map.find(7);
+    mapFound = (mapIt != map.end());
+    if (mapFound)
+    {
+      mapValue = mapIt->second;
+      map.erase(mapIt);
+    }
+    map.mtx.unlock();
+
+    set.mtx.lock();
+    setFound = set.contains(9);
+    set.erase(9);
+    set.mtx.unlock();
+  });
+  consumer.join();
+
+  EXPECT_TRUE(suite, mapFound);
+  EXPECT_EQ(suite, mapValue, 70);
+  EXPECT_TRUE(suite, setFound);
+  EXPECT_EQ(suite, map.size(), size_t(0));
+  EXPECT_EQ(suite, set.size(), size_t(0));
+}
+
 } // namespace
 
 int main()
@@ -308,6 +360,7 @@ int main()
   testBytellHashSubmap(suite);
   testBytellHashSubsetAndSubvector(suite);
   testAllocatorModeSensitivePath(suite);
+  testSharedHashContainersUseGlobalSeed(suite);
 
   return suite.finish("containers tests");
 }

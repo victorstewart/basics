@@ -294,13 +294,19 @@ template <>
 struct BufferAdapterTraits<String> {
   static void increaseBufferSize(String& string, size_t cursor, size_t atLeastN)
   {
-    size_t prospectiveNewCapacity = 64 + string.tentativeCapacity() * 2;
-    if (atLeastN > prospectiveNewCapacity)
+    size_t prospectiveNewSize = 64 + string.tentativeCapacity() * 2;
+    if (atLeastN > prospectiveNewSize)
     {
-      prospectiveNewCapacity = atLeastN * 1.5;
+      prospectiveNewSize = atLeastN * 1.5;
     }
 
-    string.reserve(prospectiveNewCapacity, cursor);
+    if (prospectiveNewSize < atLeastN)
+    {
+      prospectiveNewSize = atLeastN;
+    }
+
+    string.reserve(prospectiveNewSize, cursor);
+    string.resize(prospectiveNewSize);
   }
 
   using TIterator = uint8_t *;

@@ -70,14 +70,14 @@ public:
 #include <shared_mutex>
 
 template <typename Key, typename Value>
-class bytell_hash_map_shared : public bytell_hash_map<Key, Value> {
+class bytell_hash_map_shared : public bytell_hash_map_with_policy<Key, Value, Hasher::SeedPolicy::global_shared> {
 public:
 
   std::shared_mutex mtx;
 };
 
 template <typename Key>
-class bytell_hash_set_shared : public bytell_hash_set<Key> {
+class bytell_hash_set_shared : public bytell_hash_set_with_policy<Key, Hasher::SeedPolicy::global_shared> {
 public:
 
   std::shared_mutex mtx;

@@ -2202,25 +2202,36 @@ static void testReconnectorStateMachine(TestSuite& suite)
   ReconnectorProbe reconnect;
   reconnect.nAttemptsBudget = 2;
   reconnect.attemptDeadlineMs = 0;
+  reconnect.pendingConnect = true;
   EXPECT_FALSE(suite, reconnect.connectAttemptFailed());
+  EXPECT_FALSE(suite, reconnect.connectAttemptPending());
+  reconnect.pendingConnect = true;
   EXPECT_TRUE(suite, reconnect.connectAttemptFailed());
+  EXPECT_FALSE(suite, reconnect.connectAttemptPending());
   EXPECT_FALSE(suite, reconnect.shouldReconnect());
   EXPECT_TRUE(suite, reconnect.shouldReconnect());
 
   reconnect.reset();
+  EXPECT_FALSE(suite, reconnect.connectAttemptPending());
   reconnect.connectTimeoutMs = 50;
   reconnect.attemptForMs(25);
   EXPECT_EQ(suite, reconnect.nAttemptsBudget, uint32_t(1));
+  reconnect.pendingConnect = true;
   EXPECT_FALSE(suite, reconnect.connectAttemptFailed());
+  EXPECT_FALSE(suite, reconnect.connectAttemptPending());
   std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  reconnect.pendingConnect = true;
   EXPECT_TRUE(suite, reconnect.connectAttemptFailed());
+  EXPECT_FALSE(suite, reconnect.connectAttemptPending());
   EXPECT_FALSE(suite, reconnect.shouldReconnect());
 
   reconnect.reset();
   reconnect.connectTimeoutMs = 10;
   reconnect.nAttemptsBudget = 4;
   reconnect.nConnectionAttempts = 3;
+  reconnect.pendingConnect = true;
   reconnect.connectAttemptSucceded();
+  EXPECT_FALSE(suite, reconnect.connectAttemptPending());
   EXPECT_EQ(suite, reconnect.nConnectionAttempts, uint32_t(0));
   EXPECT_EQ(suite, reconnect.nAttemptsBudget, uint32_t(0));
   EXPECT_EQ(suite, reconnect.attemptDeadlineMs, int64_t(0));

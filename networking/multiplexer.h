@@ -15,6 +15,7 @@ private:
 
   bytell_hash_map<void *, RingInterface *> multiplexees; // this is a top level direct mapping of objects to end consumers
   bytell_hash_set<RingMultiplexer *> multiplexers;
+  RingInterface *ringMessageTarget = nullptr;
 
   template <typename Lambda>
   void distributeContains(void *object, Lambda&& lambda)
@@ -48,6 +49,19 @@ public:
   static void eraseMultiplexee(void *object)
   {
     current().multiplexees.erase(object);
+  }
+
+  static void installRingMessageTarget(RingInterface *target)
+  {
+    current().ringMessageTarget = target;
+  }
+
+  static void eraseRingMessageTarget(RingInterface *target)
+  {
+    if (current().ringMessageTarget == target)
+    {
+      current().ringMessageTarget = nullptr;
+    }
   }
 
   void beforeRing(void)
@@ -188,6 +202,17 @@ public:
     distributeContains(socket, [&](RingInterface *interface) {
       interface->pollHandler(socket, result);
     });
+  }
+
+  void ringMessageHandler(int ringFD, String *container)
+  {
+    if (ringMessageTarget)
+    {
+      ringMessageTarget->ringMessageHandler(ringFD, container);
+      return;
+    }
+
+    delete container;
   }
 
   void restartMultishotRecvMsgOn(void *socket)
