@@ -36,7 +36,7 @@ private:
 public:
 
   template <typename Lambda> requires (std::invocable<Lambda> && std::same_as<std::invoke_result_t<Lambda>, void>) // no arguments + returns void
-  static void startDetachedOnCore(uint32_t logicalCoreNumber, Lambda&& lambda)
+  static bool startDetachedOnCore(uint32_t logicalCoreNumber, Lambda&& lambda)
   {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -52,18 +52,38 @@ public:
     ThreadData *data = new ThreadData;
     data->lambda = std::move(lambda);
 
-    pthread_create(&thread, &attr, thread_trampoline, data);
+    int rc = pthread_create(&thread, &attr, thread_trampoline, data);
 
     pthread_attr_destroy(&attr);
+
+    if (rc == 0)
+    {
+      return true;
+    }
+
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    rc = pthread_create(&thread, &attr, thread_trampoline, data);
+
+    pthread_attr_destroy(&attr);
+
+    if (rc == 0)
+    {
+      return true;
+    }
+
+    delete data;
+    return false;
   }
 
-  static void pinThisThreadToCore(int core)
+  static bool pinThisThreadToCore(int core)
   {
     cpu_set_t cpuSet;
     CPU_ZERO(&cpuSet);
     CPU_SET(core, &cpuSet);
 
-    sched_setaffinity(0, sizeof(cpuSet), &cpuSet);
+    return sched_setaffinity(0, sizeof(cpuSet), &cpuSet) == 0;
   }
 };
 

@@ -53,11 +53,15 @@ public:
   bool pendingSend = false;
   bool pendingRecv = false;
   uint32_t pendingSendBytes = 0;
-  uint8_t ioGeneration = 1;
+  uint64_t ioGeneration = 1;
+  uint64_t pendingSendUserData = 0;
+  uint64_t pendingRecvUserData = 0;
+  uint64_t pendingConnectUserData = 0;
+  uint64_t pendingTCPFastOpenUserData = 0;
   bool isFixedFile = false;
   bool isNonBlocking = false;
 
-  uint8_t bumpIoGeneration(void)
+  uint64_t bumpIoGeneration(void)
   {
     ++ioGeneration;
     if (ioGeneration == 0)
@@ -184,6 +188,10 @@ public:
     pendingSend = false;
     pendingRecv = false;
     pendingSendBytes = 0;
+    pendingSendUserData = 0;
+    pendingRecvUserData = 0;
+    pendingConnectUserData = 0;
+    pendingTCPFastOpenUserData = 0;
   }
 
   void setDisconnected(void)
@@ -191,6 +199,10 @@ public:
     pendingSend = true;
     pendingRecv = true;
     pendingSendBytes = 0;
+    pendingSendUserData = 0;
+    pendingRecvUserData = 0;
+    pendingConnectUserData = 0;
+    pendingTCPFastOpenUserData = 0;
     bumpIoGeneration();
   }
 
@@ -212,6 +224,10 @@ public:
     pendingSend = false;
     pendingRecv = false;
     pendingSendBytes = 0;
+    pendingSendUserData = 0;
+    pendingRecvUserData = 0;
+    pendingConnectUserData = 0;
+    pendingTCPFastOpenUserData = 0;
     bumpIoGeneration();
 
     // we don't reset the fd to -1 because it's always

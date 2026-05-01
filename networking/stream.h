@@ -3,9 +3,12 @@
 #include <services/crypto.h>
 #include <base/traits.h>
 #include <networking/socket.h>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <time.h>
+#include <unistd.h>
 
 #pragma once
 
@@ -399,8 +402,72 @@ public:
   uint32_t inboundQueuedAtHead = 0;
 
   static inline uint32_t minMessageSize = 48; // size(4) nonce(16) message{4} [message is at least 24 bytes, 16 for the authenication header plus 8 for an echo]
-  static inline uint32_t maxMessageSize = 2 * 1024 * 1024;
+  static inline uint32_t maxMessageSize = 16 * 1024 * 1024;
   static inline uint32_t inboundQueuedAtCompactHeadThreshold = 1024;
+
+  static uint32_t maxPlaintextBytesPerFrame(void)
+  {
+    constexpr uint32_t worstCaseOverheadBytes = sizeof(AegisMessage) + sizeof(uint32_t) + 16 + 15;
+    if (maxMessageSize <= worstCaseOverheadBytes)
+    {
+      return 0;
+    }
+
+    return maxMessageSize - worstCaseOverheadBytes;
+  }
+
+  static bool parsePlaintextMessageFrame(const uint8_t *cursor, uint64_t availableBytes, uint32_t& messageSize)
+  {
+    constexpr uint32_t wireHeaderBytes = sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint8_t);
+    if (cursor == nullptr || availableBytes < wireHeaderBytes)
+    {
+      return false;
+    }
+
+    std::memcpy(&messageSize, cursor, sizeof(messageSize));
+    uint8_t padding = cursor[sizeof(uint32_t) + sizeof(uint16_t)];
+    uint8_t headerSize = cursor[sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint8_t)];
+
+    return messageSize >= wireHeaderBytes &&
+           uint64_t(messageSize) <= availableBytes &&
+           padding <= messageSize &&
+           headerSize >= wireHeaderBytes &&
+           headerSize <= messageSize &&
+           headerSize <= (messageSize - padding);
+  }
+
+  static uint32_t nextBoundedPlaintextChunkSize(const uint8_t *cursor, uint64_t remainingBytes)
+  {
+    uint32_t maxPlaintextBytes = maxPlaintextBytesPerFrame();
+    if (remainingBytes <= maxPlaintextBytes)
+    {
+      return uint32_t(remainingBytes);
+    }
+
+    uint64_t chunkBytes = 0;
+    while (chunkBytes < remainingBytes)
+    {
+      uint32_t messageSize = 0;
+      if (parsePlaintextMessageFrame(cursor + chunkBytes, remainingBytes - chunkBytes, messageSize) == false)
+      {
+        return 0;
+      }
+
+      if (messageSize > maxPlaintextBytes)
+      {
+        return 0;
+      }
+
+      if (chunkBytes + messageSize > maxPlaintextBytes)
+      {
+        break;
+      }
+
+      chunkBytes += messageSize;
+    }
+
+    return uint32_t(chunkBytes);
+  }
 
   static int64_t monotonicNowNs(void)
   {
@@ -589,11 +656,9 @@ public:
     return false;
   }
 
-  void encrypt(const StringDescendent auto& plaintext)
+  void encryptFrame(const uint8_t *plaintextHead, uint32_t plaintextSize)
   {
     uint128_t nonce = Crypto::secureRandomNumber<uint128_t>();
-
-    uint32_t plaintextSize = uint32_t(plaintext.pTail() - plaintext.pHead());
 
     uint32_t encryptedDataSize = 16 + plaintextSize; // encrypted messsage is the same number of bytes as the plaintext, we just add 16 for the authentication tag
 
@@ -621,13 +686,45 @@ public:
     wBuffer.append((const uint8_t *)&nonce, 16);
     wBuffer.append(encryptedDataSize); // already 4 byte aligned
 
-    aegis128l_encrypt(wBuffer.pTail(), 16, plaintext.pHead(), plaintextSize, (const uint8_t *)&messageSize, 4, (const uint8_t *)&nonce, (const uint8_t *)&secret);
+    aegis128l_encrypt(wBuffer.pTail(), 16, plaintextHead, plaintextSize, (const uint8_t *)&messageSize, 4, (const uint8_t *)&nonce, (const uint8_t *)&secret);
     wBuffer.advance(encryptedDataSize);
 
     if (padding > 0)
     {
       memset(wBuffer.pTail(), 0, padding);
       wBuffer.advance(padding); // pad to 16
+    }
+  }
+
+  void encrypt(const StringDescendent auto& plaintext)
+  {
+    const uint8_t *cursor = plaintext.pHead();
+    uint64_t remainingBytes = uint64_t(plaintext.pTail() - plaintext.pHead());
+
+    if (remainingBytes <= maxPlaintextBytesPerFrame())
+    {
+      encryptFrame(cursor, uint32_t(remainingBytes));
+      return;
+    }
+
+    while (remainingBytes > 0)
+    {
+      uint32_t chunkBytes = nextBoundedPlaintextChunkSize(cursor, remainingBytes);
+      if (chunkBytes == 0)
+      {
+        std::fprintf(stderr,
+                     "AegisStream encrypt oversized-or-malformed plaintext pid=%d stream=%p plaintextBytes=%llu maxPlaintextBytes=%u\n",
+                     int(getpid()),
+                     static_cast<void *>(this),
+                     (unsigned long long)remainingBytes,
+                     unsigned(maxPlaintextBytesPerFrame()));
+        std::fflush(stderr);
+        std::abort();
+      }
+
+      encryptFrame(cursor, chunkBytes);
+      cursor += chunkBytes;
+      remainingBytes -= chunkBytes;
     }
   }
 };

@@ -36,6 +36,26 @@ static int firstAllowedCore()
   return -1;
 }
 
+static int firstDisallowedCore()
+{
+  cpu_set_t cpuSet;
+  CPU_ZERO(&cpuSet);
+  if (sched_getaffinity(0, sizeof(cpuSet), &cpuSet) != 0)
+  {
+    return -1;
+  }
+
+  for (int core = 0; core < CPU_SETSIZE; ++core)
+  {
+    if (CPU_ISSET(core, &cpuSet) == false)
+    {
+      return core;
+    }
+  }
+
+  return -1;
+}
+
 static void testRandomAndCryptoHelpers(TestSuite& suite)
 {
   uint8_t zeroBitValue = Random::generateNumberWithNBits<0, uint8_t>();
@@ -231,7 +251,7 @@ static void testThreadHelpers(TestSuite& suite)
     return;
   }
 
-  Thread::pinThisThreadToCore(core);
+  EXPECT_TRUE(suite, Thread::pinThisThreadToCore(core));
 
   cpu_set_t cpuSet;
   CPU_ZERO(&cpuSet);
@@ -239,9 +259,9 @@ static void testThreadHelpers(TestSuite& suite)
   EXPECT_TRUE(suite, CPU_ISSET(core, &cpuSet));
 
   std::atomic<bool> ran = false;
-  Thread::startDetachedOnCore(core, [&]() -> void {
+  EXPECT_TRUE(suite, Thread::startDetachedOnCore(core, [&]() -> void {
     ran.store(true, std::memory_order_release);
-  });
+  }));
 
   for (int attempt = 0; attempt < 100 && !ran.load(std::memory_order_acquire); ++attempt)
   {
@@ -249,6 +269,22 @@ static void testThreadHelpers(TestSuite& suite)
   }
 
   EXPECT_TRUE(suite, ran.load(std::memory_order_acquire));
+
+  int disallowedCore = firstDisallowedCore();
+  if (disallowedCore >= 0)
+  {
+    ran.store(false, std::memory_order_release);
+    EXPECT_TRUE(suite, Thread::startDetachedOnCore(uint32_t(disallowedCore), [&]() -> void {
+      ran.store(true, std::memory_order_release);
+    }));
+
+    for (int attempt = 0; attempt < 100 && !ran.load(std::memory_order_acquire); ++attempt)
+    {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    EXPECT_TRUE(suite, ran.load(std::memory_order_acquire));
+  }
 }
 
 } // namespace

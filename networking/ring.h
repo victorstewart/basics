@@ -112,7 +112,7 @@ private:
   struct LinkTimeoutTracking {
 
     void *socket = nullptr;
-    uint8_t generation = 0;
+    uint64_t generation = 0;
     Operation linkedOp = Operation::timeout;
   };
 
@@ -121,14 +121,21 @@ private:
     void *socket = nullptr;
     int slot = -1;
     uint64_t serial = 0;
-    uint8_t generation = 0;
+    uint64_t generation = 0;
   };
 
   struct RecvmsgMultishotTracking {
 
     void *socket = nullptr;
-    uint8_t generation = 0;
+    uint64_t generation = 0;
     uint64_t serial = 0;
+  };
+
+  struct SocketOperationTracking {
+
+    void *socket = nullptr;
+    uint64_t generation = 0;
+    Operation operation = Operation::signal;
   };
 
   static thread_local inline Pool<MsghdrPackage, true, true> msghdrPackagePool;
@@ -145,7 +152,7 @@ private:
   // 600     | 596292    | 598550 (+0.4%) | 555366 (-6.7%)
 
   static thread_local inline bytell_hash_map<uint32_t, BufferRing> bufferRingsByBgid;
-  static thread_local inline bytell_hash_map<void *, uint8_t> socketGenerationByIdentity;
+  static thread_local inline bytell_hash_map<void *, uint64_t> socketGenerationByIdentity;
   static thread_local inline bytell_hash_map<uint64_t, LinkTimeoutTracking> linkTimeoutTrackingByUserData;
   static thread_local inline bytell_hash_set<uint64_t> retiredLinkTimeoutTrackingUserData;
   static thread_local inline bytell_hash_map<void *, RecvmsgMultishoter *> recvmsgMultishoterByIdentity;
@@ -153,6 +160,91 @@ private:
   static thread_local inline bytell_hash_set<uint64_t> retiredCloseTrackingUserData;
   static thread_local inline bytell_hash_map<uint64_t, RecvmsgMultishotTracking> recvmsgMultishotTrackingByUserData;
   static thread_local inline bytell_hash_set<uint64_t> retiredRecvmsgMultishotTrackingUserData;
+  static thread_local inline uint64_t nextSocketOperationTicket = 1;
+  static thread_local inline bytell_hash_map<uint64_t, SocketOperationTracking> socketOperationTrackingByUserData;
+
+  static bool fixedFileTraceEnabled(void)
+  {
+    const char *value = std::getenv("BASICS_RING_FIXED_FILE_TRACE");
+    return value != nullptr && value[0] != '\0' && (value[0] != '0' || value[1] != '\0');
+  }
+
+  static bool fixedFileTraceFull(void)
+  {
+    const char *value = std::getenv("BASICS_RING_FIXED_FILE_TRACE");
+    return value != nullptr && value[0] == 'f' && value[1] == 'u' && value[2] == 'l' && value[3] == 'l' && value[4] == '\0';
+  }
+
+  static bool fixedFileTraceEventEnabled(const char *event)
+  {
+    if (fixedFileTraceEnabled() == false)
+    {
+      return false;
+    }
+    if (fixedFileTraceFull())
+    {
+      return true;
+    }
+
+    return event != nullptr &&
+           event[0] == 'c' &&
+           event[1] == 'q' &&
+           event[2] == 'e' &&
+           event[3] == '-' &&
+           event[4] == 'n' &&
+           event[5] == 'e' &&
+           event[6] == 'g' &&
+           event[7] == 'a' &&
+           event[8] == 't' &&
+           event[9] == 'i' &&
+           event[10] == 'v' &&
+           event[11] == 'e' &&
+           event[12] == '\0';
+  }
+
+  static int fixedFileMirrorFD(int slot)
+  {
+    if (fixedfiles == nullptr || slot < 0 || static_cast<uint32_t>(slot) >= fixedFileCapacity)
+    {
+      return -2;
+    }
+
+    return fixedfiles[slot];
+  }
+
+  static void traceFixedFile(const char *event,
+                             Operation op,
+                             void *socket,
+                             int result,
+                             int slot,
+                             int fd,
+                             uint64_t generation,
+                             bool isFixed)
+  {
+    if (fixedFileTraceEventEnabled(event) == false)
+    {
+      return;
+    }
+
+    std::fprintf(stderr,
+                 "Ring fixed-file pid=%d event=%s op=%u socket=%p result=%d slot=%d mirrorFD=%d fd=%d generation=%u fixed=%u closing=%u fixedCapacity=%u reserveLimit=%u vacantReserved=%u vacantAccepted=%u\n",
+                 int(getpid()),
+                 event ? event : "",
+                 unsigned(op),
+                 socket,
+                 result,
+                 slot,
+                 fixedFileMirrorFD(slot),
+                 fd,
+                 unsigned(generation),
+                 unsigned(isFixed),
+                 unsigned(socket != nullptr && isClosing.contains(socket)),
+                 fixedFileCapacity,
+                 fixedFileReserveLimit,
+                 unsigned(vacantFixedFileSlots.size()),
+                 unsigned(vacantAcceptedFixedFileSlots.size()));
+    std::fflush(stderr);
+  }
 
   static uint8_t getTagFromUserData(uint64_t user_data)
   {
@@ -194,7 +286,7 @@ private:
     sqe->user_data = getUserDataFor(op, object, tag);
   }
 
-  static bool socketGenerationMatches(void *socket, uint8_t tag)
+  static bool socketGenerationMatches(void *socket, uint64_t generation)
   {
     auto it = socketGenerationByIdentity.find(socket);
     if (it == socketGenerationByIdentity.end())
@@ -202,7 +294,7 @@ private:
       return false;
     }
 
-    return (it->second == tag);
+    return (it->second == generation);
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
@@ -237,7 +329,7 @@ private:
     return ticket;
   }
 
-  static uint64_t issueLinkTimeoutTracking(void *socketKey, uint8_t generation, Operation linkedOp)
+  static uint64_t issueLinkTimeoutTracking(void *socketKey, uint64_t generation, Operation linkedOp)
   {
     uint64_t userData = 0;
 
@@ -255,7 +347,91 @@ private:
     return userData;
   }
 
-  static uint64_t issueCloseTracking(void *socketKey, int slot, uint64_t serial, uint8_t generation)
+  static uint64_t allocateSocketOperationTicket(void)
+  {
+    uint64_t ticket = nextSocketOperationTicket++;
+    ticket &= 0x0000FFFFFFFFFFFFULL;
+    if (ticket == 0)
+    {
+      ticket = 1;
+      nextSocketOperationTicket = 2;
+    }
+
+    return ticket;
+  }
+
+  static uint64_t issueSocketOperationTracking(Operation operation, void *socketKey, uint64_t generation)
+  {
+    uint64_t userData = 0;
+
+    do
+    {
+      userData = getUserDataFor(operation, allocateSocketOperationTicket());
+    } while (socketOperationTrackingByUserData.contains(userData));
+
+    socketOperationTrackingByUserData[userData] = {
+      .socket = socketKey,
+      .generation = generation,
+      .operation = operation
+    };
+
+    return userData;
+  }
+
+  static bool resolveSocketOperationTracking(uint64_t userData, Operation operation, SocketOperationTracking& tracking)
+  {
+    auto trackingIt = socketOperationTrackingByUserData.find(userData);
+    if (trackingIt == socketOperationTrackingByUserData.end())
+    {
+      return false;
+    }
+
+    tracking = trackingIt->second;
+    socketOperationTrackingByUserData.erase(trackingIt);
+    return tracking.operation == operation;
+  }
+
+  template <typename T> requires (std::is_base_of_v<SocketBase, T>)
+  static void assignSocketOperationUserData(T *socket, Operation operation, uint64_t userData)
+  {
+    switch (operation)
+    {
+      case Operation::send:
+        socket->pendingSendUserData = userData;
+        break;
+      case Operation::recv:
+        socket->pendingRecvUserData = userData;
+        break;
+      case Operation::connect:
+        socket->pendingConnectUserData = userData;
+        break;
+      case Operation::tcpFastOpen:
+        socket->pendingTCPFastOpenUserData = userData;
+        break;
+      default:
+        break;
+    }
+  }
+
+  template <typename T> requires (std::is_base_of_v<SocketBase, T>)
+  static uint64_t socketOperationUserData(T *socket, Operation operation)
+  {
+    switch (operation)
+    {
+      case Operation::send:
+        return socket->pendingSendUserData;
+      case Operation::recv:
+        return socket->pendingRecvUserData;
+      case Operation::connect:
+        return socket->pendingConnectUserData;
+      case Operation::tcpFastOpen:
+        return socket->pendingTCPFastOpenUserData;
+      default:
+        return 0;
+    }
+  }
+
+  static uint64_t issueCloseTracking(void *socketKey, int slot, uint64_t serial, uint64_t generation)
   {
     uint64_t userData = 0;
 
@@ -298,7 +474,7 @@ private:
     return ticket;
   }
 
-  static uint64_t issueRecvmsgMultishotTracking(void *socketKey, uint8_t generation, uint64_t serial)
+  static uint64_t issueRecvmsgMultishotTracking(void *socketKey, uint64_t generation, uint64_t serial)
   {
     uint64_t userData = 0;
 
@@ -610,6 +786,7 @@ public:
   {
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_timeout_update(sqe, (struct __kernel_timespec *)payload, getUserDataFor(Operation::timeout, payload), 0);
+    setUserData(sqe, Operation::cancel, payload);
   }
 
   // nothing says we can't just use regular cancel for this, but might as well do it this way
@@ -617,6 +794,7 @@ public:
   {
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_timeout_remove(sqe, getUserDataFor(Operation::timeout, payload), 0);
+    setUserData(sqe, Operation::cancel, payload);
   }
 
   static void waitForSignals(void)
@@ -717,6 +895,8 @@ public:
       stream->pendingSend = true;
       stream->pendingSendBytes = sendBytes;
       stream->noteSendQueued();
+      uint64_t userData = issueSocketOperationTracking(Operation::send, socket, stream->ioGeneration);
+      assignSocketOperationUserData(stream, Operation::send, userData);
 
       struct io_uring_sqe *sqe = getSQESafe();
       io_uring_prep_send(sqe, submitFD, stream->pBytesToSend(), sendBytes, 0);
@@ -724,7 +904,7 @@ public:
       {
         io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
       }
-      setUserData(sqe, Operation::send, socket, stream->ioGeneration);
+      sqe->user_data = userData;
     }
   }
 
@@ -760,6 +940,8 @@ public:
 
       noteSocketGeneration(stream);
       stream->pendingRecv = true;
+      uint64_t userData = issueSocketOperationTracking(Operation::recv, socket, stream->ioGeneration);
+      assignSocketOperationUserData(stream, Operation::recv, userData);
       struct io_uring_sqe *sqe = getSQESafe();
       io_uring_prep_recv(sqe, submitFD, stream->rBuffer.pTail(), stream->rBuffer.remainingCapacity(), 0);
       if (timeoutMs > 0)
@@ -777,7 +959,7 @@ public:
       {
         io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
       }
-      setUserData(sqe, Operation::recv, socket, stream->ioGeneration);
+      sqe->user_data = userData;
 
       if (timeoutMs > 0)
       {
@@ -803,6 +985,8 @@ public:
     }
 
     noteSocketGeneration(socket);
+    uint64_t userData = issueSocketOperationTracking(Operation::connect, socketKey, socket->ioGeneration);
+    assignSocketOperationUserData(socket, Operation::connect, userData);
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_connect(sqe, submitFD, socket->template daddr<struct sockaddr>(), socket->daddrLen);
 
@@ -823,7 +1007,7 @@ public:
       io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
     }
 
-    setUserData(sqe, Operation::connect, socketKey, socket->ioGeneration);
+    sqe->user_data = userData;
     return true;
   }
 
@@ -832,10 +1016,21 @@ public:
   {
     requireFixedFileSocket(socket, "queueTCPFastOpen");
     noteSocketGeneration(socket);
+    void *socketKey = socketIdentity(socket);
+    uint64_t userData = issueSocketOperationTracking(Operation::tcpFastOpen, socketKey, socket->ioGeneration);
+    assignSocketOperationUserData(socket, Operation::tcpFastOpen, userData);
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_sendto(sqe, socket->fslot, earlyData.data(), earlyData.size(), MSG_FASTOPEN, socket->template daddr<struct sockaddr>(), socket->daddrLen);
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
-    setUserData(sqe, Operation::tcpFastOpen, socket, socket->ioGeneration);
+    traceFixedFile("queue-tfo",
+                   Operation::tcpFastOpen,
+                   socketKey,
+                   int(earlyData.size()),
+                   socket->fslot,
+                   socket->fd,
+                   socket->ioGeneration,
+                   socket->isFixedFile);
+    sqe->user_data = userData;
   }
 
   template <typename T> requires (std::is_base_of_v<TCPSocket, T> || std::is_base_of_v<UnixSocket, T>)
@@ -911,12 +1106,13 @@ public:
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
   static void queueClose(T *socket)
   {
-    struct io_uring_sqe *sqe = getSQESafe();
     void *socketKey = socketIdentity(socket);
     if (isClosing.contains(socketKey))
     {
       return;
     }
+
+    struct io_uring_sqe *sqe = getSQESafe();
     bool hadPendingSend = socket->pendingSend;
     int closeSlot = -1;
 
@@ -925,6 +1121,10 @@ public:
     socket->pendingSend = false;
     socket->pendingRecv = false;
     socket->pendingSendBytes = 0;
+    socket->pendingSendUserData = 0;
+    socket->pendingRecvUserData = 0;
+    socket->pendingConnectUserData = 0;
+    socket->pendingTCPFastOpenUserData = 0;
     // Invalidate all in-flight completions from this stream generation before
     // the socket pointer is reused for a reconnect.
     socket->bumpIoGeneration();
@@ -957,6 +1157,14 @@ public:
       }
 
       closeSlot = socket->fslot;
+      traceFixedFile("queue-close-direct",
+                     Operation::close,
+                     socketKey,
+                     0,
+                     closeSlot,
+                     socket->fd,
+                     socket->ioGeneration,
+                     socket->isFixedFile);
       io_uring_prep_close_direct(sqe, socket->fslot);
       socket->fslot = -1;
       socket->isFixedFile = false;
@@ -968,6 +1176,14 @@ public:
         std::abort();
       }
 
+      traceFixedFile("queue-close-fd",
+                     Operation::close,
+                     socketKey,
+                     0,
+                     -1,
+                     socket->fd,
+                     socket->ioGeneration,
+                     socket->isFixedFile);
       io_uring_prep_close(sqe, socket->fd);
       socket->fd = -1;
       socket->isFixedFile = false;
@@ -1001,7 +1217,7 @@ public:
     return true;
   }
 
-  static bool shouldDispatchTrackedCloseCompletion(void *socketKey, uint64_t serial, uint8_t generation)
+  static bool shouldDispatchTrackedCloseCompletion(void *socketKey, uint64_t serial, uint64_t generation)
   {
     auto closingIt = closingSerialByIdentity.find(socketKey);
     if (closingIt == closingSerialByIdentity.end() || closingIt->second != serial)
@@ -1031,7 +1247,12 @@ public:
    static void queueCancel(T *socket, Operation op)
    {
       struct io_uring_sqe *sqe = getSQESafe();
-      io_uring_prep_cancel64(sqe, getUserDataFor(op, socketIdentity(socket), socket->ioGeneration), IORING_ASYNC_CANCEL_ANY);
+      uint64_t targetUserData = socketOperationUserData(socket, op);
+      if (targetUserData == 0)
+      {
+        targetUserData = getUserDataFor(op, socketIdentity(socket), uint8_t(socket->ioGeneration));
+      }
+      io_uring_prep_cancel64(sqe, targetUserData, IORING_ASYNC_CANCEL_ANY);
       setUserData(sqe, Operation::cancel, socketIdentity(socket), socket->ioGeneration);
    }
 
@@ -1261,6 +1482,15 @@ private:
       ::close(fd);
     }
 
+    traceFixedFile("install",
+                   Operation::socketCommand,
+                   nullptr,
+                   0,
+                   slot,
+                   fd,
+                   0,
+                   true);
+
     return slot;
   }
 
@@ -1336,6 +1566,13 @@ public:
     return (io_uring_cq_ready(&ring) > 0);
   }
 
+#ifdef BASICS_RING_TESTING
+  static uint64_t testingQueuedUserDataAt(uint32_t index)
+  {
+    return ring.sq.sqes[index].user_data;
+  }
+#endif
+
   static void shutdownForExec(void)
   {
     // Explicitly tear down io_uring so fixed-file
@@ -1377,6 +1614,7 @@ public:
     retiredCloseTrackingUserData.clear();
     recvmsgMultishotTrackingByUserData.clear();
     retiredRecvmsgMultishotTrackingUserData.clear();
+    socketOperationTrackingByUserData.clear();
     socketGenerationByIdentity.clear();
     recvmsgMultishoterByIdentity.clear();
     nextCloseSerial = 1;
@@ -1389,6 +1627,7 @@ public:
     retiredLinkTimeoutTrackingHead = 0;
     retiredLinkTimeoutTrackingUserDataCount = 0;
     nextRecvmsgMultishotTicket = 1;
+    nextSocketOperationTicket = 1;
     retiredRecvmsgMultishotTrackingHistory.fill(0);
     retiredRecvmsgMultishotTrackingHead = 0;
     retiredRecvmsgMultishotTrackingUserDataCount = 0;
@@ -1788,12 +2027,46 @@ public:
         switch (op) // ignore if cancelled or closed
         {
             // all socket based operations
-          case Operation::connect:
-          case Operation::accept:
-          case Operation::acceptMultishot:
           case Operation::send:
           case Operation::recv:
           case Operation::tcpFastOpen:
+          case Operation::connect:
+            {
+              SocketOperationTracking tracking = {};
+              if (resolveSocketOperationTracking(user_data, op, tracking) == false)
+              {
+                continue;
+              }
+
+              object = tracking.socket;
+
+              if (isClosing.contains(object))
+              {
+                continue;
+              }
+              if (socketGenerationMatches(object, tracking.generation) == false)
+              {
+                continue;
+              }
+              if ((op == Operation::connect || op == Operation::send || op == Operation::recv) && result == -ECANCELED)
+              {
+                continue;
+              }
+              if (result < 0)
+              {
+                traceFixedFile("cqe-negative",
+                               op,
+                               object,
+                               result,
+                               -1,
+                               -1,
+                               tracking.generation,
+                               false);
+              }
+              break;
+            }
+          case Operation::accept:
+          case Operation::acceptMultishot:
             {
               // ignore the cqe if we've closed the slot
               // there is no point in checking result == -ECANCELLED because we only cancel when we close
@@ -1826,6 +2099,17 @@ public:
               if ((op == Operation::connect || op == Operation::send || op == Operation::recv || op == Operation::poll) && result == -ECANCELED)
               {
                 continue;
+              }
+              if (result < 0)
+              {
+                traceFixedFile("cqe-negative",
+                               op,
+                               object,
+                               result,
+                               -1,
+                               -1,
+                               tag,
+                               false);
               }
               break;
             }
@@ -2065,6 +2349,15 @@ public:
               void *socketKey = tracking.socket;
               int slot = tracking.slot;
 
+              traceFixedFile("complete-close",
+                             Operation::close,
+                             socketKey,
+                             result,
+                             slot,
+                             -1,
+                             tracking.generation,
+                             slot >= 0);
+
               if (slot >= 0)
               {
                 if (slot < 0 || static_cast<uint32_t>(slot) >= fixedFileCapacity)
@@ -2084,7 +2377,16 @@ public:
                 fixedfiles[slot] = -1;
               }
 
-              if (shouldDispatchTrackedCloseCompletion(socketKey, tracking.serial, tracking.generation))
+              bool dispatchCloseHandler = shouldDispatchTrackedCloseCompletion(socketKey, tracking.serial, tracking.generation);
+              traceFixedFile("complete-close-dispatch",
+                             Operation::close,
+                             socketKey,
+                             dispatchCloseHandler ? 1 : 0,
+                             slot,
+                             -1,
+                             tracking.generation,
+                             slot >= 0);
+              if (dispatchCloseHandler)
               {
                 interfacer->closeHandler(socketKey);
               }
@@ -2108,6 +2410,14 @@ public:
                 vacantAcceptedFixedFileSlots.insert(slot);
               }
 
+              traceFixedFile("complete-close-raw",
+                             Operation::closeRaw,
+                             nullptr,
+                             result,
+                             slot,
+                             -1,
+                             0,
+                             true);
               fixedfiles[slot] = -1;
               break;
             }
