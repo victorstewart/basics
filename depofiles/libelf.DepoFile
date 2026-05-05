@@ -1,9 +1,9 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
 NAME libelf
-VERSION 0.194
+VERSION 0.195
 DEPENDS zlib VERSION 1.3.2
-SOURCE URL https://sourceware.org/elfutils/ftp/0.194/elfutils-0.194.tar.bz2
+SOURCE URL https://sourceware.org/elfutils/ftp/0.195/elfutils-0.195.tar.bz2
 BUILD_SYSTEM AUTOCONF
 AUTOCONF_CONFIGURE env CPPFLAGS=-I${dep:zlib}/include LDFLAGS=-L${dep:zlib}/lib LIBS=-lz ./configure --prefix="${DEPO_PREFIX}" --libdir="${DEPO_PREFIX}/lib" --disable-debuginfod --disable-libdebuginfod --disable-nls --enable-install-elfh --without-bzlib --without-lzma --without-zstd
 AUTOCONF_BUILD_SH <<'EOF'

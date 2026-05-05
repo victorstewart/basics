@@ -87,14 +87,47 @@ if (DEFINED EXPECT_MIMALLOC_OBJECT_INTERPOSITION AND EXPECT_MIMALLOC_OBJECT_INTE
   set(_downstream_link_txt "${BUILD_DIR}/CMakeFiles/basics_downstream_package_smoke.dir/link.txt")
   set(_downstream_executable "${BUILD_DIR}/basics_downstream_package_smoke")
 
-  if (NOT EXISTS "${_downstream_link_txt}")
-    message(FATAL_ERROR "Expected downstream link.txt was not produced: ${_downstream_link_txt}")
-  endif()
   if (NOT EXISTS "${_downstream_executable}")
     message(FATAL_ERROR "Expected downstream executable was not produced: ${_downstream_executable}")
   endif()
 
-  file(READ "${_downstream_link_txt}" _downstream_link_line)
+  set(_downstream_link_line "")
+  if (EXISTS "${_downstream_link_txt}")
+    file(READ "${_downstream_link_txt}" _downstream_link_line)
+  elseif (DEFINED GENERATOR AND "${GENERATOR}" MATCHES "Ninja")
+    find_program(_downstream_ninja ninja)
+    if (NOT _downstream_ninja)
+      message(FATAL_ERROR "Ninja generator did not produce link.txt and ninja was not found for command inspection.")
+    endif()
+    execute_process(
+      COMMAND "${_downstream_ninja}" -C "${BUILD_DIR}" -t commands basics_downstream_package_smoke
+      RESULT_VARIABLE _downstream_commands_result
+      OUTPUT_VARIABLE _downstream_commands_stdout
+      ERROR_VARIABLE _downstream_commands_stderr
+    )
+    if (NOT _downstream_commands_result EQUAL 0)
+      message(
+        FATAL_ERROR
+        "Failed to inspect downstream Ninja commands.\n"
+        "stdout:\n${_downstream_commands_stdout}\n"
+        "stderr:\n${_downstream_commands_stderr}"
+      )
+    endif()
+    string(REPLACE "\n" ";" _downstream_command_lines "${_downstream_commands_stdout}")
+    foreach(_downstream_command_line IN LISTS _downstream_command_lines)
+      string(FIND "${_downstream_command_line}" "mimalloc.o" _downstream_line_mimalloc_index)
+      string(FIND "${_downstream_command_line}" "main.cpp.o" _downstream_line_main_index)
+      if (NOT _downstream_line_mimalloc_index EQUAL -1 AND NOT _downstream_line_main_index EQUAL -1)
+        set(_downstream_link_line "${_downstream_command_line}")
+      endif()
+    endforeach()
+  else()
+    message(FATAL_ERROR "Expected downstream link.txt was not produced: ${_downstream_link_txt}")
+  endif()
+
+  if ("${_downstream_link_line}" STREQUAL "")
+    message(FATAL_ERROR "Failed to locate downstream executable link command.")
+  endif()
   string(FIND "${_downstream_link_line}" "mimalloc.o" _downstream_mimalloc_index)
   string(FIND "${_downstream_link_line}" "main.cpp.o" _downstream_main_index)
   if (_downstream_mimalloc_index EQUAL -1)

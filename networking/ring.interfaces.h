@@ -51,6 +51,7 @@ public:
 
   virtual void fileWriteHandler(int fslot, int result) {}
   virtual void fsyncHandler(int fslot, int result) {}
+  virtual void completionBatchHandler(uint32_t count) { (void)count; }
 };
 
 inline thread_local RingInterface *ringInterfacer = nullptr;

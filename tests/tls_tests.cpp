@@ -30,9 +30,18 @@ static void clearBasicsCtx()
 
 static std::string peerCommonName(X509 *certificate)
 {
-  char commonName[256] = {0};
-  X509_NAME_get_text_by_NID(X509_get_subject_name(certificate), NID_commonName, commonName, sizeof(commonName));
-  return std::string(commonName);
+  auto *subject = X509_get_subject_name(certificate);
+  int index = (subject != nullptr) ? X509_NAME_get_index_by_NID(subject, NID_commonName, -1) : -1;
+  auto *entry = (index >= 0) ? X509_NAME_get_entry(subject, index) : nullptr;
+  auto *data = (entry != nullptr) ? X509_NAME_ENTRY_get_data(entry) : nullptr;
+  int length = (data != nullptr) ? ASN1_STRING_length(data) : 0;
+  const unsigned char *bytes = (data != nullptr) ? ASN1_STRING_get0_data(data) : nullptr;
+  if (bytes == nullptr || length <= 0)
+  {
+    return {};
+  }
+
+  return std::string(reinterpret_cast<const char *>(bytes), size_t(length));
 }
 
 static void testContextLoadingAndStaticConfiguration(TestSuite& suite)

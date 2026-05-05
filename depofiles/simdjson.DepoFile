@@ -1,8 +1,8 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
 NAME simdjson
-VERSION 4.2.4
-SOURCE URL https://github.com/simdjson/simdjson/archive/refs/tags/v4.2.4.tar.gz
+VERSION 4.6.3
+SOURCE URL https://github.com/simdjson/simdjson/archive/refs/tags/v4.6.3.tar.gz
 BUILD_SYSTEM CMAKE
 CMAKE_DEFINE CMAKE_INSTALL_INCLUDEDIR=include/simdjson
 CMAKE_DEFINE SIMDJSON_ENABLE_THREADS=OFF

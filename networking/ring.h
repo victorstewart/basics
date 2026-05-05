@@ -74,6 +74,7 @@ public:
   };
 
 private:
+  static constexpr uint32_t completionDispatchBatchLimit = 2048;
 
   struct BufferRing {
 
@@ -1561,6 +1562,11 @@ public:
     (void)io_uring_submit(&ring);
   }
 
+  static uint32_t submissionQueueSpaceLeft(void)
+  {
+    return io_uring_sq_space_left(&ring);
+  }
+
   static bool hasReadyCompletions(void)
   {
     return (io_uring_cq_ready(&ring) > 0);
@@ -1811,8 +1817,6 @@ public:
   {
     BufferRing& bufferRing = bufferRingsByBgid[shoter->bgid];
 
-    memset(buffer, 0, bufferRing.bufferSize);
-
     uint32_t bufferIndex = bufferRing.indexForBuffer(buffer);
     io_uring_buf_ring_add(bufferRing.ring, buffer, bufferRing.bufferSize, bufferIndex, io_uring_buf_ring_mask(bufferRing.count), 0);
 
@@ -1832,7 +1836,7 @@ public:
   // so it's acutally not useful, because we can solve both in one go as we do now
   //
   // don't register more than 512-ish fixed files with valgrind
-  static void createRing(uint32_t sqeCount, uint32_t cqeCount, uint32_t nFixedFiles, uint32_t nReserveFixedFiles, int workQueueFD, int sqpollCore, uint32_t nMsghdrPackages)
+  static void createRing(uint32_t sqeCount, uint32_t cqeCount, uint32_t nFixedFiles, uint32_t nReserveFixedFiles, int workQueueFD, int sqpollCore, uint32_t nMsghdrPackages, bool requireSQPoll = false)
   {
     writeCreateRingStage("worker:ring-enter");
     // IORING_SETUP_ATTACH_WQ
@@ -1931,7 +1935,7 @@ public:
     }
 
     int initResult = io_uring_queue_init_params(sqeCount, &ring, &params);
-    if (initResult < 0 && sqpollCore > -1)
+    if (initResult < 0 && sqpollCore > -1 && requireSQPoll == false)
     {
       // Some kernels/configurations reject SQPOLL with this ring config.
       // Fall back to a regular submit path instead of crash-looping.
@@ -2016,6 +2020,10 @@ public:
 
       io_uring_for_each_cqe(&ring, head, cqe) // this is just a for loop
       {
+        if (count >= completionDispatchBatchLimit)
+        {
+          break;
+        }
         ++count;
 
         user_data = (uint64_t)io_uring_cqe_get_data(cqe);
@@ -2520,6 +2528,10 @@ public:
       }
 
       io_uring_cq_advance(&ring, count);
+      if (interfacer && count > 0)
+      {
+        interfacer->completionBatchHandler(count);
+      }
 
     } while (true);
   }

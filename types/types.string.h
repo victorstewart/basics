@@ -292,6 +292,21 @@ static uint64_t roundUpTo16(uint64_t size)
   return roundUpToMultiple(size, 16);
 }
 
+static void avoidHugePagesForSmallMmap(uint8_t *mapping, uint64_t capacity)
+{
+#if defined(MADV_NOHUGEPAGE)
+  static constexpr uint64_t smallMmapHugePageCutoff = 2ULL * 1024ULL * 1024ULL;
+
+  if (mapping != nullptr && capacity > 0 && capacity <= smallMmapHugePageCutoff)
+  {
+    (void)madvise(mapping, capacity, MADV_NOHUGEPAGE);
+  }
+#else
+  (void)mapping;
+  (void)capacity;
+#endif
+}
+
 template <typename T> concept StringType = requires (T string) { string.data(); string.size(); };
 
 template <typename T> concept StringPointerType = requires (T string) { string->data(); string->size(); };
@@ -680,6 +695,7 @@ public:
 
     capacity = roundedCapacity;
     string = mapping;
+    avoidHugePagesForSmallMmap(string, capacity);
     return true;
   }
 
@@ -1664,6 +1680,7 @@ public:
 #endif
 
               capacity = roundedCapacity;
+              avoidHugePagesForSmallMmap(string, capacity);
             }
             break;
           }
@@ -1753,14 +1770,18 @@ public:
     length += boundedLength(stepForward, capacity - length);
   }
 
-  uint64_t size(void) const
-  {
-    return length;
-  }
-  uint8_t *pend(void) const
-  {
-    return string + length;
-  }
+	  uint64_t size(void) const
+	  {
+	    return length;
+	  }
+	  uint64_t reservedBytes(void) const
+	  {
+	    return capacity;
+	  }
+	  uint8_t *pend(void) const
+	  {
+	    return string + length;
+	  }
 
   uint8_t *begin(void) const
   {

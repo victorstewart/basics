@@ -46,17 +46,20 @@ static String subjectFieldByNid(X509 *cert, int nid)
     return value;
   }
 
-  X509_NAME *subject = X509_get_subject_name(cert);
+  auto *subject = X509_get_subject_name(cert);
   if (subject == nullptr)
   {
     return value;
   }
 
-  char buffer[256] = {};
-  int length = X509_NAME_get_text_by_NID(subject, nid, buffer, sizeof(buffer));
-  if (length > 0)
+  int index = X509_NAME_get_index_by_NID(subject, nid, -1);
+  auto *entry = (index >= 0) ? X509_NAME_get_entry(subject, index) : nullptr;
+  auto *data = (entry != nullptr) ? X509_NAME_ENTRY_get_data(entry) : nullptr;
+  int length = (data != nullptr) ? ASN1_STRING_length(data) : 0;
+  const unsigned char *bytes = (data != nullptr) ? ASN1_STRING_get0_data(data) : nullptr;
+  if (bytes != nullptr && length > 0)
   {
-    value.assign(buffer, uint32_t(length));
+    value.assign(reinterpret_cast<const char *>(bytes), uint32_t(length));
   }
 
   return value;

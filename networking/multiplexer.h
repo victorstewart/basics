@@ -215,6 +215,14 @@ public:
     delete container;
   }
 
+  void completionBatchHandler(uint32_t count) override
+  {
+    for (RingInterface *multiplexer : multiplexers)
+    {
+      multiplexer->completionBatchHandler(count);
+    }
+  }
+
   void restartMultishotRecvMsgOn(void *socket)
   {
     distributeContains(socket, [&](RingInterface *interface) {

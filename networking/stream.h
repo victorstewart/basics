@@ -40,6 +40,16 @@ public:
     sendSourceIsBase = true;
   }
 
+	  void releaseIdleCapacityAbove(uint64_t retainedCapacity)
+	  {
+	    if (outstandingBytes() == 0 &&
+	        sendInFlight == false &&
+	        (reservedBytes() > retainedCapacity || other.reservedBytes() > retainedCapacity))
+	    {
+	      reset();
+	    }
+	  }
+
   void clear(void)
   {
     Buffer::clear();

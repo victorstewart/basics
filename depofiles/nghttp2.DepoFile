@@ -1,9 +1,9 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
 NAME nghttp2
-VERSION 1.64.0
-DEPENDS openssl VERSION 3.4.1
-SOURCE URL https://github.com/nghttp2/nghttp2/releases/download/v1.64.0/nghttp2-1.64.0.tar.gz
+VERSION 1.69.0
+DEPENDS openssl VERSION 4.0.0
+SOURCE URL https://github.com/nghttp2/nghttp2/releases/download/v1.69.0/nghttp2-1.69.0.tar.gz
 BUILD_SYSTEM AUTOCONF
 AUTOCONF_CONFIGURE_SH <<'EOF'
 mkdir -p "${DEPO_BUILD_DIR}"
