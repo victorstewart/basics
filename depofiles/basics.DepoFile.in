@@ -8,7 +8,7 @@ VERSION @BASICS_PACKAGE_VERSION@
 # direct dependencies remain on their exported primary targets unless a depofile exposes alternate artifacts.
 DEPENDS SG14 VERSION 0.1.0
 DEPENDS aegis VERSION 0.10.1
-DEPENDS bitsery VERSION 5.2.5
+DEPENDS bitsery VERSION 5.2.5.1
 DEPENDS gxhash VERSION 3.5.0
 DEPENDS itoa VERSION 0.1.0
 DEPENDS libbpf VERSION 1.7.0
