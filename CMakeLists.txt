@@ -3,7 +3,7 @@
 
 cmake_minimum_required(VERSION 3.21)
 
-project(basics VERSION 0.3.0 LANGUAGES CXX)
+project(basics VERSION 0.3.1 LANGUAGES CXX)
 
 include(CTest)
 include("${CMAKE_CURRENT_SOURCE_DIR}/.depos.cmake")
@@ -55,7 +55,7 @@ function(_basics_prepare_self_depofile out_var)
   if (BASICS_ENABLE_TIDESDB)
     set(_basics_tidesdb_variant_suffix "on")
     set(BASICS_SELF_TIDESDB_ENABLED "ON")
-    set(BASICS_SELF_TIDESDB_DEPENDS "DEPENDS tidesdb VERSION 9.2.0")
+    set(BASICS_SELF_TIDESDB_DEPENDS "DEPENDS tidesdb VERSION 9.2.5")
     set(BASICS_SELF_TIDESDB_LINK " tidesdb::tidesdb")
   else()
     set(_basics_tidesdb_variant_suffix "off")

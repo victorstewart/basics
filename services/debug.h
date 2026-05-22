@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cstdio>
 #include <inttypes.h>
+#include <limits.h>
 #include <type_traits>
 #include <unistd.h>
 #include <atomic>
