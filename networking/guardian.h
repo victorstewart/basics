@@ -104,6 +104,7 @@ public:
       if (pid == 0)
       {
         Filesystem::openWriteAtClose(-1, crashReportPath, report);
+        _exit(EXIT_FAILURE);
       }
       else
       {

@@ -51,7 +51,14 @@ static inline bool renderOpenSSHKnownHostLine(const String& host, uint16_t port,
     return false;
   }
 
-  line.snprintf<"[{}]:{itoa} {}"_ctv>(host, uint64_t(port), publicKeyOpenSSH);
+  if (port == 22)
+  {
+    line.snprintf<"{} {}"_ctv>(host, publicKeyOpenSSH);
+  }
+  else
+  {
+    line.snprintf<"[{}]:{itoa} {}"_ctv>(host, uint64_t(port), publicKeyOpenSSH);
+  }
   return true;
 }
 
@@ -90,10 +97,10 @@ static inline bool verifySSHSessionHostKey(const String& host, uint16_t port, co
   String knownHostLineText = {};
   knownHostLineText.assign(knownHostLine);
   int addResult = libssh2_knownhost_readline(
-     knownHosts,
-     knownHostLineText.c_str(),
-     size_t(knownHostLineText.size()),
-     LIBSSH2_KNOWNHOST_FILE_OPENSSH);
+      knownHosts,
+      knownHostLineText.c_str(),
+      size_t(knownHostLineText.size()),
+      LIBSSH2_KNOWNHOST_FILE_OPENSSH);
   if (addResult != 0)
   {
     libssh2_knownhost_free(knownHosts);
@@ -121,31 +128,31 @@ static inline bool verifySSHSessionHostKey(const String& host, uint16_t port, co
   switch (sessionHostKeyType)
   {
     case LIBSSH2_HOSTKEY_TYPE_ED25519:
-    {
-      checkTypeMask |= LIBSSH2_KNOWNHOST_KEY_ED25519;
-      break;
-    }
-    default:
-    {
-      libssh2_knownhost_free(knownHosts);
-      if (failure != nullptr)
       {
-        failure->assign("ssh server host key algorithm is not supported; only ed25519 is accepted"_ctv);
+        checkTypeMask |= LIBSSH2_KNOWNHOST_KEY_ED25519;
+        break;
       }
-      return false;
-    }
+    default:
+      {
+        libssh2_knownhost_free(knownHosts);
+        if (failure != nullptr)
+        {
+          failure->assign("ssh server host key algorithm is not supported; only ed25519 is accepted"_ctv);
+        }
+        return false;
+      }
   }
 
   String hostText = {};
   hostText.assign(host);
   int checkResult = libssh2_knownhost_checkp(
-     knownHosts,
-     hostText.c_str(),
-     int(port),
-     sessionHostKey,
-     sessionHostKeyLength,
-     checkTypeMask,
-     nullptr);
+      knownHosts,
+      hostText.c_str(),
+      int(port),
+      sessionHostKey,
+      sessionHostKeyLength,
+      checkTypeMask,
+      nullptr);
   libssh2_knownhost_free(knownHosts);
 
   if (checkResult == LIBSSH2_KNOWNHOST_CHECK_MATCH)
@@ -158,20 +165,20 @@ static inline bool verifySSHSessionHostKey(const String& host, uint16_t port, co
     switch (checkResult)
     {
       case LIBSSH2_KNOWNHOST_CHECK_MISMATCH:
-      {
-        failure->snprintf<"ssh host key mismatch for {}:{itoa}"_ctv>(host, uint64_t(port));
-        break;
-      }
+        {
+          failure->snprintf<"ssh host key mismatch for {}:{itoa}"_ctv>(host, uint64_t(port));
+          break;
+        }
       case LIBSSH2_KNOWNHOST_CHECK_NOTFOUND:
-      {
-        failure->snprintf<"ssh host key missing pinned entry for {}:{itoa}"_ctv>(host, uint64_t(port));
-        break;
-      }
+        {
+          failure->snprintf<"ssh host key missing pinned entry for {}:{itoa}"_ctv>(host, uint64_t(port));
+          break;
+        }
       default:
-      {
-        failure->snprintf<"ssh host key verification failed for {}:{itoa}"_ctv>(host, uint64_t(port));
-        break;
-      }
+        {
+          failure->snprintf<"ssh host key verification failed for {}:{itoa}"_ctv>(host, uint64_t(port));
+          break;
+        }
     }
   }
 

@@ -754,7 +754,10 @@ public:
     }
   }
 
-  // aka only ctv, but before we've defined it
+  // `_ctv` initializes a view-backed String (`String s = "literal"_ctv`).
+  // Views cannot grow; `reserve()` returns false, so mutation via append,
+  // snprintf_add, resize, or reserve is a bug. Materialize first:
+  // `String s = {}; s.assign("literal"_ctv);`.
   template <typename T> requires (CompileTimeStringViewType_Sloppy<T>)
   String(T&& anon)
       : String((uint8_t *)anon.data(), anon.size() + 1, Copy::no, anon.size())
