@@ -86,6 +86,7 @@ private:
 	bool progFDOwnedByObject = false;
 	bool loadedFromPreattached = false;
 	__u32 expectedPreattachedMapCount = 0;
+	std::vector<char> kernelLog;
 
 	struct PreattachedMapFD
 	{
@@ -102,6 +103,98 @@ private:
 	};
 
 	std::vector<PreattachedMapFD> preattachedMapFDs;
+
+	// Linux BPF object names are BPF_OBJ_NAME_LEN bytes including NUL:
+	// callers may use at most 15 visible bytes.
+	static constexpr size_t maxObjectNameBytes = BPF_OBJ_NAME_LEN - 1;
+
+	static bool objectNameFitsKernelLimit(const char *name)
+	{
+		return name != nullptr && strnlen(name, BPF_OBJ_NAME_LEN) <= maxObjectNameBytes;
+	}
+
+	static void logInvalidObjectName(const char *kind, const char *name)
+	{
+		basics_log("BPFProgram rejected overlong %s name=%s max_bytes=%zu\n",
+			kind,
+			(name ? name : "<null>"),
+			maxObjectNameBytes);
+	}
+
+	static void logBPFError(const char *op, int fd, int result)
+	{
+		basics_log("BPFProgram::%s failed fd=%d result=%d errno=%d\n",
+			(op ? op : "bpf"),
+			fd,
+			result,
+			errno);
+	}
+
+	static bool validMapFD(int fd, const char *op)
+	{
+		if (fd >= 0)
+		{
+			return true;
+		}
+
+		basics_log("BPFProgram::%s invalid map_fd=%d\n", (op ? op : "bpf-map"), fd);
+		return false;
+	}
+
+	struct bpf_object *openObject(const char *path)
+	{
+		kernelLog.assign(1 << 20, 0);
+		struct bpf_object_open_opts opts = {};
+		opts.sz = sizeof(opts);
+		opts.kernel_log_buf = kernelLog.data();
+		opts.kernel_log_size = kernelLog.size();
+		return bpf_object__open_file(path, &opts);
+	}
+
+	void logKernelLoadFailure(const char *stage, const char *path, int result)
+	{
+		basics_log("BPFProgram::%s failed path=%s result=%d errno=%d\n",
+			stage,
+			(path ? path : "<null>"),
+			result,
+			errno);
+		if (!kernelLog.empty() && kernelLog[0] != '\0')
+		{
+			basics_log("BPFProgram verifier log path=%s\n%s\n", (path ? path : "<null>"), kernelLog.data());
+		}
+	}
+
+	bool validateObjectNames(const char *path)
+	{
+		bool ok = true;
+		struct bpf_map *map = nullptr;
+		bpf_object__for_each_map(map, obj)
+		{
+			if (objectNameFitsKernelLimit(bpf_map__name(map)) == false)
+			{
+				logInvalidObjectName("object map", bpf_map__name(map));
+				ok = false;
+			}
+		}
+
+		struct bpf_program *program = nullptr;
+		bpf_object__for_each_program(program, obj)
+		{
+			if (objectNameFitsKernelLimit(bpf_program__name(program)) == false)
+			{
+				logInvalidObjectName("object program", bpf_program__name(program));
+				ok = false;
+			}
+		}
+
+		if (ok == false)
+		{
+			basics_log("BPFProgram rejected object with overlong BPF object names path=%s max_bytes=%zu\n",
+				(path ? path : "<null>"),
+				maxObjectNameBytes);
+		}
+		return ok;
+	}
 
 	static bool objectNameMatches(const char *requestedName, const char *candidateName)
 	{
@@ -134,6 +227,30 @@ private:
 		{
 			const char *candidateName = bpf_program__name(candidate);
 			if (objectNameMatches(requestedName, candidateName))
+			{
+				return candidate;
+			}
+		}
+
+		return nullptr;
+	}
+
+	static struct bpf_map *findMapByKernelName(struct bpf_object *object, const char *requestedName)
+	{
+		if (object == nullptr || requestedName == nullptr)
+		{
+			return nullptr;
+		}
+
+		if (struct bpf_map *match = bpf_object__find_map_by_name(object, requestedName))
+		{
+			return match;
+		}
+
+		struct bpf_map *candidate = nullptr;
+		bpf_object__for_each_map(candidate, object)
+		{
+			if (objectNameMatches(requestedName, bpf_map__name(candidate)))
 			{
 				return candidate;
 			}
@@ -349,16 +466,33 @@ public:
 	{
 		uint32_t next_id = 0;
 
-	   while (bpf_prog_get_next_id(next_id, &next_id) == 0) 
+	   int nextResult = 0;
+	   errno = 0;
+	   while ((nextResult = bpf_prog_get_next_id(next_id, &next_id)) == 0)
 	   {
 	      int prog_fd = bpf_prog_get_fd_by_id(next_id);
+			if (prog_fd < 0)
+			{
+				basics_log("BPFProgram::removeAllZombies bpf_prog_get_fd_by_id failed prog_id=%u errno=%d\n",
+					next_id,
+					errno);
+				continue;
+			}
 
 			struct bpf_prog_info prog_info;
 			uint32_t len = sizeof(struct bpf_prog_info);
 			memset(&prog_info, 0, len);
 
 			int result = bpf_prog_get_info_by_fd(prog_fd, &prog_info, &len);
-			(void)result;
+			if (result != 0)
+			{
+				basics_log("BPFProgram::removeAllZombies bpf_prog_get_info_by_fd failed prog_id=%u fd=%d errno=%d\n",
+					next_id,
+					prog_fd,
+					errno);
+				::close(prog_fd);
+				continue;
+			}
 			
 			// and we can't extract the attach type, i don't think?, so also need to hardcode that
 			enum bpf_attach_type attach_type;
@@ -381,9 +515,22 @@ public:
 			int ifidx = 3; // eno1
 
 			int detach_result = bpf_prog_detach_opts(prog_fd, ifidx, attach_type, nullptr);
-			(void)detach_result;
+			if (detach_result != 0)
+			{
+				basics_log("BPFProgram::removeAllZombies detach failed prog_id=%u fd=%d ifidx=%d attach_type=%d result=%d errno=%d\n",
+					next_id,
+					prog_fd,
+					ifidx,
+					int(attach_type),
+					detach_result,
+					errno);
+			}
 
 			::close(prog_fd);
+	   }
+	   if (nextResult != 0 && errno != ENOENT)
+	   {
+	      basics_log("BPFProgram::removeAllZombies bpf_prog_get_next_id failed errno=%d\n", errno);
 	   }
 	}
 
@@ -440,17 +587,18 @@ public:
 	    	attachtype = progtype;
 	    	loadedFromPreattached = true;
 	    	
-		obj = bpf_object__open(progpath.c_str());
+		obj = openObject(progpath.c_str());
 
 		if (libbpf_get_error(obj))
 		{
 			int error = -libbpf_get_error(obj);
-			basics_log("BPFProgram::loadPreattached bpf_object__open failed prog_id=%u path=%s error=%d errno=%d\n",
-				prog_id,
-				progpath.c_str(),
-				error,
-				errno);
+			logKernelLoadFailure("loadPreattached open", progpath.c_str(), error);
 			obj = nullptr;
+			close();
+			return false;
+		}
+		if (validateObjectNames(progpath.c_str()) == false)
+		{
 			close();
 			return false;
 		}
@@ -484,11 +632,24 @@ public:
 	{
 		close();
 
-		obj = bpf_object__open(progpath.c_str());
+		if (objectNameFitsKernelLimit(progname.c_str()) == false)
+		{
+			logInvalidObjectName("program", progname.c_str());
+			return false;
+		}
+
+		obj = openObject(progpath.c_str());
 	 
 	   if (libbpf_get_error(obj))
 	   {
+	      int error = -libbpf_get_error(obj);
+	      logKernelLoadFailure("load open", progpath.c_str(), error);
 	      obj = nullptr;
+	      return false;
+	   }
+	   if (validateObjectNames(progpath.c_str()) == false)
+	   {
+	      close();
 	      return false;
 	   }
 
@@ -505,8 +666,10 @@ public:
 		};
 
 	   // Load the program into the kernel
-	   if (bpf_object__load(obj)) 
+	   int loadResult = bpf_object__load(obj);
+	   if (loadResult != 0)
 	   {
+	      logKernelLoadFailure("load verifier", progpath.c_str(), loadResult);
 	      closeInnerMapFDs();
 	      close();
 	      return false;
@@ -515,10 +678,20 @@ public:
 	   closeInnerMapFDs();
 
 	   // Find the program by name (as set in the SEC macro in the eBPF program)
-	   prog = bpf_object__find_program_by_name(obj, progname.c_str());
+	   prog = findProgramByKernelName(obj, progname.c_str());
 
 	   if (!prog) 
 	   {
+	      basics_log("BPFProgram::load missing program name=%s path=%s\n", progname.c_str(), progpath.c_str());
+	      struct bpf_program *candidate = nullptr;
+	      bpf_object__for_each_program(candidate, obj)
+	      {
+	         const char *candidateName = bpf_program__name(candidate);
+	         if (candidateName)
+	         {
+	            basics_log("BPFProgram::load candidate program name=%s\n", candidateName);
+	         }
+	      }
 	      close();
 	      return false;
 	   }
@@ -526,6 +699,7 @@ public:
 	   prog_fd = bpf_program__fd(prog);
 	   if (prog_fd < 0)
 	   {
+	      logBPFError("bpf_program__fd", prog_fd, prog_fd);
 	      close();
 	      return false;
 	   }
@@ -563,6 +737,14 @@ public:
 		   	return true;
 		   }
 
+		   basics_log("BPFProgram::loadAttach attach failed fd=%d ifidx=%d attach_type=%d result=%d errno=%d path=%s program=%s\n",
+				prog_fd,
+				ifidx,
+				int(progtype),
+				result,
+				errno,
+				progpath.c_str(),
+				progname.c_str());
 		   close();
 		   return false;
 		}
@@ -575,7 +757,15 @@ public:
 		if (attachidx > -1)
 		{
 			int result = bpf_prog_detach_opts(prog_fd, attachidx, attachtype, nullptr);
-			(void)result;
+			if (result != 0)
+			{
+				basics_log("BPFProgram::detach failed fd=%d ifidx=%d attach_type=%d result=%d errno=%d\n",
+					prog_fd,
+					attachidx,
+					int(attachtype),
+					result,
+					errno);
+			}
 			attachidx = -1;
 		}
 	}
@@ -584,6 +774,13 @@ public:
 	void openMap(StringType auto&& map_name, Lambda&& lambda)
 	{
 		const char *requestedName = map_name.c_str();
+		if (objectNameFitsKernelLimit(requestedName) == false)
+		{
+			logInvalidObjectName("map", requestedName);
+			lambda(-1);
+			return;
+		}
+
 		auto tryOpenPreattachedMap = [&] (bool allowRefresh) -> int {
 			if (loadedFromPreattached == false)
 			{
@@ -603,11 +800,7 @@ public:
 					return -1;
 				}
 
-				const struct bpf_map *requestedMap = nullptr;
-				if (obj != nullptr)
-				{
-					requestedMap = bpf_object__find_map_by_name(obj, requestedName);
-				}
+				const struct bpf_map *requestedMap = findMapByKernelName(obj, requestedName);
 
 				if (requestedMap != nullptr)
 				{
@@ -703,24 +896,53 @@ public:
 			}
 		}
 
-		int fd = bpf_object__find_map_fd_by_name(obj, map_name.c_str());
+		struct bpf_map *map = findMapByKernelName(obj, requestedName);
+		int fd = (map != nullptr) ? bpf_map__fd(map) : -1;
+		if (map == nullptr)
+		{
+			basics_log("BPFProgram::openMap missing map name=%s prog_fd=%d\n",
+				(requestedName ? requestedName : "<null>"),
+				prog_fd);
+		}
+		else if (fd < 0)
+		{
+			logBPFError("bpf_map__fd", fd, fd);
+		}
 		lambda(fd);
 		// close(fd); // -9 when we open close then reopen. stupid thing.
 	}
 
 	void setElement(int map_fd, void *key, void *value)
 	{
-		bpf_map_update_elem(map_fd, key, value, BPF_ANY);
+		if (validMapFD(map_fd, "setElement") == false)
+		{
+			return;
+		}
+
+		int result = bpf_map_update_elem(map_fd, key, value, BPF_ANY);
+		if (result != 0)
+		{
+			logBPFError("bpf_map_update_elem", map_fd, result);
+		}
 	}
 
 	void deleteElement(int map_fd, void *key)
 	{
-	   bpf_map_delete_elem(map_fd, key);
+		if (validMapFD(map_fd, "deleteElement") == false)
+		{
+			return;
+		}
+
+		int result = bpf_map_delete_elem(map_fd, key);
+		if (result != 0)
+		{
+			logBPFError("bpf_map_delete_elem", map_fd, result);
+		}
 	}
 
 	void deleteArrayElement(int map_fd, uint32_t index)
 	{
-	   bpf_map_delete_elem(map_fd, &index);
+	   deleteElement(map_fd, &index);
 	}
 
 	void deleteArrayElement(StringType auto&& array_name, uint32_t index)
@@ -749,7 +971,7 @@ public:
 	template <typename T>
 	T getElement(StringType auto&& map_name, void *key)
 	{
-		T element;
+		T element = {};
 
 		openMap(map_name, [&] (int map_fd) -> void {
 
@@ -762,8 +984,8 @@ public:
 	template <typename T>
 	T getElement(int fd, void *key)
 	{
-		T element;
-		bpf_map_lookup_elem(fd, key, &element);
+		T element = {};
+		getElement(fd, key, element);
 		return element;
 	}
 
@@ -776,7 +998,17 @@ public:
 	template <typename T>
 	void getElement(int fd, void *key, T& element)
 	{
-		bpf_map_lookup_elem(fd, key, &element);
+		element = {};
+		if (validMapFD(fd, "getElement") == false)
+		{
+			return;
+		}
+
+		int result = bpf_map_lookup_elem(fd, key, &element);
+		if (result != 0)
+		{
+			logBPFError("bpf_map_lookup_elem", fd, result);
+		}
 	}
 
 	template <typename T>
