@@ -95,7 +95,11 @@ static int64_t now(void)
 static int64_t msSinceBoot(void)
 {
   struct timespec boot_time;
+#if defined(CLOCK_BOOTTIME)
   clock_gettime(CLOCK_BOOTTIME, &boot_time);
+#else
+  clock_gettime(CLOCK_MONOTONIC, &boot_time);
+#endif
 
   return timespecToMs(boot_time);
 }

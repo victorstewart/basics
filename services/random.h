@@ -4,7 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#if defined(__linux__)
 #include <sys/random.h>
+#endif
 #include <type_traits>
 
 #pragma once
@@ -21,6 +23,7 @@ constexpr bool isExtendedIntegralV =
 
 inline void fillRandomBytes(void *buffer, size_t size) noexcept
 {
+#if defined(__linux__)
   auto *bytes = static_cast<unsigned char *>(buffer);
   size_t remaining = size;
 
@@ -47,6 +50,9 @@ inline void fillRandomBytes(void *buffer, size_t size) noexcept
     bytes += written;
     remaining -= written;
   }
+#else
+  arc4random_buf(buffer, size);
+#endif
 }
 
 } // namespace detail

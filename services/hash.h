@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <services/random.h>
 
 extern "C" uint32_t gxhash32(const void *buf, size_t len, int64_t seed);
 extern "C" uint64_t gxhash64(const void *buf, size_t len, int64_t seed);

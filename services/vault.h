@@ -20,6 +20,7 @@
 #include <openssl/pem.h>
 
 #include "includes.h"
+#include "services/base64.h"
 #include "services/crypto.h"
 #include "types/types.containers.h"
 

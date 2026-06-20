@@ -1,11 +1,14 @@
 // Copyright 2026 Victor Stewart
 // SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
-#include <sys/stat.h> // fstat64
+#include <sys/stat.h> // fstat
 #include <fcntl.h> /* Definition of O_* and S_* constants */
+#if defined(__linux__)
 #include <linux/openat2.h> /* Definition of RESOLVE_* constants */
+#endif
 #include <sys/syscall.h> /* Definition of SYS_* constants */
 #include <type_traits>
 #include <unistd.h>
@@ -16,6 +19,13 @@
 
 class Filesystem {
 private:
+
+#ifndef O_CLOEXEC
+  static constexpr int O_CLOEXEC = 0;
+#endif
+#ifndef O_PATH
+  static constexpr int O_PATH = O_RDONLY;
+#endif
 
   static int normalizeDirFD(int parentDirFD)
   {
@@ -49,8 +59,8 @@ private:
       return 0;
     }
 
-    struct stat64 statbuf;
-    if (fstat64(fd, &statbuf) != 0)
+    struct stat statbuf;
+    if (fstat(fd, &statbuf) != 0)
     {
       return 0;
     }
@@ -73,8 +83,8 @@ public:
 
   static uint64_t directorySize(const char *path)
   {
-    struct stat64 statbuf;
-    stat64(path, &statbuf);
+    struct stat statbuf;
+    stat(path, &statbuf);
 
     return statbuf.st_size;
   }
@@ -87,13 +97,34 @@ public:
 
   static int openDirectoryAt(int parentDirFD, StringType auto&& relativeFilepath, int flags = O_PATH | O_DIRECTORY | O_CLOEXEC, uint64_t resolveFlags = 0)
   {
+    String scratch;
+#if defined(__linux__) && defined(SYS_openat2)
     struct open_how how;
     memset(&how, 0, sizeof(how));
 
     how.flags = flags;
     how.resolve = resolveFlags;
-    String scratch;
-    return syscall(SYS_openat2, normalizeDirFD(parentDirFD), pathCString(relativeFilepath, scratch), &how, sizeof(struct open_how));
+    int fd = syscall(SYS_openat2, normalizeDirFD(parentDirFD), pathCString(relativeFilepath, scratch), &how, sizeof(struct open_how));
+    if (fd >= 0 || errno != ENOSYS)
+    {
+      return fd;
+    }
+
+    if (resolveFlags != 0)
+    {
+      errno = ENOTSUP;
+      return -1;
+    }
+
+    return openat(normalizeDirFD(parentDirFD), pathCString(relativeFilepath, scratch), flags);
+#else
+    if (resolveFlags != 0)
+    {
+      errno = ENOTSUP;
+      return -1;
+    }
+    return openat(normalizeDirFD(parentDirFD), pathCString(relativeFilepath, scratch), flags);
+#endif
   }
 
   static int createOpenDirectoryAt(int parentDirFD, StringType auto&& path, int createFlags = S_IRWXU, int openFlags = O_PATH | O_DIRECTORY | O_CLOEXEC, uint64_t resolveFlags = 0)
@@ -106,11 +137,17 @@ public:
   {
     String oldScratch;
     String newScratch;
+#if defined(__linux__) && defined(SYS_renameat2)
     return syscall(SYS_renameat2, -1, pathCString(oldpath, oldScratch), -1, pathCString(newpath, newScratch), 0);
+#else
+    return renameat(AT_FDCWD, pathCString(oldpath, oldScratch), AT_FDCWD, pathCString(newpath, newScratch));
+#endif
   }
 
   static int openFileAt(int parentDirFD, StringType auto&& relativeFilepath, int flags = O_RDONLY | O_CLOEXEC, int mode = 0, uint64_t resolveFlags = 0)
   {
+    String scratch;
+#if defined(__linux__) && defined(SYS_openat2)
     struct open_how how;
     memset(&how, 0, sizeof(how));
 
@@ -118,8 +155,27 @@ public:
     how.mode = mode;
     how.resolve = resolveFlags;
 
-    String scratch;
-    return syscall(SYS_openat2, normalizeDirFD(parentDirFD), pathCString(relativeFilepath, scratch), &how, sizeof(struct open_how));
+    int fd = syscall(SYS_openat2, normalizeDirFD(parentDirFD), pathCString(relativeFilepath, scratch), &how, sizeof(struct open_how));
+    if (fd >= 0 || errno != ENOSYS)
+    {
+      return fd;
+    }
+
+    if (resolveFlags != 0)
+    {
+      errno = ENOTSUP;
+      return -1;
+    }
+
+    return openat(normalizeDirFD(parentDirFD), pathCString(relativeFilepath, scratch), flags, mode);
+#else
+    if (resolveFlags != 0)
+    {
+      errno = ENOTSUP;
+      return -1;
+    }
+    return openat(normalizeDirFD(parentDirFD), pathCString(relativeFilepath, scratch), flags, mode);
+#endif
   }
 
   static String filenameFromPath(const String& filepath)

@@ -1,6 +1,6 @@
 // Copyright 2026 Victor Stewart
 // SPDX-License-Identifier: Apache-2.0
-#include <ebpf/program.h>
+#include <networking/message.h>
 #include <services/filesystem.h>
 
 #if defined(BASICS_DOWNSTREAM_ENABLE_TIDESDB) && BASICS_DOWNSTREAM_ENABLE_TIDESDB
@@ -9,13 +9,14 @@
 
 int main()
 {
-  BPFProgram program;
   String text("downstream package smoke");
+  String packet;
+  Message::appendValue(packet, text.data(), uint32_t(text.size()));
 #if defined(BASICS_DOWNSTREAM_ENABLE_TIDESDB) && BASICS_DOWNSTREAM_ENABLE_TIDESDB
   TidesDB db;
 #endif
 
-  if (program.prog_fd != -1)
+  if (packet.size() <= text.size())
   {
     return 1;
   }

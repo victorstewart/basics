@@ -370,6 +370,12 @@ public:
     queuePost(std::forward<Path>(path), data, ticket, std::forward<CleanUpHandler>(cleanUp), make_header("content-type"_ctv, "application/json"_ctv), std::forward<Headers>(headers)...);
   }
 
+  template <typename Path, typename Method, typename... Headers>
+  void queueMethod(Path&& path, Method&& method, Buffer *data, Ticket *ticket, CleanUpHandler&& cleanUp, Headers&&...headers)
+  {
+    queue(std::forward<Path>(path), std::forward<Method>(method), data, ticket, std::forward<CleanUpHandler>(cleanUp), std::forward<Headers>(headers)...);
+  }
+
   // template <typename Path, typename... Headers>
   // void queuePostEncoded(Path&& path, Buffer *data, Headers&&... headers)
   // {

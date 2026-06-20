@@ -13,6 +13,4 @@ CMAKE_DEFINE MI_OPT_ARCH=OFF
 CMAKE_DEFINE MI_OPT_SIMD=OFF
 CMAKE_DEFINE MI_INSTALL_TOPLEVEL=ON
 TARGET mimalloc::mimalloc INTERFACE include
-TARGET mimalloc::runtime STATIC lib/libmimalloc.a SHARED lib/libmimalloc.so.3.3 OBJECT lib/mimalloc.o
-ARTIFACT lib/libmimalloc.so.3
-ARTIFACT lib/libmimalloc.so
+TARGET mimalloc::runtime STATIC lib/libmimalloc.a OBJECT lib/mimalloc.o
