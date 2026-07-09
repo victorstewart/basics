@@ -900,7 +900,11 @@ public:
       assignSocketOperationUserData(stream, Operation::send, userData);
 
       struct io_uring_sqe *sqe = getSQESafe();
-      io_uring_prep_send(sqe, submitFD, stream->pBytesToSend(), sendBytes, 0);
+      int sendFlags = 0;
+#ifdef MSG_NOSIGNAL
+      sendFlags |= MSG_NOSIGNAL;
+#endif
+      io_uring_prep_send(sqe, submitFD, stream->pBytesToSend(), sendBytes, sendFlags);
       if (useFixedFile)
       {
         io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
