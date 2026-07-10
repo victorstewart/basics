@@ -204,6 +204,13 @@ public:
     });
   }
 
+  void rawFDPollHandler(void *owner, uint64_t generation, uint64_t ticket, int result)
+  {
+    distributeContains(owner, [&](RingInterface *interface) {
+      interface->rawFDPollHandler(owner, generation, ticket, result);
+    });
+  }
+
   void ringMessageHandler(int ringFD, String *container)
   {
     if (ringMessageTarget)

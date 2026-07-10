@@ -1127,7 +1127,7 @@ public:
   void configure(uint16_t port)
   {
     createAndConfigureTCPSocket(AF_INET, false, 0);
-    setIPv4FromURI("127.0.0.1", port);
+    setDaddr("127.0.0.1"_ctv, port);
 
     std::string authorityText = "127.0.0.1:" + std::to_string(port);
     authority.assign(authorityText.c_str());

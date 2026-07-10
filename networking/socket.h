@@ -5,7 +5,6 @@
 #include <networking/ip.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netdb.h>
 #include <net/if.h>
 #include <netinet/udp.h>
 #include <sys/un.h>
@@ -339,24 +338,6 @@ public:
 class IPSocket : public virtual SocketBase {
 public:
 
-  static struct addrinfo *getAddressFromURI(const char *uri, uint16_t domain)
-  {
-    struct addrinfo hints, *result;
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = domain;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_V4MAPPED;
-    hints.ai_protocol = 0;
-    hints.ai_canonname = NULL;
-    hints.ai_addr = NULL;
-    hints.ai_next = NULL;
-
-    getaddrinfo(uri, NULL, &hints, &result);
-
-    return result;
-  }
-
   void setIPv6(struct sockaddr_storage *storage, socklen_t *len, const struct in6_addr *address6, uint16_t port)
   {
     *len = sizeof(struct sockaddr_in6);
@@ -476,22 +457,6 @@ public:
       inet_pton(AF_INET6, address.c_str(), &addr);
       setDaddr(&addr, port);
     }
-  }
-
-  void setDaddrFromURI(const char *uri, uint16_t port)
-  {
-    struct addrinfo *result = getAddressFromURI(uri, domain);
-
-    if (domain == AF_INET)
-    {
-      setDaddr(&reinterpret_cast<struct sockaddr_in *>(result->ai_addr)->sin_addr, port);
-    }
-    else
-    {
-      setDaddr(&reinterpret_cast<struct sockaddr_in6 *>(result->ai_addr)->sin6_addr, port);
-    }
-
-    freeaddrinfo(result);
   }
 
   uint32_t daddr4(void)

@@ -543,24 +543,6 @@ public:
     }
   }
 
-  void setIPv4FromURI(const char *uri, uint16_t port)
-  {
-    if (domain != AF_INET)
-    {
-      setIPVersion(AF_INET);
-    }
-    setDaddrFromURI(uri, port);
-  }
-
-  void setIPv6FromURI(const char *uri, uint16_t port)
-  {
-    if (domain != AF_INET6)
-    {
-      setIPVersion(AF_INET6);
-    }
-    setDaddrFromURI(uri, port);
-  }
-
   void finishSetup(const char *server_name)
   {
     setupTLS(server_name);

@@ -3,12 +3,20 @@
 #include <networking/message.h>
 #include <services/filesystem.h>
 
+#include <ares.h>
+
 #if defined(BASICS_DOWNSTREAM_ENABLE_TIDESDB) && BASICS_DOWNSTREAM_ENABLE_TIDESDB
 #include <databases/embedded/tidesdb.h>
 #endif
 
 int main()
 {
+  int cAresVersion = 0;
+  if (ares_version(&cAresVersion) == nullptr || cAresVersion < ARES_VERSION || ares_threadsafety() != ARES_TRUE)
+  {
+    return 1;
+  }
+
   String text("downstream package smoke");
   String packet;
   Message::appendValue(packet, text.data(), uint32_t(text.size()));

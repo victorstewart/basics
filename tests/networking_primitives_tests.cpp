@@ -289,10 +289,6 @@ static void testIpSocketAndArpHelpers(TestSuite& suite)
   EXPECT_EQ(suite, ipv4.dport(), uint16_t(8080));
   EXPECT_TRUE(suite, ipv4.daddrEqual(IPAddress("127.0.0.1", false)));
 
-  ipv4.setDaddrFromURI("127.0.0.1", 1234);
-  EXPECT_EQ(suite, ipv4.daddr4(), inet_addr("127.0.0.1"));
-  EXPECT_EQ(suite, ipv4.dport(), uint16_t(1234));
-
   IPSocket ipv6(AF_INET6, SOCK_STREAM, 0, false);
   ipv6.setDaddr("2001:db8::1"_ctv, 8443);
   EXPECT_EQ(suite, ipv6.dport(), uint16_t(8443));

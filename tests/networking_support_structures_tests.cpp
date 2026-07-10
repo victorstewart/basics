@@ -64,13 +64,18 @@ struct RecordingRingInterface : RingInterface {
   int closeCalls = 0;
   int recvCalls = 0;
   int pollCalls = 0;
+  int rawPollCalls = 0;
   int timeoutCalls = 0;
   int waitidCalls = 0;
   int lastAcceptSlot = -1;
   int lastRecvResult = 0;
   int lastPollResult = 0;
+  int lastRawPollResult = 0;
   int lastTimeoutResult = 0;
   void *lastSocket = nullptr;
+  void *lastRawPollOwner = nullptr;
+  uint64_t lastRawPollGeneration = 0;
+  uint64_t lastRawPollTicket = 0;
   void *lastWaiter = nullptr;
   TimeoutPacket *lastTimeoutPacket = nullptr;
 
@@ -99,6 +104,15 @@ struct RecordingRingInterface : RingInterface {
     ++pollCalls;
     lastSocket = socket;
     lastPollResult = result;
+  }
+
+  void rawFDPollHandler(void *owner, uint64_t generation, uint64_t ticket, int result) override
+  {
+    ++rawPollCalls;
+    lastRawPollOwner = owner;
+    lastRawPollGeneration = generation;
+    lastRawPollTicket = ticket;
+    lastRawPollResult = result;
   }
 
   void timeoutHandler(TimeoutPacket *packet, int result) override
@@ -184,6 +198,8 @@ static void clearRingCloseTrackingState(void)
   Ring::nextLinkTimeoutTicket = 1;
   Ring::nextCloseSerial = 1;
   Ring::nextCloseTicket = 1;
+  Ring::rawPollTrackingByUserData.clear();
+  Ring::nextRawPollTicket = 1;
   Ring::retiredLinkTimeoutTrackingHistory.fill(0);
   Ring::retiredLinkTimeoutTrackingHead = 0;
   Ring::retiredLinkTimeoutTrackingUserDataCount = 0;
@@ -472,6 +488,13 @@ static void testRingDispatcherRoutesHandlers(TestSuite& suite)
   EXPECT_EQ(suite, interfaceTarget.pollCalls, 1);
   EXPECT_EQ(suite, interfaceTarget.lastPollResult, 77);
 
+  scope.localDispatcher.rawFDPollHandler(&socketToken, UINT64_C(0x1020304050607080), UINT64_C(0x1700000000000042), -ECANCELED);
+  EXPECT_EQ(suite, interfaceTarget.rawPollCalls, 1);
+  EXPECT_TRUE(suite, interfaceTarget.lastRawPollOwner == &socketToken);
+  EXPECT_EQ(suite, interfaceTarget.lastRawPollGeneration, UINT64_C(0x1020304050607080));
+  EXPECT_EQ(suite, interfaceTarget.lastRawPollTicket, UINT64_C(0x1700000000000042));
+  EXPECT_EQ(suite, interfaceTarget.lastRawPollResult, -ECANCELED);
+
   TimeoutPacket packet;
   packet.originator = &socketToken;
   scope.localDispatcher.timeoutHandler(&packet, 88);
@@ -665,6 +688,36 @@ static void testResolveTrackedCloseCompletionReturnsTracking(TestSuite& suite)
   EXPECT_EQ(suite, tracking.serial, uint64_t(9));
   EXPECT_EQ(suite, tracking.generation, uint8_t(42));
   EXPECT_TRUE(suite, Ring::closeTrackingByUserData.find(userData) == Ring::closeTrackingByUserData.end());
+
+  clearRingCloseTrackingState();
+}
+
+static void testRawFDPollTrackingUsesStableTickets(TestSuite& suite)
+{
+  clearRingCloseTrackingState();
+
+  void *owner = reinterpret_cast<void *>(UINT64_C(0xFEDCBA9876543210));
+  const uint64_t generation = UINT64_C(0xEEDDCCBBAA998877);
+  const Ring::RawPollTicket first = Ring::issueRawPollTracking(owner, generation);
+  const Ring::RawPollTicket second = Ring::issueRawPollTracking(owner, generation + 1);
+
+  EXPECT_TRUE(suite, first != Ring::invalidRawPollTicket);
+  EXPECT_TRUE(suite, second != Ring::invalidRawPollTicket);
+  EXPECT_TRUE(suite, first != second);
+  EXPECT_TRUE(suite, Ring::getOpFromUserData(first) == Ring::Operation::rawFDPoll);
+  EXPECT_TRUE(suite, Ring::rawPollTrackingByUserData.find(first)->second.owner == owner);
+  EXPECT_EQ(suite, Ring::rawPollTrackingByUserData.find(first)->second.generation, generation);
+
+  Ring::RawPollTracking tracking = {};
+  EXPECT_TRUE(suite, Ring::beginRawPollCompletion(first, tracking));
+  EXPECT_TRUE(suite, tracking.owner == owner);
+  EXPECT_EQ(suite, tracking.generation, generation);
+  EXPECT_TRUE(suite, Ring::rawPollTrackingByUserData.contains(first));
+  EXPECT_FALSE(suite, Ring::beginRawPollCompletion(first, tracking));
+
+  Ring::retireRawPollCompletion(first);
+  EXPECT_FALSE(suite, Ring::rawPollTrackingByUserData.contains(first));
+  EXPECT_TRUE(suite, Ring::rawPollTrackingByUserData.contains(second));
 
   clearRingCloseTrackingState();
 }
@@ -995,6 +1048,7 @@ int main()
   testRingDispatcherIsThreadLocal(suite);
   testFallbackDispatcherInitDoesNotClobberLiveDispatcher(suite);
   testCoroutineStackScheduling(suite);
+  testRawFDPollTrackingUsesStableTickets(suite);
   testResolveTrackedCloseCompletionReturnsTracking(suite);
   testTrackedCloseCompletionSkipsReusedGeneration(suite);
   testTrackedCloseCompletionSkipsRecycledPointerAfterGenerationRepublish(suite);

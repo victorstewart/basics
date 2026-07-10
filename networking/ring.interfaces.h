@@ -42,6 +42,9 @@ public:
   virtual void shutdownHandler(void *socket) {}
 
   virtual void pollHandler(void *socket, int result) {}
+  // This is the terminal lifetime acknowledgement for a raw-fd poll. The
+  // owner may release the watcher before returning from this callback.
+  virtual void rawFDPollHandler(void *owner, uint64_t generation, uint64_t ticket, int result) {}
 
   virtual void waitidHandler(void *waiter) {}
 

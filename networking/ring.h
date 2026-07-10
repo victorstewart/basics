@@ -70,8 +70,12 @@ public:
     ringMessage,
     waitid,
     writeFile,
-    fsyncFile
+    fsyncFile,
+    rawFDPoll
   };
+
+  using RawPollTicket = uint64_t;
+  static constexpr RawPollTicket invalidRawPollTicket = 0;
 
 private:
   static constexpr uint32_t completionDispatchBatchLimit = 2048;
@@ -139,6 +143,14 @@ private:
     Operation operation = Operation::signal;
   };
 
+  struct RawPollTracking {
+
+    void *owner = nullptr;
+    uint64_t generation = 0;
+    bool cancellationRequested = false;
+    bool terminalCompletionObserved = false;
+  };
+
   static thread_local inline Pool<MsghdrPackage, true, true> msghdrPackagePool;
   struct FileBufferPackage {
     int fslot;
@@ -163,6 +175,8 @@ private:
   static thread_local inline bytell_hash_set<uint64_t> retiredRecvmsgMultishotTrackingUserData;
   static thread_local inline uint64_t nextSocketOperationTicket = 1;
   static thread_local inline bytell_hash_map<uint64_t, SocketOperationTracking> socketOperationTrackingByUserData;
+  static thread_local inline uint64_t nextRawPollTicket = 1;
+  static thread_local inline bytell_hash_map<RawPollTicket, RawPollTracking> rawPollTrackingByUserData;
 
   static bool fixedFileTraceEnabled(void)
   {
@@ -377,6 +391,53 @@ private:
     };
 
     return userData;
+  }
+
+  static uint64_t allocateRawPollTicket(void)
+  {
+    uint64_t ticket = nextRawPollTicket++;
+    ticket &= 0x0000FFFFFFFFFFFFULL;
+    if (ticket == 0)
+    {
+      ticket = 1;
+      nextRawPollTicket = 2;
+    }
+
+    return ticket;
+  }
+
+  static RawPollTicket issueRawPollTracking(void *owner, uint64_t generation)
+  {
+    RawPollTicket ticket = invalidRawPollTicket;
+
+    do
+    {
+      ticket = getUserDataFor(Operation::rawFDPoll, allocateRawPollTicket());
+    } while (rawPollTrackingByUserData.contains(ticket));
+
+    rawPollTrackingByUserData[ticket] = {
+      .owner = owner,
+      .generation = generation
+    };
+    return ticket;
+  }
+
+  static bool beginRawPollCompletion(RawPollTicket ticket, RawPollTracking& tracking)
+  {
+    auto it = rawPollTrackingByUserData.find(ticket);
+    if (it == rawPollTrackingByUserData.end() || it->second.terminalCompletionObserved)
+    {
+      return false;
+    }
+
+    it->second.terminalCompletionObserved = true;
+    tracking = it->second;
+    return true;
+  }
+
+  static void retireRawPollCompletion(RawPollTicket ticket)
+  {
+    rawPollTrackingByUserData.erase(ticket);
   }
 
   static bool resolveSocketOperationTracking(uint64_t userData, Operation operation, SocketOperationTracking& tracking)
@@ -1355,6 +1416,43 @@ public:
     setUserData(sqe, Operation::poll, socket, socket->ioGeneration);
   }
 
+  // Raw-fd watchers are independent of SocketBase and keep their full owner
+  // identity in the tracking map. The returned ticket is also the exact
+  // io_uring user_data value and remains live until rawFDPollHandler runs.
+  static RawPollTicket queueRawFDPoll(void *owner, uint64_t generation, int fd, unsigned pollMask)
+  {
+    if (owner == nullptr || interfacer == nullptr || fd < 0 || pollMask == 0)
+    {
+      return invalidRawPollTicket;
+    }
+
+    RawPollTicket ticket = issueRawPollTracking(owner, generation);
+    struct io_uring_sqe *sqe = getSQESafe();
+    io_uring_prep_poll_add(sqe, fd, pollMask);
+    sqe->user_data = ticket;
+    return ticket;
+  }
+
+  // Cancellation is only a request. Readiness may already have won, so the
+  // original poll CQE is always the sole terminal event and is delivered even
+  // when its result is -ECANCELED.
+  static bool cancelRawFDPoll(RawPollTicket ticket)
+  {
+    auto it = rawPollTrackingByUserData.find(ticket);
+    if (it == rawPollTrackingByUserData.end() ||
+        it->second.cancellationRequested ||
+        it->second.terminalCompletionObserved)
+    {
+      return false;
+    }
+
+    it->second.cancellationRequested = true;
+    struct io_uring_sqe *sqe = getSQESafe();
+    io_uring_prep_cancel64(sqe, ticket, 0);
+    setUserData(sqe, Operation::cancel, getObjectValueFromUserData(ticket));
+    return true;
+  }
+
   static void queueRingMessageToRingFD(int ringFD, String *container)
   {
     if (ringFD < 0)
@@ -1585,6 +1683,13 @@ public:
 
   static void shutdownForExec(void)
   {
+    // Raw-fd owners use their terminal callback as the destruction barrier.
+    // Silently dropping live tracking here would make that lifetime unknowable.
+    if (rawPollTrackingByUserData.empty() == false)
+    {
+      std::abort();
+    }
+
     // Explicitly tear down io_uring so fixed-file
     // references do not survive into the new binary and pin listener ports.
     if (ring.ring_fd > 0)
@@ -1625,6 +1730,7 @@ public:
     recvmsgMultishotTrackingByUserData.clear();
     retiredRecvmsgMultishotTrackingUserData.clear();
     socketOperationTrackingByUserData.clear();
+    rawPollTrackingByUserData.clear();
     socketGenerationByIdentity.clear();
     recvmsgMultishoterByIdentity.clear();
     nextCloseSerial = 1;
@@ -1638,6 +1744,7 @@ public:
     retiredLinkTimeoutTrackingUserDataCount = 0;
     nextRecvmsgMultishotTicket = 1;
     nextSocketOperationTicket = 1;
+    nextRawPollTicket = 1;
     retiredRecvmsgMultishotTrackingHistory.fill(0);
     retiredRecvmsgMultishotTrackingHead = 0;
     retiredRecvmsgMultishotTrackingUserDataCount = 0;
@@ -2302,6 +2409,21 @@ public:
               interfacer->pollHandler(object, result);
               break;
             }
+          case Operation::rawFDPoll:
+            {
+              RawPollTracking tracking = {};
+              if (beginRawPollCompletion(user_data, tracking) == false)
+              {
+                break;
+              }
+
+              if (interfacer)
+              {
+                interfacer->rawFDPollHandler(tracking.owner, tracking.generation, user_data, result);
+              }
+              retireRawPollCompletion(user_data);
+              break;
+            }
           case Operation::linkTimeout:
             {
               LinkTimeoutTracking tracking = {};
@@ -2535,6 +2657,10 @@ public:
       if (interfacer && count > 0)
       {
         interfacer->completionBatchHandler(count);
+      }
+      if (exit)
+      {
+        return;
       }
 
     } while (true);

@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 NAME libcurl
 VERSION 8.20.0
+DEPENDS cares VERSION 1.34.8
 DEPENDS nghttp2 VERSION 1.69.0
 DEPENDS openssl VERSION 4.0.0
 DEPENDS zlib VERSION 1.3.2
 SOURCE URL https://github.com/curl/curl/releases/download/curl-8_20_0/curl-8.20.0.tar.gz
 BUILD_SYSTEM AUTOCONF
-AUTOCONF_CONFIGURE env "CPPFLAGS=-I${dep:openssl}/include -I${dep:nghttp2}/include -I${dep:zlib}/include" "LDFLAGS=-L${dep:openssl}/lib -L${dep:nghttp2}/lib -L${dep:zlib}/lib" ./configure --prefix="${DEPO_PREFIX}" --libdir="${DEPO_PREFIX}/lib" --with-openssl="${dep:openssl}" --with-nghttp2="${dep:nghttp2}" --with-zlib="${dep:zlib}" --without-zstd --without-brotli --without-libpsl --without-libidn2 --disable-ldap --disable-ldaps --enable-static --disable-shared
+AUTOCONF_CONFIGURE env "CPPFLAGS=-I${dep:cares}/include -I${dep:openssl}/include -I${dep:nghttp2}/include -I${dep:zlib}/include" "LDFLAGS=-L${dep:cares}/lib -L${dep:openssl}/lib -L${dep:nghttp2}/lib -L${dep:zlib}/lib" ./configure --prefix="${DEPO_PREFIX}" --libdir="${DEPO_PREFIX}/lib" --enable-ares="${dep:cares}" --with-openssl="${dep:openssl}" --with-nghttp2="${dep:nghttp2}" --with-zlib="${dep:zlib}" --without-zstd --without-brotli --without-libpsl --without-libidn2 --disable-ldap --disable-ldaps --enable-static --disable-shared
 TARGET libcurl::libcurl STATIC lib/libcurl.a INTERFACE include
-LINK libcurl::libcurl nghttp2::nghttp2 openssl zlib::zlib
+LINK libcurl::libcurl cares::cares nghttp2::nghttp2 openssl zlib::zlib

@@ -79,7 +79,7 @@ set(BASICS_PACKAGE_SOURCE_URL "${BASICS_RELEASE_SOURCE_URL}")
 set(BASICS_PACKAGE_SOURCE_SHA256 "${BASICS_RELEASE_SOURCE_SHA256}")
 set(
   BASICS_PACKAGE_DIRECT_DEPENDENCY_LINKS
-  "SG14::SG14 aegis::aegis bitsery::bitsery gxhash::gxhash itoa::itoa libssh2::libssh2 liburing::liburing::static nghttp2::nghttp2 openssl static_type_info::static_type_info"
+  "SG14::SG14 aegis::aegis bitsery::bitsery cares::cares gxhash::gxhash itoa::itoa libssh2::libssh2 liburing::liburing::static nghttp2::nghttp2 openssl static_type_info::static_type_info"
 )
 set(BASICS_PACKAGE_MIMALLOC_LINK " mimalloc::runtime::object")
 set(BASICS_PACKAGE_USE_MIMALLOC 1)

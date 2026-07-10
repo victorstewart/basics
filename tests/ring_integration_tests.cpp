@@ -3,12 +3,14 @@
 #include "tests/test_support.h"
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <netinet/in.h>
+#include <poll.h>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
@@ -636,6 +638,140 @@ struct TimedRecvCloseReuseStressInterface : RingInterface {
   }
 };
 
+enum class RawPollExpectation : uint8_t {
+  ready,
+  canceled,
+  readinessCancelRace
+};
+
+struct RawPollWatcher {
+  RawPollExpectation expectation;
+  uint64_t generation;
+  Ring::RawPollTicket ticket = Ring::invalidRawPollTicket;
+  int *destructionCount = nullptr;
+
+  ~RawPollWatcher()
+  {
+    ++(*destructionCount);
+  }
+};
+
+struct RawPollScenarioInterface : RingInterface {
+  TestSuite *suite = nullptr;
+  TimeoutPacket deadline;
+  Vector<Ring::RawPollTicket> completedTickets;
+  size_t expectedCompletions = 0;
+  int destructionCount = 0;
+  bool deadlineFired = false;
+
+  explicit RawPollScenarioInterface(TestSuite& testSuite)
+      : suite(&testSuite)
+  {
+    deadline.setTimeoutMs(2000);
+  }
+
+  void rawFDPollHandler(void *owner, uint64_t generation, uint64_t ticket, int result) override
+  {
+    if (std::find(completedTickets.begin(), completedTickets.end(), ticket) != completedTickets.end())
+    {
+      suite->expectTrue(false, "raw fd poll ticket completes exactly once", __FILE__, __LINE__);
+      Ring::exit = true;
+      return;
+    }
+
+    RawPollWatcher *watcher = static_cast<RawPollWatcher *>(owner);
+    suite->expectTrue(watcher != nullptr, "raw fd poll returns its owner", __FILE__, __LINE__);
+    if (watcher == nullptr)
+    {
+      Ring::exit = true;
+      return;
+    }
+
+    suite->expectEqual(generation, watcher->generation, "generation", "watcher->generation", __FILE__, __LINE__);
+    suite->expectEqual(ticket, watcher->ticket, "ticket", "watcher->ticket", __FILE__, __LINE__);
+    suite->expectTrue(Ring::cancelRawFDPoll(ticket) == false, "terminal raw fd poll cannot be canceled again", __FILE__, __LINE__);
+
+    switch (watcher->expectation)
+    {
+      case RawPollExpectation::ready:
+        suite->expectTrue(result >= 0 && (result & POLLIN), "ready raw fd poll reports POLLIN", __FILE__, __LINE__);
+        break;
+      case RawPollExpectation::canceled:
+        suite->expectEqual(result, -ECANCELED, "result", "-ECANCELED", __FILE__, __LINE__);
+        break;
+      case RawPollExpectation::readinessCancelRace:
+        suite->expectTrue(result == -ECANCELED || (result >= 0 && (result & POLLIN)), "readiness/cancel race has one valid terminal result", __FILE__, __LINE__);
+        break;
+    }
+
+    completedTickets.push_back(ticket);
+    delete watcher;
+
+    if (completedTickets.size() == expectedCompletions)
+    {
+      Ring::exit = true;
+    }
+  }
+
+  void timeoutHandler(TimeoutPacket *packet, int result) override
+  {
+    (void)result;
+    if (packet == &deadline)
+    {
+      deadlineFired = true;
+      Ring::exit = true;
+    }
+  }
+};
+
+struct CompletionBatchExitInterface : RingInterface {
+  TimeoutPacket wakeup;
+  bool timeoutHandled = false;
+  bool batchHandled = false;
+
+  CompletionBatchExitInterface()
+  {
+    wakeup.setTimeoutMs(1);
+  }
+
+  void timeoutHandler(TimeoutPacket *packet, int result) override
+  {
+    if (packet == &wakeup && result == -ETIME)
+    {
+      timeoutHandled = true;
+    }
+  }
+
+  void completionBatchHandler(uint32_t count) override
+  {
+    if (count > 0 && timeoutHandled)
+    {
+      batchHandled = true;
+      Ring::exit = true;
+    }
+  }
+};
+
+static void testCompletionBatchCanQuiesceRing(TestSuite& suite)
+{
+  CompletionBatchExitInterface interfacer;
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(32, 32, 4, 2, -1, -1, 4);
+  Ring::queueTimeout(&interfacer.wakeup);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  EXPECT_TRUE(suite, interfacer.timeoutHandled);
+  EXPECT_TRUE(suite, interfacer.batchHandled);
+}
+
 static void runRingScenario(TestSuite& suite)
 {
   RingScenarioInterface interfacer(suite);
@@ -738,6 +874,78 @@ static void runRingScenario(TestSuite& suite)
   EXPECT_EQ(suite, reply, std::string("pong"));
   EXPECT_TRUE(suite, passiveClientResult <= 0);
   (void)interfacer.acceptMultishotMustRearm;
+}
+
+static void testRawFDPollReadinessCancellationAndRace(TestSuite& suite)
+{
+  RawPollScenarioInterface interfacer(suite);
+  Vector<std::array<int, 2>> pipes;
+
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(256, 512, 8, 2, -1, -1, 8);
+
+  EXPECT_EQ(suite, Ring::queueRawFDPoll(nullptr, 1, STDIN_FILENO, POLLIN), Ring::invalidRawPollTicket);
+  EXPECT_EQ(suite, Ring::queueRawFDPoll(&interfacer, 1, -1, POLLIN), Ring::invalidRawPollTicket);
+  EXPECT_EQ(suite, Ring::queueRawFDPoll(&interfacer, 1, STDIN_FILENO, 0), Ring::invalidRawPollTicket);
+
+  auto addWatcher = [&](RawPollExpectation expectation, bool makeReady, bool cancel) {
+    std::array<int, 2> descriptors = {-1, -1};
+    EXPECT_EQ(suite, pipe2(descriptors.data(), O_NONBLOCK | O_CLOEXEC), 0);
+    if (descriptors[0] < 0 || descriptors[1] < 0)
+    {
+      return;
+    }
+
+    RawPollWatcher *watcher = new RawPollWatcher {
+      .expectation = expectation,
+      .generation = UINT64_C(0xEEDDCCBBAA000000) + pipes.size(),
+      .destructionCount = &interfacer.destructionCount
+    };
+    watcher->ticket = Ring::queueRawFDPoll(watcher, watcher->generation, descriptors[0], POLLIN);
+    EXPECT_TRUE(suite, watcher->ticket != Ring::invalidRawPollTicket);
+
+    if (makeReady)
+    {
+      const uint8_t value = 1;
+      EXPECT_EQ(suite, write(descriptors[1], &value, sizeof(value)), ssize_t(sizeof(value)));
+    }
+    if (cancel)
+    {
+      EXPECT_TRUE(suite, Ring::cancelRawFDPoll(watcher->ticket));
+      EXPECT_FALSE(suite, Ring::cancelRawFDPoll(watcher->ticket));
+    }
+
+    pipes.push_back(descriptors);
+    ++interfacer.expectedCompletions;
+  };
+
+  addWatcher(RawPollExpectation::ready, true, false);
+  addWatcher(RawPollExpectation::canceled, false, true);
+  for (size_t index = 0; index < 64; ++index)
+  {
+    addWatcher(RawPollExpectation::readinessCancelRace, true, true);
+  }
+
+  Ring::queueTimeout(&interfacer.deadline);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  for (const auto& descriptors : pipes)
+  {
+    close(descriptors[0]);
+    close(descriptors[1]);
+  }
+
+  EXPECT_FALSE(suite, interfacer.deadlineFired);
+  EXPECT_EQ(suite, interfacer.completedTickets.size(), interfacer.expectedCompletions);
+  EXPECT_EQ(suite, interfacer.destructionCount, int(interfacer.expectedCompletions));
 }
 
 static void testRingletSendRecvAndTimeout(TestSuite& suite)
@@ -1156,6 +1364,8 @@ int main()
 
   TestSuite suite;
   runRingScenario(suite);
+  testCompletionBatchCanQuiesceRing(suite);
+  testRawFDPollReadinessCancellationAndRace(suite);
   testRingletSendRecvAndTimeout(suite);
   testDuplicateQueueCloseIsIdempotent(suite);
   testAcceptedCloseRawReturnsDynamicSlot(suite);
