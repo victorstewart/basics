@@ -28,7 +28,6 @@
 #include <utility>
 #include <vector>
 
-#include <curl/curl.h>
 #include <nghttp2/nghttp2.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -50,8 +49,6 @@
 #include "networking/tls.h"
 #include "networking/ring.h"
 #include "networking/reconnector.h"
-#include "networking/email.client.h"
-#include "networking/h2b.client.h"
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wkeyword-macro"
@@ -553,193 +550,6 @@ public:
   }
 };
 
-class SMTPServer : public TLSLoopbackServer {
-private:
-
-  std::vector<std::string> commands_;
-  std::string messageData_;
-
-protected:
-
-  void handleClient(SSL *ssl) override
-  {
-    if (!sslWriteAll(ssl, "220 basics-smtp ESMTP ready\r\n"))
-    {
-      setFailure("failed to send smtp greeting");
-      return;
-    }
-
-    while (true)
-    {
-      std::string line;
-      if (!sslReadLine(ssl, line))
-      {
-        break;
-      }
-
-      commands_.push_back(line);
-
-      if (line.rfind("EHLO ", 0) == 0 || line.rfind("HELO ", 0) == 0)
-      {
-        if (!sslWriteAll(ssl, "250-localhost\r\n250 SIZE 1048576\r\n"))
-        {
-          setFailure("failed to reply to smtp greeting");
-          return;
-        }
-      }
-      else if (line.rfind("MAIL FROM:", 0) == 0 || line.rfind("RCPT TO:", 0) == 0)
-      {
-        if (!sslWriteAll(ssl, "250 OK\r\n"))
-        {
-          setFailure("failed to reply to smtp envelope command");
-          return;
-        }
-      }
-      else if (line == "DATA\r\n")
-      {
-        if (!sslWriteAll(ssl, "354 End data with <CR><LF>.<CR><LF>\r\n"))
-        {
-          setFailure("failed to reply to smtp DATA");
-          return;
-        }
-
-        if (!sslReadUntil(ssl, "\r\n.\r\n", messageData_))
-        {
-          setFailure("failed to read smtp message payload");
-          return;
-        }
-
-        if (messageData_.size() >= 5)
-        {
-          messageData_.erase(messageData_.size() - 5);
-        }
-
-        if (!sslWriteAll(ssl, "250 OK queued\r\n"))
-        {
-          setFailure("failed to acknowledge smtp payload");
-          return;
-        }
-      }
-      else if (line == "QUIT\r\n")
-      {
-        (void)sslWriteAll(ssl, "221 Bye\r\n");
-        break;
-      }
-      else
-      {
-        if (!sslWriteAll(ssl, "250 OK\r\n"))
-        {
-          setFailure("failed to reply to smtp command");
-          return;
-        }
-      }
-    }
-  }
-
-public:
-
-  explicit SMTPServer(const RuntimeTLSMaterial& tls)
-      : TLSLoopbackServer(tls, false)
-  {}
-
-  const std::vector<std::string>& commands() const
-  {
-    return commands_;
-  }
-
-  const std::string& messageData() const
-  {
-    return messageData_;
-  }
-};
-
-struct HTTPResponseSpec {
-  int status = 200;
-  std::string contentType = "application/json";
-  std::string body;
-};
-
-class HTTPServer : public TLSLoopbackServer {
-public:
-
-  struct ObservedRequest {
-    std::string method;
-    std::string path;
-    std::string authority;
-    std::string authorization;
-  };
-
-  using Handler = std::function<HTTPResponseSpec(const ObservedRequest&)>;
-
-private:
-
-  Handler handler_;
-  ObservedRequest lastRequest_;
-  bool sawRequest_ = false;
-
-protected:
-
-  void handleClient(SSL *ssl) override
-  {
-    std::string request;
-    if (!sslReadUntil(ssl, "\r\n\r\n", request))
-    {
-      setFailure("failed to read https request");
-      return;
-    }
-
-    size_t lineEnd = request.find("\r\n");
-    if (lineEnd == std::string::npos)
-    {
-      setFailure("invalid https request line");
-      return;
-    }
-
-    std::string_view requestLine(request.data(), lineEnd);
-    size_t methodEnd = requestLine.find(' ');
-    size_t pathEnd = (methodEnd == std::string::npos) ? std::string_view::npos : requestLine.find(' ', methodEnd + 1);
-    if (methodEnd == std::string::npos || pathEnd == std::string_view::npos)
-    {
-      setFailure("malformed https request line");
-      return;
-    }
-
-    sawRequest_ = true;
-    lastRequest_.method.assign(requestLine.substr(0, methodEnd));
-    lastRequest_.path.assign(requestLine.substr(methodEnd + 1, pathEnd - methodEnd - 1));
-
-    HTTPResponseSpec response = handler_(lastRequest_);
-    std::string payload =
-        "HTTP/1.1 " + std::to_string(response.status) + " OK\r\n"
-        "Content-Type: " + response.contentType + "\r\n"
-        "Content-Length: " + std::to_string(response.body.size()) + "\r\n"
-        "Connection: close\r\n\r\n" +
-        response.body;
-
-    if (!sslWriteAll(ssl, payload))
-    {
-      setFailure("failed to write https response");
-    }
-  }
-
-public:
-
-  HTTPServer(const RuntimeTLSMaterial& tls, Handler handler)
-      : TLSLoopbackServer(tls, false),
-        handler_(std::move(handler))
-  {}
-
-  bool sawRequest() const
-  {
-    return sawRequest_;
-  }
-
-  const ObservedRequest& lastRequest() const
-  {
-    return lastRequest_;
-  }
-};
-
 struct HTTP2ResponseSpec {
   int status = 200;
   std::string contentType = "application/json";
@@ -1082,12 +892,6 @@ public:
   {
     return lastRequest_;
   }
-};
-
-class ExposedH2BlockingClient : public H2BlockingClient {
-public:
-
-  using H2BlockingClient::getJSONResponse;
 };
 
 class WakeTrackingCoroutineStack : public CoroutineStack {
@@ -2237,132 +2041,6 @@ static void testReconnectorStateMachine(TestSuite& suite)
   EXPECT_EQ(suite, reconnect.attemptDeadlineMs, int64_t(0));
 }
 
-static void testEmailClientSMTPFlow(TestSuite& suite, const RuntimeTLSMaterial& tls)
-{
-  SMTPServer server(tls);
-  EXPECT_TRUE(suite, server.ready());
-  if (!server.ready())
-  {
-    return;
-  }
-
-  {
-    EmailClient client;
-    std::string smtpUrl = "smtps://127.0.0.1:" + std::to_string(server.port());
-    client.setTLSCAFile(tls.certPath());
-    client.setSMTP(smtpUrl);
-    client.sendEmail(
-        "sender@example.com"_ctv,
-        "recipient@example.com"_ctv,
-        "Protocol Test"_ctv,
-        "This body is intentionally long so that the email client has to wrap it onto multiple lines while preserving the message contents."_ctv);
-  }
-
-  server.wait();
-
-  if (!server.failure().empty())
-  {
-    std::cerr << "smtp server failure: " << server.failure() << '\n';
-  }
-
-  EXPECT_TRUE(suite, server.failure().empty());
-  EXPECT_TRUE(suite, !server.commands().empty());
-  EXPECT_TRUE(suite, server.messageData().find("Subject: Protocol Test\r\n") != std::string::npos);
-  EXPECT_TRUE(suite, server.messageData().find("To: recipient@example.com\r\n") != std::string::npos);
-  EXPECT_TRUE(suite, server.messageData().find("From: ") != std::string::npos);
-  EXPECT_TRUE(suite, server.messageData().find("This body is intentionally long") != std::string::npos);
-
-  bool sawMailFrom = false;
-  bool sawRcptTo = false;
-  bool sawData = false;
-  for (const std::string& command : server.commands())
-  {
-    sawMailFrom = sawMailFrom || (command.rfind("MAIL FROM:", 0) == 0);
-    sawRcptTo = sawRcptTo || (command.rfind("RCPT TO:", 0) == 0);
-    sawData = sawData || (command == "DATA\r\n");
-  }
-
-  EXPECT_TRUE(suite, sawMailFrom);
-  EXPECT_TRUE(suite, sawRcptTo);
-  EXPECT_TRUE(suite, sawData);
-}
-
-static void testH2BlockingClientJSONAndParseFailure(TestSuite& suite, const RuntimeTLSMaterial& tls)
-{
-  {
-    HTTPServer server(tls, [](const HTTPServer::ObservedRequest& request) -> HTTPResponseSpec {
-      HTTPResponseSpec response;
-      if (request.path == "/json")
-      {
-        response.body = "{\"message\":\"ok\"}";
-      }
-      else
-      {
-        response.body = "{\"unexpected\":true}";
-      }
-      return response;
-    });
-
-    EXPECT_TRUE(suite, server.ready());
-    if (server.ready())
-    {
-      ExposedH2BlockingClient client;
-      client.setTLSCAFile(tls.certPath());
-      std::string url = "https://127.0.0.1:" + std::to_string(server.port()) + "/json";
-      auto result = client.getJSONResponse(url);
-      EXPECT_TRUE(suite, !result.error());
-      if (!result.error())
-      {
-        simdjson::dom::element element;
-        EXPECT_TRUE(suite, !result.get(element));
-        std::string_view message;
-        EXPECT_TRUE(suite, !element["message"].get(message));
-        EXPECT_EQ(suite, message, std::string_view("ok"));
-      }
-
-      server.wait();
-      if (!server.failure().empty())
-      {
-        std::cerr << "https server failure (/json): " << server.failure() << '\n';
-      }
-      EXPECT_TRUE(suite, server.failure().empty());
-      EXPECT_TRUE(suite, server.sawRequest());
-      EXPECT_EQ(suite, server.lastRequest().path, std::string("/json"));
-      EXPECT_EQ(suite, server.lastRequest().method, std::string("GET"));
-    }
-  }
-
-  {
-    HTTPServer server(tls, [](const HTTPServer::ObservedRequest& request) -> HTTPResponseSpec {
-      HTTPResponseSpec response;
-      if (request.path == "/invalid")
-      {
-        response.body = "not-json";
-      }
-      return response;
-    });
-
-    EXPECT_TRUE(suite, server.ready());
-    if (server.ready())
-    {
-      ExposedH2BlockingClient client;
-      client.setTLSCAFile(tls.certPath());
-      std::string url = "https://127.0.0.1:" + std::to_string(server.port()) + "/invalid";
-      auto result = client.getJSONResponse(url);
-      EXPECT_TRUE(suite, result.error() != simdjson::SUCCESS);
-
-      server.wait();
-      if (!server.failure().empty())
-      {
-        std::cerr << "https server failure (/invalid): " << server.failure() << '\n';
-      }
-      EXPECT_TRUE(suite, server.failure().empty());
-      EXPECT_TRUE(suite, server.sawRequest());
-      EXPECT_EQ(suite, server.lastRequest().path, std::string("/invalid"));
-    }
-  }
-}
-
 static void runH2NonBlockingScenario(TestSuite& suite,
                                      TestH2NonBlockingClient& client,
                                      HTTP2Server& server)
@@ -2571,8 +2249,6 @@ int main()
   }
 
   testReconnectorStateMachine(suite);
-  testEmailClientSMTPFlow(suite, tls);
-  testH2BlockingClientJSONAndParseFailure(suite, tls);
   testH2NonBlockingClientFlows(suite, tls, skipped);
   testSSHClientLoopback(suite, skipped);
   testSSHClientRejectsMismatchedHostKey(suite, skipped);

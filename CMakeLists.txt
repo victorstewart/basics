@@ -75,7 +75,7 @@ function(_basics_prepare_self_depofile out_var)
     message(FATAL_ERROR "Unsupported BASICS_DEPENDENCY_LINK_MODE='${BASICS_DEPENDENCY_LINK_MODE}'. Expected STATIC or SHARED.")
   endif()
 
-  set(BASICS_SELF_DIRECT_DEPENDENCY_LINKS "SG14::SG14 aegis::aegis bitsery::bitsery cares::cares gxhash::gxhash itoa::itoa libssh2::libssh2 ${BASICS_SELF_LIBURING_LINK} nghttp2::nghttp2 openssl static_type_info::static_type_info${BASICS_SELF_TIDESDB_LINK}")
+  set(BASICS_SELF_DIRECT_DEPENDENCY_LINKS "SG14::SG14 aegis::aegis bitsery::bitsery cares::cares gxhash::gxhash itoa::itoa libcurl::libcurl libssh2::libssh2 ${BASICS_SELF_LIBURING_LINK} nghttp2::nghttp2 openssl static_type_info::static_type_info${BASICS_SELF_TIDESDB_LINK}")
 
   set(_basics_self_root "${CMAKE_BINARY_DIR}/.deps/basics-self")
   set(_basics_source_root "${_basics_self_root}/source")
@@ -264,6 +264,8 @@ endif()
 _basics_add_test_executable(basics_codec_tests tests/codec_tests.cpp)
 _basics_add_test_executable(basics_async_dns_tests tests/async_dns_tests.cpp)
 _basics_add_test_executable(basics_async_dns_cares_tests tests/async_dns_cares_tests.cpp)
+_basics_add_test_executable(basics_curl_multi_ring_contract_tests tests/curl_multi_ring_contract_tests.cpp)
+_basics_add_test_executable(basics_curl_multi_ring_tests tests/curl_multi_ring_tests.cpp)
 _basics_add_test_executable(basics_happy_eyeballs_tests tests/happy_eyeballs_tests.cpp)
 _basics_add_test_executable(basics_codec_fuzz_tests tests/codec_fuzz_tests.cpp)
 _basics_add_test_executable(basics_bitsery_tests tests/bitsery_tests.cpp)
@@ -293,6 +295,14 @@ add_test(
     "${CMAKE_COMMAND}"
       "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_async_dns_native_types.cmake"
+)
+
+add_test(
+  NAME basics_curl_multi_ring_native_types_contract
+  COMMAND
+    "${CMAKE_COMMAND}"
+      "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_curl_multi_ring_native_types.cmake"
 )
 
 add_test(

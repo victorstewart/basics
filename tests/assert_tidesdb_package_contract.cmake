@@ -19,6 +19,8 @@ string(FIND "${_basics_package_depofile}" "DEPENDS aegis VERSION 0.10.1" _basics
 string(FIND "${_basics_package_depofile}" "aegis::aegis" _basics_aegis_link_index)
 string(FIND "${_basics_package_depofile}" "DEPENDS cares VERSION 1.34.8" _basics_cares_depends_index)
 string(FIND "${_basics_package_depofile}" "cares::cares" _basics_cares_link_index)
+string(FIND "${_basics_package_depofile}" "DEPENDS libcurl VERSION 8.21.0" _basics_libcurl_depends_index)
+string(FIND "${_basics_package_depofile}" "libcurl::libcurl" _basics_libcurl_link_index)
 string(FIND "${_basics_package_depofile}" "DEPENDS libssh2 VERSION 1.11.1" _basics_libssh2_depends_index)
 string(FIND "${_basics_package_depofile}" "libssh2::libssh2" _basics_libssh2_link_index)
 string(FIND "${_basics_package_depofile}" "DEPENDS liburing VERSION 2.14" _basics_liburing_depends_index)
@@ -27,8 +29,8 @@ string(FIND "${_basics_package_depofile}" "DEPENDS nghttp2 VERSION 1.69.0" _basi
 string(FIND "${_basics_package_depofile}" "nghttp2::nghttp2" _basics_nghttp2_link_index)
 
 foreach(_basics_forbidden_surface_token IN ITEMS
-  "DEPENDS libbpf" "DEPENDS libcurl" "DEPENDS simdjson" "DEPENDS zlib"
-  "libbpf::" "libcurl::" "simdjson::" "zlib::"
+  "DEPENDS libbpf" "DEPENDS simdjson" "DEPENDS zlib"
+  "libbpf::" "simdjson::" "zlib::"
 )
   string(FIND "${_basics_package_depofile}" "${_basics_forbidden_surface_token}" _basics_forbidden_surface_index)
   if (NOT _basics_forbidden_surface_index EQUAL -1)
@@ -47,6 +49,12 @@ if (_basics_cares_depends_index EQUAL -1)
 endif()
 if (_basics_cares_link_index EQUAL -1)
   message(FATAL_ERROR "Generated basics package depofile must link cares::cares because networking/async.dns.cares.h calls it.")
+endif()
+if (_basics_libcurl_depends_index EQUAL -1)
+  message(FATAL_ERROR "Generated basics package depofile must depend on libcurl because networking/curl.multi.ring.h includes it.")
+endif()
+if (_basics_libcurl_link_index EQUAL -1)
+  message(FATAL_ERROR "Generated basics package depofile must link libcurl::libcurl because networking/curl.multi.ring.h calls it.")
 endif()
 if (_basics_libssh2_depends_index EQUAL -1)
   message(FATAL_ERROR "Generated basics package depofile must depend on libssh2 because networking/ssh.h includes it.")

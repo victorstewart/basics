@@ -3,6 +3,7 @@
 NAME openssl
 VERSION 4.0.0
 SOURCE URL https://github.com/openssl/openssl/releases/download/openssl-4.0.0/openssl-4.0.0.tar.gz
+SHA256 c32cf49a959c4f345f9606982dd36e7d28f7c58b19c2e25d75624d2b3d2f79ac
 BUILD_SYSTEM AUTOCONF
 AUTOCONF_CONFIGURE_SH <<'EOF'
 case "$(uname -s):${DEPO_TARGET_ARCH}" in
@@ -11,7 +12,7 @@ case "$(uname -s):${DEPO_TARGET_ARCH}" in
   Linux:*) openssl_target="linux-${DEPO_TARGET_ARCH}" ;;
   *) echo "Unsupported OpenSSL target $(uname -s):${DEPO_TARGET_ARCH}" >&2; exit 1 ;;
 esac
-./Configure "$openssl_target" --prefix="${DEPO_PREFIX}" --libdir=lib --openssldir="${DEPO_PREFIX}/ssl" no-quic no-tests no-docs no-shared
+CC=clang ./Configure "$openssl_target" --prefix="${DEPO_PREFIX}" --libdir=lib --openssldir="${DEPO_PREFIX}/ssl" no-quic no-tests no-docs no-shared
 EOF
 AUTOCONF_BUILD_SH <<'EOF'
 make build_generated

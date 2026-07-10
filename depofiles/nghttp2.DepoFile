@@ -4,12 +4,15 @@ NAME nghttp2
 VERSION 1.69.0
 DEPENDS openssl VERSION 4.0.0
 SOURCE URL https://github.com/nghttp2/nghttp2/releases/download/v1.69.0/nghttp2-1.69.0.tar.gz
+SHA256 c866b7477cbb7512ab6863a685027adbb1bb8da8fc3bab7429ed43d3281d5aa9
 BUILD_SYSTEM AUTOCONF
 AUTOCONF_CONFIGURE_SH <<'EOF'
 mkdir -p "${DEPO_BUILD_DIR}"
 cd "${DEPO_BUILD_DIR}"
 
 env \
+  CC=clang \
+  CXX=clang++ \
   CPPFLAGS="-I${dep:openssl}/include" \
   CFLAGS=-fPIC \
   LDFLAGS="-L${dep:openssl}/lib" \

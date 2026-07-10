@@ -87,13 +87,15 @@ public:
          uint32_t minimum = canonicalNameTtlSeconds == 0
                                 ? std::numeric_limits<uint32_t>::max()
                                 : canonicalNameTtlSeconds;
+         bool hasTtl = canonicalNameTtlSeconds != 0;
 
          for (const Address& address : addresses)
          {
             minimum = std::min(minimum, address.ttlSeconds);
+            hasTtl = true;
          }
 
-         return minimum == std::numeric_limits<uint32_t>::max() ? 0 : minimum;
+         return hasTtl ? minimum : 0;
       }
    };
 
@@ -294,23 +296,47 @@ private:
          return true;
       }
 
-      Result *get(const String& key, TimePoint now)
+      bool get(const String& key, TimePoint now, Result& result)
       {
          auto it = entries.find(key);
          if (it == entries.end())
          {
-            return nullptr;
+            return false;
          }
 
          CacheEntry *entry = it->second.get();
          if (entry->expires <= now)
          {
             erase(entry);
-            return nullptr;
+            return false;
+         }
+
+         const auto remainingDuration = std::chrono::duration_cast<std::chrono::seconds>(entry->expires - now);
+         const auto remainingCount = remainingDuration.count();
+         if (remainingCount == 0)
+         {
+            erase(entry);
+            return false;
          }
 
          makeNewest(entry);
-         return &entry->result;
+         result = entry->result;
+         const uint32_t remaining = remainingCount >= std::numeric_limits<uint32_t>::max()
+                                        ? std::numeric_limits<uint32_t>::max()
+                                        : static_cast<uint32_t>(remainingCount);
+
+         for (Address& address : result.addresses)
+         {
+            if (address.ttlSeconds != 0)
+            {
+               address.ttlSeconds = std::min(address.ttlSeconds, remaining);
+            }
+         }
+         if (result.canonicalNameTtlSeconds != 0)
+         {
+            result.canonicalNameTtlSeconds = std::min(result.canonicalNameTtlSeconds, remaining);
+         }
+         return true;
       }
 
       void put(const String& key, Result result, TimePoint expires)
@@ -432,13 +458,13 @@ private:
       }
    }
 
-   Result *cached(const String& key, TimePoint current)
+   bool cached(const String& key, TimePoint current, Result& result)
    {
-      if (Result *result = positiveCache.get(key, current))
+      if (positiveCache.get(key, current, result))
       {
-         return result;
+         return true;
       }
-      return negativeCache.get(key, current);
+      return negativeCache.get(key, current, result);
    }
 
    void cache(const String& key, const Result& result, TimePoint current)
@@ -696,11 +722,11 @@ public:
       }
 
       const String key = keyFor(normalized);
-      if (Result *hit = cached(key, current))
+      Result cachedResult;
+      if (cached(key, current, cachedResult))
       {
-         Result result = *hit;
-         result.fromCache = true;
-         deliver(callback, ticket, std::move(result));
+         cachedResult.fromCache = true;
+         deliver(callback, ticket, std::move(cachedResult));
          return ticket;
       }
 

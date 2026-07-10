@@ -30,6 +30,11 @@ struct FakeClock {
    {
       current += std::chrono::seconds(seconds);
    }
+
+   void advanceMilliseconds(uint32_t milliseconds)
+   {
+      current += std::chrono::milliseconds(milliseconds);
+   }
 };
 
 struct Completion {
@@ -235,6 +240,13 @@ static void testNormalizationAndNumericFastPath(TestSuite& suite)
    EXPECT_TRUE(suite, normalized.service == "443"_ctv);
    EXPECT_FALSE(suite, normalized.numeric);
 
+   Resolver::Result permanent;
+   permanent.status = Resolver::Status::success;
+   permanent.canonicalNameTtlSeconds = std::numeric_limits<uint32_t>::max();
+   permanent.addresses.push_back(address4("127.0.0.1", 443,
+                                           std::numeric_limits<uint32_t>::max()));
+   EXPECT_EQ(suite, permanent.minimumTtlSeconds(), std::numeric_limits<uint32_t>::max());
+
    EXPECT_TRUE(suite, Resolver::normalize("localhost", "443", Resolver::Family::any).status ==
                           Resolver::Status::singleLabelRejected);
    EXPECT_TRUE(suite, Resolver::normalize("-bad.example", "443", Resolver::Family::any).status ==
@@ -356,6 +368,41 @@ static void testPositiveAndNegativeCaching(TestSuite& suite)
    clock.advance(6);
    resolver.resolve("cache.example", "443", Resolver::Family::any, recorder.callback());
    EXPECT_EQ(suite, backend.started.size(), size_t(3));
+   resolver.shutdown();
+}
+
+static void testCachedTtlReflectsRemainingLifetime(TestSuite& suite)
+{
+   FakeClock clock;
+   FakeBackend backend;
+   Recorder recorder;
+   Resolver resolver({}, backend.interface(), clock.source());
+
+   resolver.resolve("ttl.example", "443", Resolver::Family::any, recorder.callback());
+   EXPECT_TRUE(suite, resolver.complete(backend.started.back().identifier, successfulResult(10)));
+
+   clock.advance(3);
+   resolver.resolve("ttl.example", "443", Resolver::Family::any, recorder.callback());
+   EXPECT_EQ(suite, backend.started.size(), size_t(1));
+   EXPECT_TRUE(suite, recorder.completions.back().result.fromCache);
+   EXPECT_EQ(suite, recorder.completions.back().result.minimumTtlSeconds(), uint32_t(7));
+   EXPECT_EQ(suite, recorder.completions.back().result.canonicalNameTtlSeconds, uint32_t(7));
+   EXPECT_EQ(suite, recorder.completions.back().result.addresses[0].ttlSeconds, uint32_t(7));
+   EXPECT_EQ(suite, recorder.completions.back().result.addresses[1].ttlSeconds, uint32_t(7));
+
+   clock.advanceMilliseconds(500);
+   resolver.resolve("ttl.example", "443", Resolver::Family::any, recorder.callback());
+   EXPECT_EQ(suite, backend.started.size(), size_t(1));
+   EXPECT_EQ(suite, recorder.completions.back().result.minimumTtlSeconds(), uint32_t(6));
+
+   clock.advance(5);
+   resolver.resolve("ttl.example", "443", Resolver::Family::any, recorder.callback());
+   EXPECT_EQ(suite, backend.started.size(), size_t(1));
+   EXPECT_EQ(suite, recorder.completions.back().result.minimumTtlSeconds(), uint32_t(1));
+
+   clock.advanceMilliseconds(1000);
+   resolver.resolve("ttl.example", "443", Resolver::Family::any, recorder.callback());
+   EXPECT_EQ(suite, backend.started.size(), size_t(2));
    resolver.shutdown();
 }
 
@@ -888,6 +935,7 @@ int main()
    testBackendRequirementAndSingleflight(suite);
    testSynchronousBackendAndCallbackOrdering(suite);
    testPositiveAndNegativeCaching(suite);
+   testCachedTtlReflectsRemainingLifetime(suite);
    testNegativeCacheCannotEvictPositiveCache(suite);
    testCacheClearAndEarliestDeadline(suite);
    testCancellationDeadlinesAndShutdown(suite);
