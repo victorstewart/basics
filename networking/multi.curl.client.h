@@ -182,18 +182,6 @@ public:
       RingAsyncDnsResolver::BackendConfig dnsBackend;
    };
 
-   struct LocalBind
-   {
-      sockaddr_storage address = {};
-      socklen_t length = 0;
-      bool freebind = false;
-
-      explicit operator bool(void) const
-      {
-         return length != 0;
-      }
-   };
-
    struct Request
    {
       String url;
@@ -215,7 +203,7 @@ public:
       AsyncDnsResolver::Family family = AsyncDnsResolver::Family::any;
       AddressPolicy addressPolicy;
       OriginPolicy originPolicy;
-      LocalBind localBind;
+      LocalSocketBinds localBinds;
       std::chrono::milliseconds connectTimeout = {};
       std::chrono::milliseconds firstByteTimeout = {};
       std::chrono::milliseconds idleTimeout = {};
@@ -654,35 +642,6 @@ private:
       return false;
    }
 
-   static bool sameLocalEndpoint(const LocalBind& configuredBind,
-                                 const sockaddr *actual,
-                                 socklen_t actualLength)
-   {
-      const sockaddr *configured = reinterpret_cast<const sockaddr *>(&configuredBind.address);
-      if (actual == nullptr || configured->sa_family != actual->sa_family)
-      {
-         return false;
-      }
-      if (configured->sa_family == AF_INET &&
-          configuredBind.length == sizeof(sockaddr_in) && actualLength == sizeof(sockaddr_in))
-      {
-         const sockaddr_in *configured4 = reinterpret_cast<const sockaddr_in *>(configured);
-         const sockaddr_in *actual4 = reinterpret_cast<const sockaddr_in *>(actual);
-         return configured4->sin_port == actual4->sin_port &&
-                std::memcmp(&configured4->sin_addr, &actual4->sin_addr, sizeof(in_addr)) == 0;
-      }
-      if (configured->sa_family == AF_INET6 &&
-          configuredBind.length == sizeof(sockaddr_in6) && actualLength == sizeof(sockaddr_in6))
-      {
-         const sockaddr_in6 *configured6 = reinterpret_cast<const sockaddr_in6 *>(configured);
-         const sockaddr_in6 *actual6 = reinterpret_cast<const sockaddr_in6 *>(actual);
-         return configured6->sin6_port == actual6->sin6_port &&
-                configured6->sin6_scope_id == actual6->sin6_scope_id &&
-                std::memcmp(&configured6->sin6_addr, &actual6->sin6_addr, sizeof(in6_addr)) == 0;
-      }
-      return false;
-   }
-
    static curl_socket_t openSocketCallback(void *context,
                                            curlsocktype purpose,
                                            struct curl_sockaddr *address)
@@ -718,43 +677,9 @@ private:
       {
          return CURL_SOCKET_BAD;
       }
-      if (transfer.request.localBind)
+      if (transfer.request.localBinds)
       {
-         const sockaddr *local = reinterpret_cast<const sockaddr *>(&transfer.request.localBind.address);
-         int freebindLevel = 0;
-         int freebindOption = 0;
-#if defined(__linux__) && defined(IP_FREEBIND) && defined(IPV6_FREEBIND)
-         if (local->sa_family == AF_INET)
-         {
-            freebindLevel = SOL_IP;
-            freebindOption = IP_FREEBIND;
-         }
-         else if (local->sa_family == AF_INET6)
-         {
-            freebindLevel = SOL_IPV6;
-            freebindOption = IPV6_FREEBIND;
-         }
-#else
-         if (transfer.request.localBind.freebind)
-         {
-            close(fd);
-            return CURL_SOCKET_BAD;
-         }
-#endif
-         const int enabled = 1;
-         sockaddr_storage actualLocal = {};
-         socklen_t actualLocalLength = sizeof(actualLocal);
-         if (local->sa_family != address->family ||
-             setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0 ||
-             (transfer.request.localBind.freebind &&
-              setsockopt(fd, freebindLevel, freebindOption, &enabled, sizeof(enabled)) != 0) ||
-             bind(fd, local, transfer.request.localBind.length) != 0 ||
-             getsockname(fd,
-                         reinterpret_cast<sockaddr *>(&actualLocal),
-                         &actualLocalLength) != 0 ||
-             !sameLocalEndpoint(transfer.request.localBind,
-                                reinterpret_cast<const sockaddr *>(&actualLocal),
-                                actualLocalLength))
+         if (!transfer.request.localBinds.bind(fd))
          {
             close(fd);
             return CURL_SOCKET_BAD;
@@ -817,14 +742,19 @@ private:
          return CURL_PREREQFUNC_ABORT;
       }
 
-      if (transfer.request.localBind)
+      if (transfer.request.localBinds)
       {
          if (localIp == nullptr || localPort <= 0 || localPort > 65535)
          {
             return CURL_PREREQFUNC_ABORT;
          }
-         const sockaddr *configured = reinterpret_cast<const sockaddr *>(
-             &transfer.request.localBind.address);
+         const LocalSocketBinds::Endpoint *configuredBind =
+             transfer.request.localBinds.lookup(reinterpret_cast<const sockaddr *>(&peer)->sa_family);
+         if (configuredBind == nullptr)
+         {
+            return CURL_PREREQFUNC_ABORT;
+         }
+         const sockaddr *configured = reinterpret_cast<const sockaddr *>(&configuredBind->address);
          char expected[INET6_ADDRSTRLEN] = {};
          const void *source = configured->sa_family == AF_INET
                                   ? static_cast<const void *>(&reinterpret_cast<const sockaddr_in *>(
@@ -1487,27 +1417,6 @@ private:
       return true;
    }
 
-   static bool validLocalBind(const LocalBind& localBind)
-   {
-      if (!localBind)
-      {
-         return true;
-      }
-      if (localBind.address.ss_family == AF_INET && localBind.length == sizeof(sockaddr_in))
-      {
-         sockaddr_in address = {};
-         std::memcpy(&address, &localBind.address, sizeof(address));
-         return address.sin_port != 0;
-      }
-      if (localBind.address.ss_family == AF_INET6 && localBind.length == sizeof(sockaddr_in6))
-      {
-         sockaddr_in6 address = {};
-         std::memcpy(&address, &localBind.address, sizeof(address));
-         return address.sin6_port != 0;
-      }
-      return false;
-   }
-
    static bool validAuthority(const String& authority)
    {
       if (authority.empty())
@@ -1530,38 +1439,46 @@ private:
       return true;
    }
 
-   static void appendLocalBindIdentity(String& identity, const LocalBind& localBind)
+   static void appendLocalBindEndpointIdentity(String& identity,
+                                               const LocalSocketBinds::Endpoint *endpoint,
+                                               sa_family_t family)
    {
       identity.append('\0');
-      if (!localBind)
+      if (endpoint == nullptr)
       {
          identity.append('0');
          return;
       }
 
-      const sockaddr *configured = reinterpret_cast<const sockaddr *>(&localBind.address);
+      const sockaddr *configured = reinterpret_cast<const sockaddr *>(&endpoint->address);
       char text[INET6_ADDRSTRLEN] = {};
-      const void *source = configured->sa_family == AF_INET
+      const void *source = family == AF_INET
                                ? static_cast<const void *>(&reinterpret_cast<const sockaddr_in *>(
                                      configured)->sin_addr)
                                : static_cast<const void *>(&reinterpret_cast<const sockaddr_in6 *>(
                                      configured)->sin6_addr);
-      const uint16_t port = configured->sa_family == AF_INET
+      const uint16_t port = family == AF_INET
                                 ? ntohs(reinterpret_cast<const sockaddr_in *>(configured)->sin_port)
                                 : ntohs(reinterpret_cast<const sockaddr_in6 *>(configured)->sin6_port);
-      identity.append(configured->sa_family == AF_INET ? '4' : '6');
-      identity.append(localBind.freebind ? '1' : '0');
+      identity.append(family == AF_INET ? '4' : '6');
+      identity.append(endpoint->freebind ? '1' : '0');
       identity.append(':');
-      if (inet_ntop(configured->sa_family, source, text, sizeof(text)))
+      if (inet_ntop(family, source, text, sizeof(text)))
       {
          identity.append(text);
       }
       identity.append(':');
       identity.append(String(port));
       identity.append(':');
-      identity.append(String(configured->sa_family == AF_INET6
+      identity.append(String(family == AF_INET6
                                  ? reinterpret_cast<const sockaddr_in6 *>(configured)->sin6_scope_id
                                  : 0));
+   }
+
+   static void appendLocalBindsIdentity(String& identity, const LocalSocketBinds& localBinds)
+   {
+      appendLocalBindEndpointIdentity(identity, localBinds.lookup(AF_INET), AF_INET);
+      appendLocalBindEndpointIdentity(identity, localBinds.lookup(AF_INET6), AF_INET6);
    }
 
    bool prepareEasy(Transfer& transfer)
@@ -1801,12 +1718,15 @@ private:
             return;
          }
          policyCallbackActive = false;
-         if (!addressAccepted ||
-             (transfer.request.localBind &&
-              transfer.request.localBind.address.ss_family != address.family()))
+         if (!addressAccepted)
          {
             finish(ticket.identifier, Status::addressRejected, CURLE_COULDNT_CONNECT);
             return;
+         }
+         if (transfer.request.localBinds &&
+             transfer.request.localBinds.lookup(address.family()) == nullptr)
+         {
+            continue;
          }
          accepted.addresses.push_back(address);
       }
@@ -1881,7 +1801,7 @@ private:
       connectionPins.append(transfer.request.authority.empty()
                                 ? transfer.host
                                 : transfer.request.authority);
-      appendLocalBindIdentity(connectionPins, transfer.request.localBind);
+      appendLocalBindsIdentity(connectionPins, transfer.request.localBinds);
       const ConnectionIdentity identity {transfer.request.resolutionGeneration,
                                          transfer.request.identityGeneration,
                                          std::move(connectionPins)};
@@ -2431,8 +2351,7 @@ public:
                                      (request.method == Method::get || request.method == Method::head);
       if (snapshotBytes > config.requestBytes || !certificatePathsPaired ||
           !certificateBlobsPaired || mixedCertificateSources || invalidTimeout ||
-          invalidMethodBody || !validLocalBind(request.localBind) ||
-          !validAuthority(request.authority))
+          invalidMethodBody || !validAuthority(request.authority))
       {
          Result result;
          result.status = snapshotBytes > config.requestBytes

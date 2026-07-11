@@ -86,6 +86,8 @@ public:
       int maximumTimeoutMilliseconds = 2000;
       int udpMaximumQueries = 0;
       String servers;
+      LocalSocketBinds udpBinds;
+      LocalSocketBinds tcpBinds;
    };
 
    enum class InitializationStatus : uint8_t {
@@ -188,6 +190,16 @@ private:
       RingAsyncDnsResolver *owner = static_cast<RingAsyncDnsResolver *>(context);
       owner->requireOwnerThread();
       owner->refreshTimer();
+   }
+
+   static int configureSocket(ares_socket_t fd, int type, void *context)
+   {
+      RingAsyncDnsResolver& owner = *static_cast<RingAsyncDnsResolver *>(context);
+      owner.requireOwnerThread();
+      const LocalSocketBinds *binds = type == SOCK_DGRAM
+                                         ? &owner.backendConfig.udpBinds
+                                         : type == SOCK_STREAM ? &owner.backendConfig.tcpBinds : nullptr;
+      return binds && binds->bind(fd) ? 0 : -1;
    }
 
    static Resolver::Status statusFromAres(int status, bool shuttingDown)
@@ -775,6 +787,7 @@ public:
          initialization = InitializationStatus::invalidServers;
          return;
       }
+      ares_set_socket_configure_callback(channel, configureSocket, this);
 
       threadOwner = this;
       RingDispatcher::installMultiplexee(this, this);

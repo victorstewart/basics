@@ -91,6 +91,7 @@ private:
    std::atomic<bool> stopping = false;
    std::atomic<uint32_t> queries = 0;
    uint32_t delayMilliseconds = 0;
+   bool answerIpv6 = false;
    std::thread worker;
 
    void run(void)
@@ -134,11 +135,12 @@ private:
          const uint16_t type = uint16_t(query[offset] << 8 | query[offset + 1]);
          const size_t questionEnd = offset + 4;
          const bool ipv4 = type == 1;
+         const bool ipv6 = type == 28 && answerIpv6;
          Vector<uint8_t> response;
          response.insert(response.end(), query, query + 2);
          append16(response, 0x8180);
          append16(response, 1);
-         append16(response, ipv4 ? 1 : 0);
+         append16(response, ipv4 || ipv6 ? 1 : 0);
          append16(response, 0);
          append16(response, 0);
          response.insert(response.end(), query + 12, query + questionEnd);
@@ -152,6 +154,19 @@ private:
             response.push_back(127);
             response.push_back(0);
             response.push_back(0);
+            response.push_back(1);
+         }
+         else if (ipv6)
+         {
+            append16(response, 0xC00C);
+            append16(response, 28);
+            append16(response, 1);
+            append32(response, 1);
+            append16(response, 16);
+            for (size_t index = 0; index < 15; ++index)
+            {
+               response.push_back(0);
+            }
             response.push_back(1);
          }
          if (delayMilliseconds != 0)
@@ -170,8 +185,9 @@ private:
 
 public:
 
-   explicit DnsFixture(uint32_t delay = 0)
-       : delayMilliseconds(delay)
+   explicit DnsFixture(uint32_t delay = 0, bool ipv6 = false)
+       : delayMilliseconds(delay),
+         answerIpv6(ipv6)
    {
       fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
       if (fd < 0)
@@ -1047,7 +1063,7 @@ static uint16_t reserveLoopbackSourcePort(void)
    return ready ? ntohs(address.sin_port) : 0;
 }
 
-struct LocalBindScenario final : RingMultiplexer
+struct LocalBindsScenario final : RingMultiplexer
 {
    MultiCurlClient *client = nullptr;
    MultiCurlClient::Request secondRequest;
@@ -1058,7 +1074,7 @@ struct LocalBindScenario final : RingMultiplexer
    bool allSucceeded = true;
    uint32_t calls = 0;
 
-   LocalBindScenario()
+   LocalBindsScenario()
    {
       guard.originator = this;
    }
@@ -1067,7 +1083,7 @@ struct LocalBindScenario final : RingMultiplexer
                         MultiCurlClient::Ticket,
                         MultiCurlClient::Result&& result)
    {
-      LocalBindScenario& scenario = *static_cast<LocalBindScenario *>(context);
+      LocalBindsScenario& scenario = *static_cast<LocalBindsScenario *>(context);
       ++scenario.calls;
       scenario.allSucceeded = scenario.allSucceeded && result.succeeded() &&
                               result.statusCode == 200 && result.body == "bound"_ctv;
@@ -1114,13 +1130,15 @@ struct LocalBindScenario final : RingMultiplexer
    }
 };
 
-static void testStructuredAuthorityAndReusableLocalBind(TestSuite& suite)
+static void testStructuredAuthorityAndReusableLocalBinds(TestSuite& suite)
 {
+   DnsFixture dns(0, true);
    HttpFixture fixture("bound", 0, 2, "Host: service.example\r\n");
    const uint16_t sourcePort = reserveLoopbackSourcePort();
+   EXPECT_TRUE(suite, dns.ready());
    EXPECT_TRUE(suite, fixture.ready());
    EXPECT_TRUE(suite, sourcePort != 0);
-   if (!fixture.ready() || sourcePort == 0)
+   if (!dns.ready() || !fixture.ready() || sourcePort == 0)
    {
       return;
    }
@@ -1133,12 +1151,13 @@ static void testStructuredAuthorityAndReusableLocalBind(TestSuite& suite)
    RingDispatcher dispatcher;
    Ring::createRing(64, 128, 4, 2, -1, -1, 4);
 
-   LocalBindScenario scenario;
+   LocalBindsScenario scenario;
    RingDispatcher::installMultiplexee(&scenario, &scenario);
    RingDispatcher::installMultiplexer(&scenario);
    MultiCurlClient::Config config;
    config.totalConnections = 1;
    config.hostConnections = 1;
+   config.dnsBackend.servers = dns.servers();
    scenario.client = new MultiCurlClient(config);
    EXPECT_TRUE(suite, scenario.client->ready());
 
@@ -1146,12 +1165,24 @@ static void testStructuredAuthorityAndReusableLocalBind(TestSuite& suite)
    local.sin_family = AF_INET;
    local.sin_port = htons(sourcePort);
    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-   MultiCurlClient::Request request = requestFor(fixture);
+   MultiCurlClient::Request request;
+   request.url.snprintf<"http://dual-bind.test:{itoa}/"_ctv>(uint64_t(fixture.port()));
+   request.requireTls = false;
+   request.httpPolicy = MultiCurlClient::HttpPolicy::requireHttp1;
+   request.responseBytes = 1024;
+   request.overallDeadline = MultiCurlClient::Clock::now() + std::chrono::seconds(3);
    request.authority = "service.example";
-   std::memcpy(&request.localBind.address, &local, sizeof(local));
-   request.localBind.length = sizeof(local);
+   EXPECT_TRUE(suite,
+               request.localBinds.set(reinterpret_cast<const sockaddr *>(&local), sizeof(local)));
+   sockaddr_in6 unusedLocal6 = {};
+   unusedLocal6.sin6_family = AF_INET6;
+   unusedLocal6.sin6_port = htons(sourcePort);
+   unusedLocal6.sin6_addr = in6addr_loopback;
+   EXPECT_TRUE(suite,
+               request.localBinds.set(reinterpret_cast<const sockaddr *>(&unusedLocal6),
+                                      sizeof(unusedLocal6)));
    scenario.secondRequest = request;
-   scenario.client->submit(std::move(request), {&scenario, LocalBindScenario::callback});
+   scenario.client->submit(std::move(request), {&scenario, LocalBindsScenario::callback});
    scenario.guard.setTimeoutSeconds(5);
    scenario.guardArmed = true;
    Ring::queueTimeout(&scenario.guard);
@@ -1161,6 +1192,7 @@ static void testStructuredAuthorityAndReusableLocalBind(TestSuite& suite)
    EXPECT_TRUE(suite, scenario.allSucceeded);
    EXPECT_EQ(suite, scenario.calls, uint32_t(2));
    EXPECT_TRUE(suite, fixture.sawExpectedAuthority());
+   EXPECT_TRUE(suite, dns.queryCount() >= 2 && dns.queryCount() % 2 == 0);
    EXPECT_TRUE(suite, scenario.client->shutdownSafe());
    delete scenario.client;
    RingDispatcher::eraseMultiplexee(&scenario);
@@ -1186,6 +1218,6 @@ int main()
    testResetAndActiveShutdownBarriers(suite, true);
    testResetAndActiveShutdownBarriers(suite, false);
    testQueuedPinExpiryReresolves(suite);
-   testStructuredAuthorityAndReusableLocalBind(suite);
+   testStructuredAuthorityAndReusableLocalBinds(suite);
    return suite.finish("MultiCurlClient");
 }

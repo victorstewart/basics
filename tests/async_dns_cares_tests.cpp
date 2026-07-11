@@ -70,6 +70,7 @@ private:
    uint16_t boundPort = 0;
    std::atomic<bool> stopping = false;
    std::atomic<uint32_t> receivedQueries = 0;
+   std::atomic<uint16_t> lastSourcePort = 0;
    std::thread worker;
 
    static bool parseQuestion(const uint8_t *packet,
@@ -186,6 +187,12 @@ private:
          {
             continue;
          }
+         if (peer.ss_family == AF_INET)
+         {
+            lastSourcePort.store(
+                ntohs(reinterpret_cast<const sockaddr_in *>(&peer)->sin_port),
+                std::memory_order_relaxed);
+         }
 
          receivedQueries.fetch_add(1, std::memory_order_relaxed);
          String name;
@@ -270,7 +277,29 @@ public:
    {
       return receivedQueries.load(std::memory_order_relaxed);
    }
+
+   uint16_t sourcePort(void) const
+   {
+      return lastSourcePort.load(std::memory_order_relaxed);
+   }
 };
+
+static uint16_t reserveLoopbackUdpPort(void)
+{
+   const int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+   if (fd < 0)
+   {
+      return 0;
+   }
+   sockaddr_in address = {};
+   address.sin_family = AF_INET;
+   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   socklen_t length = sizeof(address);
+   const bool ready = bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 &&
+                      getsockname(fd, reinterpret_cast<sockaddr *>(&address), &length) == 0;
+   close(fd);
+   return ready ? ntohs(address.sin_port) : 0;
+}
 
 static bool ringSupported(void)
 {
@@ -400,6 +429,15 @@ static void runScenario(TestSuite& suite,
    Resolver::BackendConfig backend;
    backend.servers = fixture.servers();
    backend.udpMaximumQueries = 1;
+   sockaddr_in local = {};
+   local.sin_family = AF_INET;
+   local.sin_port = htons(reserveLoopbackUdpPort());
+   local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   EXPECT_TRUE(suite, local.sin_port != 0);
+   EXPECT_TRUE(suite,
+               backend.udpBinds.set(reinterpret_cast<const sockaddr *>(&local), sizeof(local)));
+   EXPECT_TRUE(suite,
+               backend.tcpBinds.set(reinterpret_cast<const sockaddr *>(&local), sizeof(local)));
    {
       Resolver resolver({}, backend);
       monitor.resolver = &resolver;
@@ -419,6 +457,7 @@ static void runScenario(TestSuite& suite,
    Ring::shuttingDown = false;
    RingDispatcher::dispatcher = nullptr;
    EXPECT_FALSE(suite, monitor.timedOut);
+   EXPECT_EQ(suite, fixture.sourcePort(), ntohs(local.sin_port));
 }
 
 struct ReloadContext {

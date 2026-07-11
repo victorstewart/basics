@@ -39,5 +39,28 @@ int main()
                                                     "127.0.0.1"_ctv));
    EXPECT_TRUE(suite, request.httpPolicy == MultiCurlClient::HttpPolicy::preferHttp2);
    EXPECT_TRUE(suite, request.tlsMinimum == MultiCurlClient::TlsMinimum::tls12);
+
+   sockaddr_in local4 = {};
+   local4.sin_family = AF_INET;
+   local4.sin_port = htons(43123);
+   local4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   sockaddr_in6 local6 = {};
+   local6.sin6_family = AF_INET6;
+   local6.sin6_port = htons(43124);
+   local6.sin6_addr = in6addr_loopback;
+   EXPECT_TRUE(suite,
+               request.localBinds.set(reinterpret_cast<const sockaddr *>(&local4),
+                                      sizeof(local4),
+                                      true));
+   EXPECT_TRUE(suite,
+               request.localBinds.set(reinterpret_cast<const sockaddr *>(&local6), sizeof(local6)));
+   const LocalSocketBinds::Endpoint *bound4 = request.localBinds.lookup(AF_INET);
+   const LocalSocketBinds::Endpoint *bound6 = request.localBinds.lookup(AF_INET6);
+   EXPECT_TRUE(suite, bound4 != nullptr && bound4->freebind);
+   EXPECT_TRUE(suite, bound6 != nullptr && !bound6->freebind);
+   EXPECT_TRUE(suite, request.localBinds.lookup(AF_UNSPEC) == nullptr);
+   EXPECT_TRUE(suite,
+               request.localBinds.set(reinterpret_cast<const sockaddr *>(&local4),
+                                      sizeof(local4) - 1) == false);
    return suite.finish("MultiCurlClient contract");
 }

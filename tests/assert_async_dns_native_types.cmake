@@ -29,3 +29,19 @@ foreach(_basics_async_dns_source IN ITEMS
     endif()
   endforeach()
 endforeach()
+
+file(READ "${BASICS_SOURCE_DIR}/networking/async.dns.cares.h" _basics_cares_header)
+foreach(_basics_required_bind_fragment IN ITEMS
+  "LocalSocketBinds udpBinds"
+  "LocalSocketBinds tcpBinds"
+  "ares_set_socket_configure_callback"
+)
+  string(FIND
+    "${_basics_cares_header}"
+    "${_basics_required_bind_fragment}"
+    _basics_required_bind_index
+  )
+  if (_basics_required_bind_index EQUAL -1)
+    message(FATAL_ERROR "RingAsyncDnsResolver must retain bounded transport-specific local binds; missing '${_basics_required_bind_fragment}'.")
+  endif()
+endforeach()

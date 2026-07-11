@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 foreach(_basics_curl_source IN ITEMS
+  networking/socket.h
   networking/multi.curl.client.h
   tests/multi_curl_client_contract_tests.cpp
   tests/multi_curl_client_tests.cpp
@@ -33,18 +34,24 @@ foreach(_basics_curl_source IN ITEMS
 endforeach()
 
 file(READ "${BASICS_SOURCE_DIR}/networking/multi.curl.client.h" _basics_multi_curl_header)
+string(FIND "${_basics_multi_curl_header}" "CURLMNWC_CLEAR_CONNS" _basics_curl_reuse_index)
+if (_basics_curl_reuse_index EQUAL -1)
+  message(FATAL_ERROR "MultiCurlClient must preserve connection-identity reuse enforcement.")
+endif()
+
+file(READ "${BASICS_SOURCE_DIR}/networking/socket.h" _basics_socket_header)
 foreach(_basics_required_transport_fragment IN ITEMS
-  "CURLMNWC_CLEAR_CONNS"
+  "class LocalSocketBinds"
   "getsockname"
   "sin6_scope_id"
 )
   string(FIND
-    "${_basics_multi_curl_header}"
+    "${_basics_socket_header}"
     "${_basics_required_transport_fragment}"
     _basics_required_transport_index
   )
   if (_basics_required_transport_index EQUAL -1)
-    message(FATAL_ERROR "MultiCurlClient must preserve exact local endpoint/reuse enforcement; missing '${_basics_required_transport_fragment}'.")
+    message(FATAL_ERROR "LocalSocketBinds must preserve exact endpoint enforcement; missing '${_basics_required_transport_fragment}'.")
   endif()
 endforeach()
 
