@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <csignal>
 #include <cstdlib>
+#include <functional>
 
 #pragma once
 

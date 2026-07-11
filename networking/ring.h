@@ -43,6 +43,11 @@ public:
   siginfo_t infop;
 };
 
+enum class RingProcessIntegration : uint8_t {
+  enabled,
+  isolatedWorker
+};
+
 class Ring {
 public:
 
@@ -1630,8 +1635,8 @@ public:
   static thread_local inline RingInterface *& interfacer = ringInterfacer;
   static thread_local inline RingLifecycle *& lifecycler = ringLifecycler;
 
-  static inline bool shuttingDown = false; // better to put it here than make it some universal static variable in a header
-  static inline bool exit = false;
+  static thread_local inline bool shuttingDown = false; // better to put it here than make it some universal static variable in a header
+  static thread_local inline bool exit = false;
 
   static int adoptProcessFDIntoFixedFileSlot(int fd, bool relinquishProcessFD = true)
   {
@@ -1947,8 +1952,9 @@ public:
   // so it's acutally not useful, because we can solve both in one go as we do now
   //
   // don't register more than 512-ish fixed files with valgrind
-  static void createRing(uint32_t sqeCount, uint32_t cqeCount, uint32_t nFixedFiles, uint32_t nReserveFixedFiles, int workQueueFD, int sqpollCore, uint32_t nMsghdrPackages, bool requireSQPoll = false)
+  static void createRing(uint32_t sqeCount, uint32_t cqeCount, uint32_t nFixedFiles, uint32_t nReserveFixedFiles, int workQueueFD, int sqpollCore, uint32_t nMsghdrPackages, bool requireSQPoll = false, RingProcessIntegration requestedProcessIntegration = RingProcessIntegration::enabled)
   {
+    const bool integrateProcess = requestedProcessIntegration == RingProcessIntegration::enabled;
     writeCreateRingStage("worker:ring-enter");
     // IORING_SETUP_ATTACH_WQ
 
@@ -1961,7 +1967,10 @@ public:
     nFixedFiles += 1;
     nReserveFixedFiles += 1;
 
-    Guardian::boot();
+    if (integrateProcess)
+    {
+      Guardian::boot();
+    }
     writeCreateRingStage("worker:ring-after-guardian-boot");
 
     fixedfiles = new int[nFixedFiles];
@@ -1986,7 +1995,7 @@ public:
 
     memset(signals, 0xff, sizeof(int) * 16); // make sparse with -1
 
-    if (lifecycler)
+    if (integrateProcess && lifecycler)
     {
       writeCreateRingStage("worker:ring-before-lifecycle-beforeRing");
       lifecycler->beforeRing(); // they set up to 16 signals in here as well
@@ -2012,7 +2021,10 @@ public:
         }
       }
 
-      sigprocmask(SIG_BLOCK, &listenForSignals, nullptr);
+      if (integrateProcess)
+      {
+        sigprocmask(SIG_BLOCK, &listenForSignals, nullptr);
+      }
     }
 
     fixedfiles[0] = signalfd(-1, &listenForSignals, 0);
@@ -2081,7 +2093,7 @@ public:
 
     fixedFilesWereRegistered = true;
 
-    if (lifecycler)
+    if (integrateProcess && lifecycler)
     {
       writeCreateRingStage("worker:ring-before-lifecycle-afterRing");
       lifecycler->afterRing();

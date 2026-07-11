@@ -41,6 +41,11 @@ public:
     current().multiplexers.insert(multiplexer);
   }
 
+  static void eraseMultiplexer(RingMultiplexer *multiplexer)
+  {
+    current().multiplexers.erase(multiplexer);
+  }
+
   static void installMultiplexee(void *object, RingInterface *target)
   {
     current().multiplexees.insert_or_assign(object, target);

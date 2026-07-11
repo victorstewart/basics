@@ -132,6 +132,82 @@ static bool ringAndRingletSupported()
   return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+static void isolatedWorkerSignalHandler(int)
+{}
+
+static void testIsolatedWorkerRingPreservesProcessIntegration(TestSuite& suite)
+{
+  WaitableSigChldScope waitableSigChld;
+  pid_t child = fork();
+  if (child == 0)
+  {
+    struct Lifecycle final : RingLifecycle
+    {
+      bool before = false;
+      bool after = false;
+      void beforeRing(void) override { before = true; }
+      void afterRing(void) override { after = true; }
+    } lifecycle;
+
+    struct sigaction action = {};
+    sigemptyset(&action.sa_mask);
+    action.sa_handler = isolatedWorkerSignalHandler;
+    if (sigaction(SIGTERM, &action, nullptr) != 0)
+    {
+      _exit(2);
+    }
+
+    sigset_t beforeMask = {};
+    sigprocmask(SIG_SETMASK, nullptr, &beforeMask);
+    Ring::interfacer = nullptr;
+    Ring::lifecycler = &lifecycle;
+    Ring::exit = false;
+    Ring::shuttingDown = false;
+    Ring::createRing(32, 32, 8, 2, -1, -1, 8, false,
+                     RingProcessIntegration::isolatedWorker);
+
+    struct sigaction afterAction = {};
+    sigset_t afterMask = {};
+    sigaction(SIGTERM, nullptr, &afterAction);
+    sigprocmask(SIG_SETMASK, nullptr, &afterMask);
+    bool preserved = afterAction.sa_handler == isolatedWorkerSignalHandler &&
+                     sigismember(&beforeMask, SIGTERM) == sigismember(&afterMask, SIGTERM) &&
+                     lifecycle.before == false && lifecycle.after == false;
+    Ring::shutdownForExec();
+    _exit(preserved ? 0 : 3);
+  }
+
+  EXPECT_TRUE(suite, child >= 0);
+  if (child < 0)
+  {
+    return;
+  }
+  int status = 0;
+  EXPECT_EQ(suite, waitpid(child, &status, 0), child);
+  EXPECT_TRUE(suite, WIFEXITED(status));
+  EXPECT_EQ(suite, WEXITSTATUS(status), 0);
+}
+
+static void testRingControlStateIsThreadLocal(TestSuite& suite)
+{
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  bool firstThreadIsolated = false;
+  bool secondThreadIsolated = false;
+  std::thread first([&](void) -> void {
+    Ring::exit = true;
+    firstThreadIsolated = Ring::shuttingDown == false;
+  });
+  std::thread second([&](void) -> void {
+    Ring::shuttingDown = true;
+    secondThreadIsolated = Ring::exit == false;
+  });
+  first.join();
+  second.join();
+  EXPECT_TRUE(suite, firstThreadIsolated && secondThreadIsolated &&
+                         Ring::exit == false && Ring::shuttingDown == false);
+}
+
 struct RingScenarioInterface : RingInterface {
   TestSuite *suite = nullptr;
 
@@ -1356,13 +1432,15 @@ static void testRingMessageSenderErrorReportsInvalidTarget(TestSuite& suite)
 
 int main()
 {
+  TestSuite suite;
+  testRingControlStateIsThreadLocal(suite);
   if (!ringAndRingletSupported())
   {
     std::cout << "ring integration tests skipped: required io_uring features unavailable on this host.\n";
-    return 0;
+    return suite.finish("ring integration tests");
   }
 
-  TestSuite suite;
+  testIsolatedWorkerRingPreservesProcessIntegration(suite);
   runRingScenario(suite);
   testCompletionBatchCanQuiesceRing(suite);
   testRawFDPollReadinessCancellationAndRace(suite);
