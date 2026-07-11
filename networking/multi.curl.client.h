@@ -6,6 +6,7 @@
 #include <networking/happy.eyeballs.h>
 
 #include <curl/curl.h>
+#include <openssl/ssl.h>
 
 #include <arpa/inet.h>
 #include <poll.h>
@@ -23,7 +24,7 @@
 #include <thread>
 #include <utility>
 
-class CurlMultiRingClient final : private RingInterface
+class MultiCurlClient final : private RingInterface
 {
 public:
 
@@ -96,6 +97,7 @@ public:
    {
       ready,
       ringDispatcherRequired,
+      threadClientAlreadyExists,
       curlInitializationFailed,
       asynchronousDnsRequired,
       sslRequired,
@@ -128,18 +130,33 @@ public:
    struct OriginPolicy
    {
       void *context = nullptr;
+      String requiredScheme;
+      String requiredHost;
+      String requiredAuthority;
+      String requiredService;
+      String requiredResolveHost;
       bool (*accept)(void *context,
                      const String& scheme,
                      const String& host,
+                     const String& authority,
                      const String& service,
                      const String& resolveHost) = nullptr;
 
       bool accepts(const String& scheme,
                    const String& host,
+                   const String& authority,
                    const String& service,
                    const String& resolveHost) const
       {
-         return accept == nullptr || accept(context, scheme, host, service, resolveHost);
+         if ((!requiredScheme.empty() && requiredScheme != scheme) ||
+             (!requiredHost.empty() && requiredHost != host) ||
+             (!requiredAuthority.empty() && requiredAuthority != authority) ||
+             (!requiredService.empty() && requiredService != service) ||
+             (!requiredResolveHost.empty() && requiredResolveHost != resolveHost))
+         {
+            return false;
+         }
+         return accept == nullptr || accept(context, scheme, host, authority, service, resolveHost);
       }
    };
 
@@ -181,6 +198,7 @@ public:
    {
       String url;
       String resolveHost;
+      String authority;
       Method method = Method::get;
       HttpPolicy httpPolicy = HttpPolicy::preferHttp2;
       TlsMinimum tlsMinimum = TlsMinimum::tls12;
@@ -256,7 +274,7 @@ private:
 
    struct Transfer
    {
-      CurlMultiRingClient *owner = nullptr;
+      MultiCurlClient *owner = nullptr;
       Ticket ticket;
       Request request;
       Callback callback;
@@ -343,7 +361,7 @@ private:
 
    static inline std::once_flag curlInitializationOnce;
    static inline CURLcode curlInitializationResult = CURLE_FAILED_INIT;
-   static thread_local inline CurlMultiRingClient *threadOwner = nullptr;
+   static thread_local inline MultiCurlClient *threadOwner = nullptr;
 
    std::shared_ptr<LifetimeState> lifetimeState = std::make_shared<LifetimeState>();
    Config config;
@@ -621,6 +639,35 @@ private:
       return false;
    }
 
+   static bool sameLocalEndpoint(const LocalBind& configuredBind,
+                                 const sockaddr *actual,
+                                 socklen_t actualLength)
+   {
+      const sockaddr *configured = reinterpret_cast<const sockaddr *>(&configuredBind.address);
+      if (actual == nullptr || configured->sa_family != actual->sa_family)
+      {
+         return false;
+      }
+      if (configured->sa_family == AF_INET &&
+          configuredBind.length == sizeof(sockaddr_in) && actualLength == sizeof(sockaddr_in))
+      {
+         const sockaddr_in *configured4 = reinterpret_cast<const sockaddr_in *>(configured);
+         const sockaddr_in *actual4 = reinterpret_cast<const sockaddr_in *>(actual);
+         return configured4->sin_port == actual4->sin_port &&
+                std::memcmp(&configured4->sin_addr, &actual4->sin_addr, sizeof(in_addr)) == 0;
+      }
+      if (configured->sa_family == AF_INET6 &&
+          configuredBind.length == sizeof(sockaddr_in6) && actualLength == sizeof(sockaddr_in6))
+      {
+         const sockaddr_in6 *configured6 = reinterpret_cast<const sockaddr_in6 *>(configured);
+         const sockaddr_in6 *actual6 = reinterpret_cast<const sockaddr_in6 *>(actual);
+         return configured6->sin6_port == actual6->sin6_port &&
+                configured6->sin6_scope_id == actual6->sin6_scope_id &&
+                std::memcmp(&configured6->sin6_addr, &actual6->sin6_addr, sizeof(in6_addr)) == 0;
+      }
+      return false;
+   }
+
    static curl_socket_t openSocketCallback(void *context,
                                            curlsocktype purpose,
                                            struct curl_sockaddr *address)
@@ -680,10 +727,19 @@ private:
          }
 #endif
          const int enabled = 1;
+         sockaddr_storage actualLocal = {};
+         socklen_t actualLocalLength = sizeof(actualLocal);
          if (local->sa_family != address->family ||
+             setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0 ||
              (transfer.request.localBind.freebind &&
               setsockopt(fd, freebindLevel, freebindOption, &enabled, sizeof(enabled)) != 0) ||
-             bind(fd, local, transfer.request.localBind.length) != 0)
+             bind(fd, local, transfer.request.localBind.length) != 0 ||
+             getsockname(fd,
+                         reinterpret_cast<sockaddr *>(&actualLocal),
+                         &actualLocalLength) != 0 ||
+             !sameLocalEndpoint(transfer.request.localBind,
+                                reinterpret_cast<const sockaddr *>(&actualLocal),
+                                actualLocalLength))
          {
             close(fd);
             return CURL_SOCKET_BAD;
@@ -769,12 +825,34 @@ private:
             return CURL_PREREQFUNC_ABORT;
          }
       }
+      if (transfer.request.httpPolicy == HttpPolicy::requireHttp2 &&
+          transfer.scheme.equals("https"_ctv))
+      {
+         curl_tlssessioninfo *session = nullptr;
+         const CURLcode sessionStatus = curl_easy_getinfo(transfer.easy,
+                                                          CURLINFO_TLS_SSL_PTR,
+                                                          &session);
+         const unsigned char *protocol = nullptr;
+         unsigned int protocolLength = 0;
+         if (sessionStatus == CURLE_OK && session &&
+             session->backend == CURLSSLBACKEND_OPENSSL && session->internals)
+         {
+            SSL_get0_alpn_selected(static_cast<SSL *>(session->internals),
+                                   &protocol,
+                                   &protocolLength);
+         }
+         if (protocol == nullptr || protocolLength != 2 || std::memcmp(protocol, "h2", 2) != 0)
+         {
+            transfer.forcedStatus = Status::httpVersionRejected;
+            return CURL_PREREQFUNC_ABORT;
+         }
+      }
       return CURL_PREREQFUNC_OK;
    }
 
    static int socketCallback(CURL *, curl_socket_t fd, int action, void *context, void *)
    {
-      CurlMultiRingClient& client = *static_cast<CurlMultiRingClient *>(context);
+      MultiCurlClient& client = *static_cast<MultiCurlClient *>(context);
       client.requireOwnerThread();
       if (client.stagedSocketEvents.size() >= maximumStagedSocketEvents)
       {
@@ -797,7 +875,7 @@ private:
 
    static int timerCallback(CURLM *, long milliseconds, void *context)
    {
-      CurlMultiRingClient& client = *static_cast<CurlMultiRingClient *>(context);
+      MultiCurlClient& client = *static_cast<MultiCurlClient *>(context);
       client.requireOwnerThread();
       if (milliseconds < 0)
       {
@@ -1415,6 +1493,62 @@ private:
       return false;
    }
 
+   static bool validAuthority(const String& authority)
+   {
+      if (authority.empty())
+      {
+         return true;
+      }
+      if (authority.size() > maximumUrlBytes)
+      {
+         return false;
+      }
+      for (char character : authority)
+      {
+         const unsigned char byte = static_cast<unsigned char>(character);
+         if (byte <= 0x20 || byte == 0x7f || byte == '/' || byte == '\\' ||
+             byte == '@' || byte == '#' || byte == '?')
+         {
+            return false;
+         }
+      }
+      return true;
+   }
+
+   static void appendLocalBindIdentity(String& identity, const LocalBind& localBind)
+   {
+      identity.append('\0');
+      if (!localBind)
+      {
+         identity.append('0');
+         return;
+      }
+
+      const sockaddr *configured = reinterpret_cast<const sockaddr *>(&localBind.address);
+      char text[INET6_ADDRSTRLEN] = {};
+      const void *source = configured->sa_family == AF_INET
+                               ? static_cast<const void *>(&reinterpret_cast<const sockaddr_in *>(
+                                     configured)->sin_addr)
+                               : static_cast<const void *>(&reinterpret_cast<const sockaddr_in6 *>(
+                                     configured)->sin6_addr);
+      const uint16_t port = configured->sa_family == AF_INET
+                                ? ntohs(reinterpret_cast<const sockaddr_in *>(configured)->sin_port)
+                                : ntohs(reinterpret_cast<const sockaddr_in6 *>(configured)->sin6_port);
+      identity.append(configured->sa_family == AF_INET ? '4' : '6');
+      identity.append(localBind.freebind ? '1' : '0');
+      identity.append(':');
+      if (inet_ntop(configured->sa_family, source, text, sizeof(text)))
+      {
+         identity.append(text);
+      }
+      identity.append(':');
+      identity.append(String(port));
+      identity.append(':');
+      identity.append(String(configured->sa_family == AF_INET6
+                                 ? reinterpret_cast<const sockaddr_in6 *>(configured)->sin6_scope_id
+                                 : 0));
+   }
+
    bool prepareEasy(Transfer& transfer)
    {
       transfer.easy = curl_easy_init();
@@ -1423,12 +1557,26 @@ private:
          return false;
       }
 
-      if (transfer.request.headers.size() > maximumRequestHeaders)
+      const size_t structuredHeaderCount = transfer.request.authority.empty() ? 0 : 1;
+      if (transfer.request.headers.size() + structuredHeaderCount > maximumRequestHeaders)
       {
          transfer.result.status = Status::headersTooLarge;
          return false;
       }
       size_t requestHeaderBytes = 0;
+      if (!transfer.request.authority.empty())
+      {
+         Header authorityHeader {"Host", transfer.request.authority};
+         requestHeaderBytes = authorityHeader.name.size() + authorityHeader.value.size() + 2;
+         if (requestHeaderBytes > config.headerBytes ||
+             !appendRequestHeader(transfer, authorityHeader))
+         {
+            transfer.result.status = requestHeaderBytes > config.headerBytes
+                                         ? Status::headersTooLarge
+                                         : Status::initializationFailure;
+            return false;
+         }
+      }
       for (const Header& header : transfer.request.headers)
       {
          const size_t lineBytes = header.name.size() + header.value.size() + 2;
@@ -1482,11 +1630,6 @@ private:
       code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_PREREQFUNCTION,
                                                  prerequisiteCallback) : code;
       code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_PREREQDATA, &transfer) : code;
-      if (transfer.request.localBind)
-      {
-         code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_FRESH_CONNECT, 1L) : code;
-         code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_FORBID_REUSE, 1L) : code;
-      }
       code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_PROXY, "") : code;
       code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_NOPROXY, "*") : code;
       code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_PROTOCOLS_STR,
@@ -1718,9 +1861,15 @@ private:
       origin.append(transfer.host);
       origin.append('\0');
       origin.append(transfer.service);
+      String connectionPins = rule;
+      connectionPins.append('\0');
+      connectionPins.append(transfer.request.authority.empty()
+                                ? transfer.host
+                                : transfer.request.authority);
+      appendLocalBindIdentity(connectionPins, transfer.request.localBind);
       const ConnectionIdentity identity {transfer.request.resolutionGeneration,
                                          transfer.request.identityGeneration,
-                                         rule};
+                                         std::move(connectionPins)};
       auto previousIdentity = connectionIdentityByOrigin.find(origin);
       const bool knownOrigin = previousIdentity != connectionIdentityByOrigin.end();
       const bool connectionIdentityChanged = !knownOrigin ||
@@ -1736,7 +1885,9 @@ private:
             connectionIdentityByOrigin.clear();
          }
          if ((knownOrigin || evictAll) &&
-             curl_multi_setopt(multi, CURLMOPT_NETWORK_CHANGED, 1L) != CURLM_OK)
+             curl_multi_setopt(multi,
+                               CURLMOPT_NETWORK_CHANGED,
+                               CURLMNWC_CLEAR_CONNS) != CURLM_OK)
          {
             finish(ticket.identifier, Status::transportFailure, CURLE_FAILED_INIT);
             return;
@@ -1809,6 +1960,9 @@ private:
          policyCallbackActive = true;
          const bool originAccepted = transfer.request.originPolicy.accepts(transfer.scheme,
                                                                            transfer.host,
+                                                                           transfer.request.authority.empty()
+                                                                               ? transfer.host
+                                                                               : transfer.request.authority,
                                                                            transfer.service,
                                                                            transfer.connectHost);
          if (!originPolicyLifetime->alive)
@@ -1899,7 +2053,9 @@ private:
       {
          finalStatus = curlCode == CURLE_OPERATION_TIMEDOUT
                            ? Status::deadlineExceeded
-                           : Status::transportFailure;
+                           : curlCode == CURLE_FILESIZE_EXCEEDED
+                                 ? Status::responseTooLarge
+                                 : Status::transportFailure;
       }
       else if (requestedStatus == Status::success &&
                transfer->request.httpPolicy == HttpPolicy::requireHttp2 &&
@@ -2086,11 +2242,11 @@ private:
 
 public:
 
-   CurlMultiRingClient()
-       : CurlMultiRingClient(Config {})
+   MultiCurlClient()
+       : MultiCurlClient(Config {})
    {}
 
-   explicit CurlMultiRingClient(Config requested)
+   explicit MultiCurlClient(Config requested)
        : config(std::move(requested)),
          resolver({}, config.dnsBackend)
    {
@@ -2121,9 +2277,14 @@ public:
       timer.originator = this;
 
       RingDispatcher& dispatcher = RingDispatcher::current();
-      if (Ring::interfacer != &dispatcher || threadOwner != nullptr)
+      if (Ring::interfacer != &dispatcher)
       {
          initialization = InitializationStatus::ringDispatcherRequired;
+         return;
+      }
+      if (threadOwner != nullptr)
+      {
+         initialization = InitializationStatus::threadClientAlreadyExists;
          return;
       }
 
@@ -2167,7 +2328,7 @@ public:
       initialization = InitializationStatus::ready;
    }
 
-   ~CurlMultiRingClient()
+   ~MultiCurlClient()
    {
       requireOwnerThread();
       if (callbackActive)
@@ -2182,8 +2343,8 @@ public:
       }
    }
 
-   CurlMultiRingClient(const CurlMultiRingClient&) = delete;
-   CurlMultiRingClient& operator=(const CurlMultiRingClient&) = delete;
+   MultiCurlClient(const MultiCurlClient&) = delete;
+   MultiCurlClient& operator=(const MultiCurlClient&) = delete;
 
    bool ready(void) const
    {
@@ -2221,7 +2382,13 @@ public:
          }
          return ticket;
       }
-      size_t snapshotBytes = request.url.size() + request.resolveHost.size() + request.body.size() +
+      size_t snapshotBytes = request.url.size() + request.resolveHost.size() + request.authority.size() +
+                             request.body.size() +
+                             request.originPolicy.requiredScheme.size() +
+                             request.originPolicy.requiredHost.size() +
+                             request.originPolicy.requiredAuthority.size() +
+                             request.originPolicy.requiredService.size() +
+                             request.originPolicy.requiredResolveHost.size() +
                              request.caFile.size() + request.caPath.size() + request.caBlob.size() +
                              request.clientCertificateFile.size() + request.clientKeyFile.size() +
                              request.clientCertificateBlob.size() + request.clientKeyBlob.size();
@@ -2248,7 +2415,8 @@ public:
                                      (request.method == Method::get || request.method == Method::head);
       if (snapshotBytes > config.requestBytes || !certificatePathsPaired ||
           !certificateBlobsPaired || mixedCertificateSources || invalidTimeout ||
-          invalidMethodBody || !validLocalBind(request.localBind))
+          invalidMethodBody || !validLocalBind(request.localBind) ||
+          !validAuthority(request.authority))
       {
          Result result;
          result.status = snapshotBytes > config.requestBytes

@@ -1,7 +1,7 @@
 // Copyright 2026 Victor Stewart
 // SPDX-License-Identifier: Apache-2.0
+#include <networking/multi.curl.client.h>
 #include <networking/message.h>
-#include <networking/curl.multi.ring.h>
 #include <services/filesystem.h>
 
 #include <ares.h>
@@ -12,7 +12,7 @@
 
 int main()
 {
-  static_assert(CurlMultiRingClient::maximumConcurrentStreams == 32);
+  static_assert(MultiCurlClient::maximumConcurrentStreams == 32);
   const curl_version_info_data *curlVersion = curl_version_info(CURLVERSION_NOW);
   if (curlVersion == nullptr || !(curlVersion->features & CURL_VERSION_ASYNCHDNS))
   {

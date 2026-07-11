@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "tests/test_support.h"
 
-#include <networking/curl.multi.ring.h>
+#include <networking/multi.curl.client.h>
 
 #include <arpa/inet.h>
 #include <atomic>
@@ -14,6 +14,7 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <zlib.h>
 
 namespace
 {
@@ -51,6 +52,34 @@ static void append32(Vector<uint8_t>& bytes, uint32_t value)
    bytes.push_back(uint8_t(value >> 16));
    bytes.push_back(uint8_t(value >> 8));
    bytes.push_back(uint8_t(value));
+}
+
+static String gzip(const String& input)
+{
+   z_stream stream = {};
+   if (deflateInit2(&stream,
+                    Z_BEST_COMPRESSION,
+                    Z_DEFLATED,
+                    MAX_WBITS + 16,
+                    8,
+                    Z_DEFAULT_STRATEGY) != Z_OK)
+   {
+      return {};
+   }
+   Vector<uint8_t> output;
+   output.resize(size_t(input.size() + 128));
+   stream.next_in = reinterpret_cast<Bytef *>(input.data());
+   stream.avail_in = uInt(input.size());
+   stream.next_out = output.data();
+   stream.avail_out = uInt(output.size());
+   const int status = deflate(&stream, Z_FINISH);
+   String compressed;
+   if (status == Z_STREAM_END)
+   {
+      compressed.assign(output.data(), stream.total_out);
+   }
+   deflateEnd(&stream);
+   return compressed;
 }
 
 class DnsFixture
@@ -210,9 +239,12 @@ private:
    int listener = -1;
    uint16_t boundPort = 0;
    String body;
+   String expectedAuthority;
+   String contentEncoding;
    uint32_t delayMilliseconds = 0;
    uint32_t expectedConnections = 1;
    std::atomic<bool> stopping = false;
+   std::atomic<bool> authorityMatched = true;
    std::thread worker;
 
    void run(void)
@@ -231,14 +263,24 @@ private:
             continue;
          }
          char request[4096] = {};
-         (void)recv(connection, request, sizeof(request), 0);
+         (void)recv(connection, request, sizeof(request) - 1, 0);
+         if (!expectedAuthority.empty() && std::strstr(request, expectedAuthority.c_str()) == nullptr)
+         {
+            authorityMatched.store(false, std::memory_order_relaxed);
+         }
          if (delayMilliseconds != 0 && completed == 0)
          {
             std::this_thread::sleep_for(std::chrono::milliseconds(delayMilliseconds));
          }
          String response;
-         response.snprintf<"HTTP/1.1 200 OK\r\nContent-Length: {itoa}\r\nConnection: close\r\n\r\n"_ctv>(
-             uint64_t(body.size()));
+         response.snprintf<"HTTP/1.1 200 OK\r\nContent-Length: {itoa}\r\n"_ctv>(uint64_t(body.size()));
+         if (!contentEncoding.empty())
+         {
+            response.append("Content-Encoding: "_ctv);
+            response.append(contentEncoding);
+            response.append("\r\n"_ctv);
+         }
+         response.append("Connection: close\r\n\r\n"_ctv);
          response.append(body);
          size_t sent = 0;
          while (sent < response.size())
@@ -263,8 +305,14 @@ private:
 
 public:
 
-   HttpFixture(const String& responseBody, uint32_t delay, uint32_t connections = 1)
+   HttpFixture(const String& responseBody,
+               uint32_t delay,
+               uint32_t connections = 1,
+               const char *requiredAuthority = nullptr,
+               const char *encoding = nullptr)
        : body(responseBody),
+         expectedAuthority(requiredAuthority ? requiredAuthority : ""),
+         contentEncoding(encoding ? encoding : ""),
          delayMilliseconds(delay),
          expectedConnections(connections)
    {
@@ -329,12 +377,17 @@ public:
    {
       return boundPort;
    }
+
+   bool sawExpectedAuthority(void) const
+   {
+      return authorityMatched.load(std::memory_order_relaxed);
+   }
 };
 
 struct Scenario final : RingMultiplexer
 {
    TestSuite *suite = nullptr;
-   CurlMultiRingClient *client = nullptr;
+   MultiCurlClient *client = nullptr;
    TimeoutPacket guard;
    bool guardArmed = false;
    bool guardCancellationRequested = false;
@@ -342,7 +395,10 @@ struct Scenario final : RingMultiplexer
    bool slowDone = false;
    bool canceledDone = false;
    bool invalidHeaderDone = false;
+   bool invalidAuthorityDone = false;
    bool capDone = false;
+   bool compressedCapDone = false;
+   bool compressedCapStatusCorrect = false;
    bool deadlineDone = false;
    bool timedOut = false;
    bool firstCompletedWhileSecondActive = false;
@@ -350,7 +406,9 @@ struct Scenario final : RingMultiplexer
    uint32_t slowCalls = 0;
    uint32_t canceledCalls = 0;
    uint32_t invalidHeaderCalls = 0;
+   uint32_t invalidAuthorityCalls = 0;
    uint32_t capCalls = 0;
+   uint32_t compressedCapCalls = 0;
    uint32_t deadlineCalls = 0;
 
    explicit Scenario(TestSuite& testSuite)
@@ -360,8 +418,8 @@ struct Scenario final : RingMultiplexer
    }
 
    static void fastCallback(void *context,
-                            CurlMultiRingClient::Ticket,
-                            CurlMultiRingClient::Result&& result)
+                            MultiCurlClient::Ticket,
+                            MultiCurlClient::Result&& result)
    {
       Scenario& scenario = *static_cast<Scenario *>(context);
       ++scenario.fastCalls;
@@ -371,8 +429,8 @@ struct Scenario final : RingMultiplexer
    }
 
    static void slowCallback(void *context,
-                            CurlMultiRingClient::Ticket,
-                            CurlMultiRingClient::Result&& result)
+                            MultiCurlClient::Ticket,
+                            MultiCurlClient::Result&& result)
    {
       Scenario& scenario = *static_cast<Scenario *>(context);
       ++scenario.slowCalls;
@@ -381,49 +439,71 @@ struct Scenario final : RingMultiplexer
    }
 
    static void canceledCallback(void *context,
-                                CurlMultiRingClient::Ticket,
-                                CurlMultiRingClient::Result&& result)
+                                MultiCurlClient::Ticket,
+                                MultiCurlClient::Result&& result)
    {
       Scenario& scenario = *static_cast<Scenario *>(context);
       ++scenario.canceledCalls;
-      scenario.canceledDone = result.status == CurlMultiRingClient::Status::canceled;
+      scenario.canceledDone = result.status == MultiCurlClient::Status::canceled;
       scenario.beginShutdownIfDone();
    }
 
    static void invalidHeaderCallback(void *context,
-                                     CurlMultiRingClient::Ticket,
-                                     CurlMultiRingClient::Result&& result)
+                                     MultiCurlClient::Ticket,
+                                     MultiCurlClient::Result&& result)
    {
       Scenario& scenario = *static_cast<Scenario *>(context);
       ++scenario.invalidHeaderCalls;
-      scenario.invalidHeaderDone = result.status == CurlMultiRingClient::Status::invalidRequest;
+      scenario.invalidHeaderDone = result.status == MultiCurlClient::Status::invalidRequest;
+      scenario.beginShutdownIfDone();
+   }
+
+   static void invalidAuthorityCallback(void *context,
+                                        MultiCurlClient::Ticket,
+                                        MultiCurlClient::Result&& result)
+   {
+      Scenario& scenario = *static_cast<Scenario *>(context);
+      ++scenario.invalidAuthorityCalls;
+      scenario.invalidAuthorityDone = result.status == MultiCurlClient::Status::invalidRequest;
       scenario.beginShutdownIfDone();
    }
 
    static void capCallback(void *context,
-                           CurlMultiRingClient::Ticket,
-                           CurlMultiRingClient::Result&& result)
+                           MultiCurlClient::Ticket,
+                           MultiCurlClient::Result&& result)
    {
       Scenario& scenario = *static_cast<Scenario *>(context);
       ++scenario.capCalls;
-      scenario.capDone = result.status == CurlMultiRingClient::Status::responseTooLarge;
+      scenario.capDone = result.status == MultiCurlClient::Status::responseTooLarge;
+      scenario.beginShutdownIfDone();
+   }
+
+   static void compressedCapCallback(void *context,
+                                     MultiCurlClient::Ticket,
+                                     MultiCurlClient::Result&& result)
+   {
+      Scenario& scenario = *static_cast<Scenario *>(context);
+      ++scenario.compressedCapCalls;
+      scenario.compressedCapDone = true;
+      scenario.compressedCapStatusCorrect =
+          result.status == MultiCurlClient::Status::responseTooLarge;
       scenario.beginShutdownIfDone();
    }
 
    static void deadlineCallback(void *context,
-                                CurlMultiRingClient::Ticket,
-                                CurlMultiRingClient::Result&& result)
+                                MultiCurlClient::Ticket,
+                                MultiCurlClient::Result&& result)
    {
       Scenario& scenario = *static_cast<Scenario *>(context);
       ++scenario.deadlineCalls;
-      scenario.deadlineDone = result.status == CurlMultiRingClient::Status::deadlineExceeded;
+      scenario.deadlineDone = result.status == MultiCurlClient::Status::deadlineExceeded;
       scenario.beginShutdownIfDone();
    }
 
    void beginShutdownIfDone(void)
    {
-      if (!fastDone || !slowDone || !canceledDone || !invalidHeaderDone ||
-          !capDone || !deadlineDone)
+      if (!fastDone || !slowDone || !canceledDone || !invalidHeaderDone || !invalidAuthorityDone ||
+          !capDone || !compressedCapDone || !deadlineDone)
       {
          return;
       }
@@ -464,14 +544,14 @@ struct Scenario final : RingMultiplexer
    }
 };
 
-static CurlMultiRingClient::Request requestFor(const HttpFixture& fixture)
+static MultiCurlClient::Request requestFor(const HttpFixture& fixture)
 {
-   CurlMultiRingClient::Request request;
+   MultiCurlClient::Request request;
    request.url = fixture.url();
    request.requireTls = false;
-   request.httpPolicy = CurlMultiRingClient::HttpPolicy::requireHttp1;
+   request.httpPolicy = MultiCurlClient::HttpPolicy::requireHttp1;
    request.responseBytes = 1024;
-   request.overallDeadline = CurlMultiRingClient::Clock::now() + std::chrono::seconds(3);
+   request.overallDeadline = MultiCurlClient::Clock::now() + std::chrono::seconds(3);
    return request;
 }
 
@@ -484,14 +564,22 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
    HttpFixture slow("slow", 150);
    HttpFixture cancelFixture("cancel", 1000);
    HttpFixture capFixture("response exceeds cap", 0);
+   String decompressedBody;
+   decompressedBody.reserve(2048);
+   decompressedBody.resize(2048);
+   std::memset(decompressedBody.data(), 'x', decompressedBody.size());
+   const String compressedBody = gzip(decompressedBody);
+   HttpFixture compressedCapFixture(compressedBody, 0, 1, nullptr, "gzip");
    HttpFixture deadlineFixture("late", 400);
    EXPECT_TRUE(suite, fast.ready());
    EXPECT_TRUE(suite, slow.ready());
    EXPECT_TRUE(suite, cancelFixture.ready());
    EXPECT_TRUE(suite, capFixture.ready());
+   EXPECT_TRUE(suite, compressedBody.size() < decompressedBody.size());
+   EXPECT_TRUE(suite, compressedCapFixture.ready());
    EXPECT_TRUE(suite, deadlineFixture.ready());
    if (!fast.ready() || !slow.ready() || !cancelFixture.ready() ||
-       !capFixture.ready() || !deadlineFixture.ready())
+       !capFixture.ready() || !compressedCapFixture.ready() || !deadlineFixture.ready())
    {
       (void)unsetenv("HTTP_PROXY");
       (void)unsetenv("HTTPS_PROXY");
@@ -510,24 +598,39 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
    Scenario scenario(suite);
    RingDispatcher::installMultiplexee(&scenario, &scenario);
    RingDispatcher::installMultiplexer(&scenario);
-   scenario.client = new CurlMultiRingClient();
+   scenario.client = new MultiCurlClient();
    EXPECT_TRUE(suite, scenario.client->ready());
+   {
+      MultiCurlClient duplicate;
+      EXPECT_FALSE(suite, duplicate.ready());
+      EXPECT_TRUE(suite,
+                  duplicate.initializationStatus() ==
+                     MultiCurlClient::InitializationStatus::threadClientAlreadyExists);
+   }
 
-   CurlMultiRingClient::Request invalid = requestFor(fast);
+   MultiCurlClient::Request invalid = requestFor(fast);
    invalid.headers.push_back({"Host", "invalid.test"});
    scenario.client->submit(std::move(invalid), {&scenario, Scenario::invalidHeaderCallback});
+   MultiCurlClient::Request invalidAuthority = requestFor(fast);
+   invalidAuthority.authority.assign("invalid\nauthority"_ctv);
+   scenario.client->submit(std::move(invalidAuthority),
+                           {&scenario, Scenario::invalidAuthorityCallback});
 
-   CurlMultiRingClient::Request canceled = requestFor(cancelFixture);
+   MultiCurlClient::Request canceled = requestFor(cancelFixture);
    const auto canceledTicket = scenario.client->submit(std::move(canceled),
                                                         {&scenario, Scenario::canceledCallback});
    EXPECT_TRUE(suite, scenario.client->cancel(canceledTicket));
 
    scenario.client->submit(requestFor(slow), {&scenario, Scenario::slowCallback});
    scenario.client->submit(requestFor(fast), {&scenario, Scenario::fastCallback});
-   CurlMultiRingClient::Request capped = requestFor(capFixture);
+   MultiCurlClient::Request capped = requestFor(capFixture);
    capped.responseBytes = 4;
    scenario.client->submit(std::move(capped), {&scenario, Scenario::capCallback});
-   CurlMultiRingClient::Request deadline = requestFor(deadlineFixture);
+   MultiCurlClient::Request compressedCapped = requestFor(compressedCapFixture);
+   compressedCapped.responseBytes = 1024;
+   scenario.client->submit(std::move(compressedCapped),
+                           {&scenario, Scenario::compressedCapCallback});
+   MultiCurlClient::Request deadline = requestFor(deadlineFixture);
    deadline.firstByteTimeout = std::chrono::milliseconds(50);
    scenario.client->submit(std::move(deadline), {&scenario, Scenario::deadlineCallback});
    scenario.guard.setTimeoutSeconds(5);
@@ -540,14 +643,19 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
    EXPECT_TRUE(suite, scenario.slowDone);
    EXPECT_TRUE(suite, scenario.canceledDone);
    EXPECT_TRUE(suite, scenario.invalidHeaderDone);
+   EXPECT_TRUE(suite, scenario.invalidAuthorityDone);
    EXPECT_TRUE(suite, scenario.capDone);
+   EXPECT_TRUE(suite, scenario.compressedCapDone);
+   EXPECT_TRUE(suite, scenario.compressedCapStatusCorrect);
    EXPECT_TRUE(suite, scenario.deadlineDone);
    EXPECT_TRUE(suite, scenario.firstCompletedWhileSecondActive);
    EXPECT_EQ(suite, scenario.fastCalls, uint32_t(1));
    EXPECT_EQ(suite, scenario.slowCalls, uint32_t(1));
    EXPECT_EQ(suite, scenario.canceledCalls, uint32_t(1));
    EXPECT_EQ(suite, scenario.invalidHeaderCalls, uint32_t(1));
+   EXPECT_EQ(suite, scenario.invalidAuthorityCalls, uint32_t(1));
    EXPECT_EQ(suite, scenario.capCalls, uint32_t(1));
+   EXPECT_EQ(suite, scenario.compressedCapCalls, uint32_t(1));
    EXPECT_EQ(suite, scenario.deadlineCalls, uint32_t(1));
    EXPECT_TRUE(suite, scenario.client->shutdownSafe());
    delete scenario.client;
@@ -566,7 +674,7 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
 
 struct ResetScenario final : RingMultiplexer
 {
-   CurlMultiRingClient *client = nullptr;
+   MultiCurlClient *client = nullptr;
    TimeoutPacket guard;
    bool guardArmed = false;
    bool completionDone = false;
@@ -581,14 +689,14 @@ struct ResetScenario final : RingMultiplexer
    }
 
    static void callback(void *context,
-                        CurlMultiRingClient::Ticket,
-                        CurlMultiRingClient::Result&& result)
+                        MultiCurlClient::Ticket,
+                        MultiCurlClient::Result&& result)
    {
       ResetScenario& scenario = *static_cast<ResetScenario *>(context);
       ++scenario.calls;
       scenario.completionDone = result.status == (scenario.resetMode
-                                                       ? CurlMultiRingClient::Status::reset
-                                                       : CurlMultiRingClient::Status::shutdown);
+                                                       ? MultiCurlClient::Status::reset
+                                                       : MultiCurlClient::Status::shutdown);
       scenario.stateCorrect = scenario.resetMode ? scenario.client->ready()
                                                  : !scenario.client->ready();
       if (scenario.resetMode)
@@ -650,7 +758,7 @@ static void testResetAndActiveShutdownBarriers(TestSuite& suite, bool resetMode)
    scenario.resetMode = resetMode;
    RingDispatcher::installMultiplexee(&scenario, &scenario);
    RingDispatcher::installMultiplexer(&scenario);
-   scenario.client = new CurlMultiRingClient();
+   scenario.client = new MultiCurlClient();
    EXPECT_TRUE(suite, scenario.client->ready());
    scenario.client->submit(requestFor(delayed), {&scenario, ResetScenario::callback});
    if (resetMode)
@@ -683,7 +791,7 @@ static void testResetAndActiveShutdownBarriers(TestSuite& suite, bool resetMode)
 
 struct PinRefreshScenario final : RingMultiplexer
 {
-   CurlMultiRingClient *client = nullptr;
+   MultiCurlClient *client = nullptr;
    TimeoutPacket guard;
    TimeoutPacket heartbeat;
    bool guardArmed = false;
@@ -700,8 +808,8 @@ struct PinRefreshScenario final : RingMultiplexer
    }
 
    static void callback(void *context,
-                        CurlMultiRingClient::Ticket,
-                        CurlMultiRingClient::Result&& result)
+                        MultiCurlClient::Ticket,
+                        MultiCurlClient::Result&& result)
    {
       PinRefreshScenario& scenario = *static_cast<PinRefreshScenario *>(context);
       ++scenario.calls;
@@ -788,18 +896,18 @@ static void testQueuedPinExpiryReresolves(TestSuite& suite)
    PinRefreshScenario scenario;
    RingDispatcher::installMultiplexee(&scenario, &scenario);
    RingDispatcher::installMultiplexer(&scenario);
-   CurlMultiRingClient::Config config;
+   MultiCurlClient::Config config;
    config.totalConnections = 1;
    config.hostConnections = 1;
    config.dnsBackend.servers = dns.servers();
-   scenario.client = new CurlMultiRingClient(std::move(config));
+   scenario.client = new MultiCurlClient(std::move(config));
    EXPECT_TRUE(suite, scenario.client->ready());
 
-   CurlMultiRingClient::Request request;
+   MultiCurlClient::Request request;
    request.url.snprintf<"http://queue.test:{itoa}/"_ctv>(uint64_t(http.port()));
    request.requireTls = false;
-   request.httpPolicy = CurlMultiRingClient::HttpPolicy::requireHttp1;
-   request.overallDeadline = CurlMultiRingClient::Clock::now() + std::chrono::seconds(5);
+   request.httpPolicy = MultiCurlClient::HttpPolicy::requireHttp1;
+   request.overallDeadline = MultiCurlClient::Clock::now() + std::chrono::seconds(5);
    request.firstByteTimeout = std::chrono::seconds(3);
    scenario.client->submit(request, {&scenario, PinRefreshScenario::callback});
    scenario.client->submit(std::move(request), {&scenario, PinRefreshScenario::callback});
@@ -827,6 +935,150 @@ static void testQueuedPinExpiryReresolves(TestSuite& suite)
    RingDispatcher::dispatcher = nullptr;
 }
 
+static uint16_t reserveLoopbackSourcePort(void)
+{
+   const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+   if (fd < 0)
+   {
+      return 0;
+   }
+   const int enabled = 1;
+   (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+   sockaddr_in address = {};
+   address.sin_family = AF_INET;
+   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   socklen_t length = sizeof(address);
+   const bool ready = bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 &&
+                      getsockname(fd, reinterpret_cast<sockaddr *>(&address), &length) == 0;
+   close(fd);
+   return ready ? ntohs(address.sin_port) : 0;
+}
+
+struct LocalBindScenario final : RingMultiplexer
+{
+   MultiCurlClient *client = nullptr;
+   MultiCurlClient::Request secondRequest;
+   TimeoutPacket guard;
+   bool guardArmed = false;
+   bool guardCancellationRequested = false;
+   bool timedOut = false;
+   bool allSucceeded = true;
+   uint32_t calls = 0;
+
+   LocalBindScenario()
+   {
+      guard.originator = this;
+   }
+
+   static void callback(void *context,
+                        MultiCurlClient::Ticket,
+                        MultiCurlClient::Result&& result)
+   {
+      LocalBindScenario& scenario = *static_cast<LocalBindScenario *>(context);
+      ++scenario.calls;
+      scenario.allSucceeded = scenario.allSucceeded && result.succeeded() &&
+                              result.statusCode == 200 && result.body == "bound"_ctv;
+      if (scenario.calls == 1)
+      {
+         scenario.client->submit(std::move(scenario.secondRequest), {&scenario, callback});
+         return;
+      }
+
+      (void)scenario.client->shutdown();
+      if (scenario.guardArmed && !scenario.guardCancellationRequested)
+      {
+         scenario.guardCancellationRequested = true;
+         Ring::queueCancelTimeout(&scenario.guard);
+      }
+   }
+
+   void timeoutHandler(TimeoutPacket *packet, int result) override
+   {
+      if (packet != &guard)
+      {
+         return;
+      }
+      guardArmed = false;
+      guardCancellationRequested = false;
+      guard.clear();
+      if (result != -ECANCELED)
+      {
+         timedOut = true;
+         (void)client->shutdown();
+      }
+      if (client->shutdownSafe())
+      {
+         Ring::exit = true;
+      }
+   }
+
+   void completionBatchHandler(uint32_t) override
+   {
+      if (client->shutdownSafe() && !guardArmed)
+      {
+         Ring::exit = true;
+      }
+   }
+};
+
+static void testStructuredAuthorityAndReusableLocalBind(TestSuite& suite)
+{
+   HttpFixture fixture("bound", 0, 2, "Host: service.example\r\n");
+   const uint16_t sourcePort = reserveLoopbackSourcePort();
+   EXPECT_TRUE(suite, fixture.ready());
+   EXPECT_TRUE(suite, sourcePort != 0);
+   if (!fixture.ready() || sourcePort == 0)
+   {
+      return;
+   }
+
+   Ring::interfacer = nullptr;
+   Ring::lifecycler = nullptr;
+   Ring::exit = false;
+   Ring::shuttingDown = false;
+   RingDispatcher::dispatcher = nullptr;
+   RingDispatcher dispatcher;
+   Ring::createRing(64, 128, 4, 2, -1, -1, 4);
+
+   LocalBindScenario scenario;
+   RingDispatcher::installMultiplexee(&scenario, &scenario);
+   RingDispatcher::installMultiplexer(&scenario);
+   MultiCurlClient::Config config;
+   config.totalConnections = 1;
+   config.hostConnections = 1;
+   scenario.client = new MultiCurlClient(config);
+   EXPECT_TRUE(suite, scenario.client->ready());
+
+   sockaddr_in local = {};
+   local.sin_family = AF_INET;
+   local.sin_port = htons(sourcePort);
+   local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   MultiCurlClient::Request request = requestFor(fixture);
+   request.authority = "service.example";
+   std::memcpy(&request.localBind.address, &local, sizeof(local));
+   request.localBind.length = sizeof(local);
+   scenario.secondRequest = request;
+   scenario.client->submit(std::move(request), {&scenario, LocalBindScenario::callback});
+   scenario.guard.setTimeoutSeconds(5);
+   scenario.guardArmed = true;
+   Ring::queueTimeout(&scenario.guard);
+   Ring::start();
+
+   EXPECT_FALSE(suite, scenario.timedOut);
+   EXPECT_TRUE(suite, scenario.allSucceeded);
+   EXPECT_EQ(suite, scenario.calls, uint32_t(2));
+   EXPECT_TRUE(suite, fixture.sawExpectedAuthority());
+   EXPECT_TRUE(suite, scenario.client->shutdownSafe());
+   delete scenario.client;
+   RingDispatcher::eraseMultiplexee(&scenario);
+   Ring::shutdownForExec();
+   Ring::interfacer = nullptr;
+   Ring::lifecycler = nullptr;
+   Ring::exit = false;
+   Ring::shuttingDown = false;
+   RingDispatcher::dispatcher = nullptr;
+}
+
 } // namespace
 
 int main()
@@ -834,12 +1086,13 @@ int main()
    TestSuite suite;
    if (!ringSupported())
    {
-      std::cout << "curl multi Ring tests skipped: io_uring unavailable.\n";
-      return suite.finish("curl multi Ring");
+      std::cout << "MultiCurlClient tests skipped: io_uring unavailable.\n";
+      return suite.finish("MultiCurlClient");
    }
    testConcurrentCompletionCancellationAndShutdown(suite);
    testResetAndActiveShutdownBarriers(suite, true);
    testResetAndActiveShutdownBarriers(suite, false);
    testQueuedPinExpiryReresolves(suite);
-   return suite.finish("curl multi Ring");
+   testStructuredAuthorityAndReusableLocalBind(suite);
+   return suite.finish("MultiCurlClient");
 }

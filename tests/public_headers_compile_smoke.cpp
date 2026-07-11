@@ -7,11 +7,11 @@
 #include "services/memfd.h"
 #include "services/vault.h"
 #include "types/types.containers.h"
-#include "networking/curl.multi.ring.h"
+#include "networking/multi.curl.client.h"
 
 int main()
 {
-  static_assert(CurlMultiRingClient::maximumConcurrentStreams == 32);
+  static_assert(MultiCurlClient::maximumConcurrentStreams == 32);
   String value("alpha");
 
   Vector<int> numbers;

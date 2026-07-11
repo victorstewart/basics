@@ -24,12 +24,12 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <nghttp2/nghttp2.h>
 #include <openssl/err.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
 
 #include "macros/bytes.h"
@@ -49,6 +49,7 @@
 #include "networking/tls.h"
 #include "networking/ring.h"
 #include "networking/reconnector.h"
+#include "networking/multi.curl.client.h"
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wkeyword-macro"
@@ -185,9 +186,47 @@ private:
   std::string keyPath_;
   bool ready_ = false;
 
+  // BASICS_MULTI_CURL_CERT_NATIVE_BEGIN
+  static bool expireCertificate(String& certificatePath,
+                                String& keyPath)
+  {
+    FILE *certificateFile = std::fopen(certificatePath.c_str(), "rb");
+    X509 *certificate = certificateFile
+                            ? PEM_read_X509(certificateFile, nullptr, nullptr, nullptr)
+                            : nullptr;
+    if (certificateFile)
+    {
+      std::fclose(certificateFile);
+    }
+
+    FILE *keyFile = std::fopen(keyPath.c_str(), "rb");
+    EVP_PKEY *key = keyFile
+                        ? PEM_read_PrivateKey(keyFile, nullptr, nullptr, nullptr)
+                        : nullptr;
+    if (keyFile)
+    {
+      std::fclose(keyFile);
+    }
+
+    bool ok = certificate && key &&
+              ASN1_TIME_set_string(X509_getm_notBefore(certificate), "20000101000000Z") == 1 &&
+              ASN1_TIME_set_string(X509_getm_notAfter(certificate), "20000102000000Z") == 1 &&
+              X509_sign(certificate, key, EVP_sha256()) > 0;
+    certificateFile = ok ? std::fopen(certificatePath.c_str(), "wb") : nullptr;
+    ok = certificateFile && PEM_write_X509(certificateFile, certificate) == 1;
+    if (certificateFile)
+    {
+      std::fclose(certificateFile);
+    }
+    EVP_PKEY_free(key);
+    X509_free(certificate);
+    return ok;
+  }
+  // BASICS_MULTI_CURL_CERT_NATIVE_END
+
 public:
 
-  RuntimeTLSMaterial()
+  explicit RuntimeTLSMaterial(bool expired = false)
   {
     if (!temp_.valid())
     {
@@ -219,6 +258,14 @@ public:
                   keyPath_,
                   "-out",
                   certPath_}) == 0);
+    if (ready_ && expired)
+    {
+      String certificatePath;
+      certificatePath.assign(certPath_.data(), certPath_.size());
+      String keyPath;
+      keyPath.assign(keyPath_.data(), keyPath_.size());
+      ready_ = expireCertificate(certificatePath, keyPath);
+    }
   }
 
   bool ready() const
@@ -417,12 +464,29 @@ static bool sslReadUntil(SSL *ssl, std::string_view terminator, std::string& dat
     }
 
     data.append(buffer.data(), size_t(readBytes));
-    if (data.size() >= terminator.size() &&
-        data.rfind(terminator) == (data.size() - terminator.size()))
+    if (data.find(terminator) != std::string::npos)
     {
       return true;
     }
   }
+}
+
+static bool sslReadUntilNative(SSL *ssl, const char *terminator, String& data)
+{
+  std::string fixtureData;
+  if (!sslReadUntil(ssl, terminator, fixtureData))
+  {
+    return false;
+  }
+  data.assign(fixtureData.data(), fixtureData.size());
+  return true;
+}
+
+static bool sslWriteAllNative(SSL *ssl, const String& data)
+{
+  return sslWriteAll(ssl,
+                     std::string_view(reinterpret_cast<const char *>(data.data()),
+                                      size_t(data.size())));
 }
 
 class TLSLoopbackServer {
@@ -589,8 +653,8 @@ private:
   ObservedRequest lastRequest_;
   bool sawRequest_ = false;
   bool selectedHTTP2_ = false;
-  std::unordered_map<int32_t, StreamState> streams_;
-  std::unordered_map<int32_t, std::unique_ptr<ResponseState>> responses_;
+  bytell_hash_map<int32_t, StreamState> streams_;
+  bytell_hash_map<int32_t, std::unique_ptr<ResponseState>> responses_;
   bool closeAfterRequest_ = false;
 
   static nghttp2_nv makeHeader(const std::string& name, const std::string& value)
@@ -1076,7 +1140,7 @@ private:
   Buffer outbound_ = Buffer(4096, MemoryType::heap);
   Buffer inbound_ = Buffer(4096, MemoryType::heap);
   nghttp2_session *session_ = nullptr;
-  std::unordered_map<int32_t, StreamState> streams_;
+  bytell_hash_map<int32_t, StreamState> streams_;
   Handler handler_;
   bool ready_ = false;
   bool alpnChecked_ = false;
@@ -1144,7 +1208,7 @@ private:
 
     if (frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_REQUEST)
     {
-      server->streams_.try_emplace(frame->hd.stream_id);
+      server->streams_.emplace(frame->hd.stream_id, StreamState {});
     }
 
     return 0;
@@ -2143,6 +2207,286 @@ static void testH2NonBlockingClientFlows(TestSuite& suite, const RuntimeTLSMater
   }
 }
 
+// BASICS_MULTI_CURL_TLS_NATIVE_BEGIN
+class HTTP1TLSServer : public TLSLoopbackServer {
+private:
+
+  String body_;
+  bool sawRequest_ = false;
+
+protected:
+
+  void handleClient(SSL *ssl) override
+  {
+    String request;
+    if (!sslReadUntilNative(ssl, "\r\n\r\n", request))
+    {
+      setFailure("failed to read http1 request");
+      return;
+    }
+    sawRequest_ = true;
+    static constexpr char http2Preface[] = "PRI * HTTP/2.0";
+    if (request.size() >= sizeof(http2Preface) - 1 &&
+        std::memcmp(request.data(), http2Preface, sizeof(http2Preface) - 1) == 0)
+    {
+      return;
+    }
+    String response;
+    response.snprintf<"HTTP/1.1 200 OK\r\nContent-Length: {itoa}\r\nConnection: close\r\n\r\n"_ctv>(
+        uint64_t(body_.size()));
+    response.append(body_);
+    if (!sslWriteAllNative(ssl, response))
+    {
+      setFailure("failed to write http1 response");
+    }
+  }
+
+public:
+
+  HTTP1TLSServer(const RuntimeTLSMaterial& tls, String body)
+      : TLSLoopbackServer(tls, false), body_(std::move(body))
+  {}
+
+  bool sawRequest() const
+  {
+    return sawRequest_;
+  }
+};
+
+struct CurlTlsScenario final : RingMultiplexer {
+  MultiCurlClient *client = nullptr;
+  TimeoutPacket guard;
+  MultiCurlClient::Result result;
+  bool guardArmed = false;
+  bool guardCancellationRequested = false;
+  bool timedOut = false;
+  uint32_t callbacks = 0;
+
+  CurlTlsScenario()
+  {
+    guard.originator = this;
+  }
+
+  static void completed(void *context,
+                        MultiCurlClient::Ticket,
+                        MultiCurlClient::Result&& completion)
+  {
+    CurlTlsScenario& scenario = *static_cast<CurlTlsScenario *>(context);
+    ++scenario.callbacks;
+    scenario.result = std::move(completion);
+    (void)scenario.client->shutdown();
+    if (scenario.guardArmed && !scenario.guardCancellationRequested)
+    {
+      scenario.guardCancellationRequested = true;
+      Ring::queueCancelTimeout(&scenario.guard);
+    }
+  }
+
+  void timeoutHandler(TimeoutPacket *packet, int resultCode) override
+  {
+    if (packet != &guard)
+    {
+      return;
+    }
+    guardArmed = false;
+    guardCancellationRequested = false;
+    guard.clear();
+    if (resultCode != -ECANCELED)
+    {
+      timedOut = true;
+      (void)client->shutdown();
+    }
+    if (client->shutdownSafe())
+    {
+      Ring::exit = true;
+    }
+  }
+
+  void completionBatchHandler(uint32_t) override
+  {
+    if (client->shutdownSafe() && !guardArmed)
+    {
+      Ring::exit = true;
+    }
+  }
+};
+
+static MultiCurlClient::Request curlTlsRequest(const RuntimeTLSMaterial& tls,
+                                                   const char *host,
+                                                   uint16_t port,
+                                                   MultiCurlClient::HttpPolicy policy,
+                                                   bool trustFixture)
+{
+  String url;
+  url.append("https://"_ctv);
+  url.append(host);
+  url.append(':');
+  url.append(String(port));
+  url.append("/tls"_ctv);
+  String service(port);
+  MultiCurlClient::Request request;
+  request.url = std::move(url);
+  request.resolveHost.assign("127.0.0.1"_ctv);
+  request.authority.assign(host);
+  request.httpPolicy = policy;
+  request.tlsMinimum = MultiCurlClient::TlsMinimum::tls13;
+  request.family = AsyncDnsResolver::Family::ipv4;
+  request.responseBytes = 4_KB;
+  request.overallDeadline = MultiCurlClient::Clock::now() + std::chrono::seconds(3);
+  request.originPolicy.requiredScheme.assign("https"_ctv);
+  request.originPolicy.requiredHost.assign(host);
+  request.originPolicy.requiredAuthority.assign(host);
+  request.originPolicy.requiredService.assign(service);
+  request.originPolicy.requiredResolveHost.assign("127.0.0.1"_ctv);
+  if (trustFixture)
+  {
+    request.caSource = MultiCurlClient::CaSource::file;
+    request.caFile.assign(tls.certPath().data(), tls.certPath().size());
+  }
+  return request;
+}
+
+static MultiCurlClient::Result runCurlTlsRequest(TestSuite& suite,
+                                                     MultiCurlClient::Request request)
+{
+  RingInterface *previousInterfacer = Ring::interfacer;
+  RingLifecycle *previousLifecycler = Ring::lifecycler;
+  RingDispatcher *previousDispatcher = RingDispatcher::dispatcher;
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  RingDispatcher::dispatcher = nullptr;
+  RingDispatcher dispatcher;
+  Ring::createRing(128, 256, 8, 2, -1, -1, 8);
+
+  CurlTlsScenario scenario;
+  RingDispatcher::installMultiplexee(&scenario, &scenario);
+  RingDispatcher::installMultiplexer(&scenario);
+  scenario.client = new MultiCurlClient();
+  EXPECT_TRUE(suite, scenario.client->ready());
+  scenario.guard.setTimeoutSeconds(5);
+  scenario.guardArmed = true;
+  Ring::queueTimeout(&scenario.guard);
+  scenario.client->submit(std::move(request), {&scenario, CurlTlsScenario::completed});
+  Ring::start();
+
+  EXPECT_FALSE(suite, scenario.timedOut);
+  EXPECT_EQ(suite, scenario.callbacks, uint32_t(1));
+  EXPECT_TRUE(suite, scenario.client->shutdownSafe());
+  MultiCurlClient::Result result = std::move(scenario.result);
+  delete scenario.client;
+  RingDispatcher::eraseMultiplexee(&scenario);
+  Ring::shutdownForExec();
+  Ring::interfacer = previousInterfacer;
+  Ring::lifecycler = previousLifecycler;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  RingDispatcher::dispatcher = previousDispatcher;
+  return result;
+}
+
+static void testCurlTlsAndProtocolPolicies(TestSuite& suite,
+                                           const RuntimeTLSMaterial& tls,
+                                           const RuntimeTLSMaterial& expiredTls,
+                                           bool& skipped)
+{
+  if (!ringSupported())
+  {
+    skipped = true;
+    std::cout << "protocol client tests: skipping Curl TLS coverage because required io_uring features are unavailable.\n";
+    return;
+  }
+
+  {
+    HTTP2Server server(tls, [](const HTTP2Server::ObservedRequest&) {
+      HTTP2ResponseSpec response;
+      response.body = "h2-ok";
+      return response;
+    });
+    EXPECT_TRUE(suite, server.ready());
+    MultiCurlClient::Result result = runCurlTlsRequest(
+        suite,
+        curlTlsRequest(tls, "localhost", server.port(),
+                       MultiCurlClient::HttpPolicy::requireHttp2, true));
+    server.wait();
+    EXPECT_TRUE(suite, result.status == MultiCurlClient::Status::success);
+    EXPECT_EQ(suite, result.httpVersion, long(CURL_HTTP_VERSION_2_0));
+    EXPECT_STRING_EQ(suite, result.body, "h2-ok"_ctv);
+    EXPECT_TRUE(suite, server.failure().empty());
+    EXPECT_TRUE(suite, server.selectedHTTP2());
+    EXPECT_TRUE(suite, server.sawRequest());
+  }
+
+  {
+    HTTP1TLSServer server(tls, "h1-ok");
+    EXPECT_TRUE(suite, server.ready());
+    MultiCurlClient::Result result = runCurlTlsRequest(
+        suite,
+        curlTlsRequest(tls, "localhost", server.port(),
+                       MultiCurlClient::HttpPolicy::preferHttp2, true));
+    server.wait();
+    EXPECT_TRUE(suite, result.status == MultiCurlClient::Status::success);
+    EXPECT_EQ(suite, result.httpVersion, long(CURL_HTTP_VERSION_1_1));
+    EXPECT_STRING_EQ(suite, result.body, "h1-ok"_ctv);
+    EXPECT_TRUE(suite, server.failure().empty());
+    EXPECT_TRUE(suite, server.sawRequest());
+  }
+
+  {
+    HTTP1TLSServer server(tls, "rejected");
+    EXPECT_TRUE(suite, server.ready());
+    MultiCurlClient::Result result = runCurlTlsRequest(
+        suite,
+        curlTlsRequest(tls, "localhost", server.port(),
+                       MultiCurlClient::HttpPolicy::requireHttp2, true));
+    server.wait();
+    EXPECT_TRUE(suite, result.status == MultiCurlClient::Status::httpVersionRejected);
+    EXPECT_FALSE(suite, server.sawRequest());
+  }
+
+  {
+    HTTP2Server server(tls, [](const HTTP2Server::ObservedRequest&) {
+      return HTTP2ResponseSpec {};
+    });
+    EXPECT_TRUE(suite, server.ready());
+    MultiCurlClient::Result result = runCurlTlsRequest(
+        suite,
+        curlTlsRequest(tls, "localhost", server.port(),
+                       MultiCurlClient::HttpPolicy::requireHttp2, false));
+    server.wait();
+    EXPECT_TRUE(suite, result.status == MultiCurlClient::Status::transportFailure);
+  }
+
+  {
+    HTTP2Server server(expiredTls, [](const HTTP2Server::ObservedRequest&) {
+      return HTTP2ResponseSpec {};
+    });
+    EXPECT_TRUE(suite, server.ready());
+    MultiCurlClient::Result result = runCurlTlsRequest(
+        suite,
+        curlTlsRequest(expiredTls, "localhost", server.port(),
+                       MultiCurlClient::HttpPolicy::requireHttp2, true));
+    server.wait();
+    EXPECT_TRUE(suite, result.status == MultiCurlClient::Status::transportFailure);
+    EXPECT_EQ(suite, result.curlCode, CURLcode(CURLE_PEER_FAILED_VERIFICATION));
+  }
+
+  {
+    HTTP2Server server(tls, [](const HTTP2Server::ObservedRequest&) {
+      return HTTP2ResponseSpec {};
+    });
+    EXPECT_TRUE(suite, server.ready());
+    MultiCurlClient::Result result = runCurlTlsRequest(
+        suite,
+        curlTlsRequest(tls, "wrong-host.test", server.port(),
+                       MultiCurlClient::HttpPolicy::requireHttp2, true));
+    server.wait();
+    EXPECT_TRUE(suite, result.status == MultiCurlClient::Status::transportFailure);
+  }
+}
+// BASICS_MULTI_CURL_TLS_NATIVE_END
+
 static void testSSHClientLoopback(TestSuite& suite, bool& skipped)
 {
   if (!ringSupported())
@@ -2242,14 +2586,17 @@ int main()
   bool skipped = false;
 
   RuntimeTLSMaterial tls;
+  RuntimeTLSMaterial expiredTls(true);
   EXPECT_TRUE(suite, tls.ready());
-  if (!tls.ready())
+  EXPECT_TRUE(suite, expiredTls.ready());
+  if (!tls.ready() || !expiredTls.ready())
   {
     return suite.finish("protocol client tests");
   }
 
   testReconnectorStateMachine(suite);
   testH2NonBlockingClientFlows(suite, tls, skipped);
+  testCurlTlsAndProtocolPolicies(suite, tls, expiredTls, skipped);
   testSSHClientLoopback(suite, skipped);
   testSSHClientRejectsMismatchedHostKey(suite, skipped);
 

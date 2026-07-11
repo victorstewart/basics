@@ -264,8 +264,8 @@ endif()
 _basics_add_test_executable(basics_codec_tests tests/codec_tests.cpp)
 _basics_add_test_executable(basics_async_dns_tests tests/async_dns_tests.cpp)
 _basics_add_test_executable(basics_async_dns_cares_tests tests/async_dns_cares_tests.cpp)
-_basics_add_test_executable(basics_curl_multi_ring_contract_tests tests/curl_multi_ring_contract_tests.cpp)
-_basics_add_test_executable(basics_curl_multi_ring_tests tests/curl_multi_ring_tests.cpp)
+_basics_add_test_executable(basics_multi_curl_client_contract_tests tests/multi_curl_client_contract_tests.cpp)
+_basics_add_test_executable(basics_multi_curl_client_tests tests/multi_curl_client_tests.cpp)
 _basics_add_test_executable(basics_happy_eyeballs_tests tests/happy_eyeballs_tests.cpp)
 _basics_add_test_executable(basics_codec_fuzz_tests tests/codec_fuzz_tests.cpp)
 _basics_add_test_executable(basics_bitsery_tests tests/bitsery_tests.cpp)
@@ -298,11 +298,11 @@ add_test(
 )
 
 add_test(
-  NAME basics_curl_multi_ring_native_types_contract
+  NAME basics_multi_curl_client_native_types_contract
   COMMAND
     "${CMAKE_COMMAND}"
       "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
-      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_curl_multi_ring_native_types.cmake"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_multi_curl_client_native_types.cmake"
 )
 
 add_test(
