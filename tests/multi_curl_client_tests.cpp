@@ -232,6 +232,11 @@ public:
    }
 };
 
+struct HttpResponse
+{
+   String informationalHeaders;
+};
+
 class HttpFixture
 {
 private:
@@ -239,6 +244,7 @@ private:
    int listener = -1;
    uint16_t boundPort = 0;
    String body;
+   String informationalHeaders;
    String expectedAuthority;
    String contentEncoding;
    uint32_t delayMilliseconds = 0;
@@ -247,74 +253,25 @@ private:
    std::atomic<bool> authorityMatched = true;
    std::thread worker;
 
-   void run(void)
+   static bool sendAll(int fd, const String& response)
    {
-      uint32_t completed = 0;
-      while (!stopping.load(std::memory_order_relaxed))
+      size_t sent = 0;
+      while (sent < response.size())
       {
-         pollfd descriptor {.fd = listener, .events = POLLIN, .revents = 0};
-         if (poll(&descriptor, 1, 25) <= 0)
+         const ssize_t count = send(fd,
+                                    response.data() + sent,
+                                    response.size() - sent,
+                                    MSG_NOSIGNAL);
+         if (count <= 0)
          {
-            continue;
+            return false;
          }
-         const int connection = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
-         if (connection < 0)
-         {
-            continue;
-         }
-         char request[4096] = {};
-         (void)recv(connection, request, sizeof(request) - 1, 0);
-         if (!expectedAuthority.empty() && std::strstr(request, expectedAuthority.c_str()) == nullptr)
-         {
-            authorityMatched.store(false, std::memory_order_relaxed);
-         }
-         if (delayMilliseconds != 0 && completed == 0)
-         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(delayMilliseconds));
-         }
-         String response;
-         response.snprintf<"HTTP/1.1 200 OK\r\nContent-Length: {itoa}\r\n"_ctv>(uint64_t(body.size()));
-         if (!contentEncoding.empty())
-         {
-            response.append("Content-Encoding: "_ctv);
-            response.append(contentEncoding);
-            response.append("\r\n"_ctv);
-         }
-         response.append("Connection: close\r\n\r\n"_ctv);
-         response.append(body);
-         size_t sent = 0;
-         while (sent < response.size())
-         {
-            const ssize_t count = send(connection,
-                                       response.data() + sent,
-                                       response.size() - sent,
-                                       MSG_NOSIGNAL);
-            if (count <= 0)
-            {
-               break;
-            }
-            sent += size_t(count);
-         }
-         close(connection);
-         if (++completed == expectedConnections)
-         {
-            return;
-         }
+         sent += size_t(count);
       }
+      return true;
    }
 
-public:
-
-   HttpFixture(const String& responseBody,
-               uint32_t delay,
-               uint32_t connections = 1,
-               const char *requiredAuthority = nullptr,
-               const char *encoding = nullptr)
-       : body(responseBody),
-         expectedAuthority(requiredAuthority ? requiredAuthority : ""),
-         contentEncoding(encoding ? encoding : ""),
-         delayMilliseconds(delay),
-         expectedConnections(connections)
+   void start(void)
    {
       listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
       if (listener < 0)
@@ -345,6 +302,81 @@ public:
       {
          run();
       });
+   }
+
+   void run(void)
+   {
+      uint32_t completed = 0;
+      while (!stopping.load(std::memory_order_relaxed))
+      {
+         pollfd descriptor {.fd = listener, .events = POLLIN, .revents = 0};
+         if (poll(&descriptor, 1, 25) <= 0)
+         {
+            continue;
+         }
+         const int connection = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
+         if (connection < 0)
+         {
+            continue;
+         }
+         char request[4096] = {};
+         (void)recv(connection, request, sizeof(request) - 1, 0);
+         if (!expectedAuthority.empty() && std::strstr(request, expectedAuthority.c_str()) == nullptr)
+         {
+            authorityMatched.store(false, std::memory_order_relaxed);
+         }
+         if (delayMilliseconds != 0 && completed == 0)
+         {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMilliseconds));
+         }
+         if (!informationalHeaders.empty())
+         {
+            String informational;
+            informational.assign("HTTP/1.1 100 Continue\r\n"_ctv);
+            informational.append(informationalHeaders);
+            informational.append("\r\n"_ctv);
+            (void)sendAll(connection, informational);
+            (void)recv(connection, request, sizeof(request), 0);
+         }
+         String response;
+         response.snprintf<"HTTP/1.1 200 OK\r\nContent-Length: {itoa}\r\n"_ctv>(uint64_t(body.size()));
+         if (!contentEncoding.empty())
+         {
+            response.append("Content-Encoding: "_ctv);
+            response.append(contentEncoding);
+            response.append("\r\n"_ctv);
+         }
+         response.append("Connection: close\r\n\r\n"_ctv);
+         response.append(body);
+         (void)sendAll(connection, response);
+         close(connection);
+         if (++completed == expectedConnections)
+         {
+            return;
+         }
+      }
+   }
+
+public:
+
+   HttpFixture(const String& responseBody,
+               uint32_t delay,
+               uint32_t connections = 1,
+               const char *requiredAuthority = nullptr,
+               const char *encoding = nullptr)
+       : body(responseBody),
+         expectedAuthority(requiredAuthority ? requiredAuthority : ""),
+         contentEncoding(encoding ? encoding : ""),
+         delayMilliseconds(delay),
+         expectedConnections(connections)
+   {
+      start();
+   }
+
+   explicit HttpFixture(HttpResponse response)
+       : informationalHeaders(std::move(response.informationalHeaders))
+   {
+      start();
    }
 
    ~HttpFixture()
@@ -400,6 +432,8 @@ struct Scenario final : RingMultiplexer
    bool compressedCapDone = false;
    bool compressedCapStatusCorrect = false;
    bool deadlineDone = false;
+   bool clearedLocationDone = false;
+   bool duplicateLocationDone = false;
    bool timedOut = false;
    bool firstCompletedWhileSecondActive = false;
    uint32_t fastCalls = 0;
@@ -500,10 +534,38 @@ struct Scenario final : RingMultiplexer
       scenario.beginShutdownIfDone();
    }
 
+   static void clearedLocationCallback(void *context,
+                                       MultiCurlClient::Ticket,
+                                       MultiCurlClient::Result&& result)
+   {
+      Scenario& scenario = *static_cast<Scenario *>(context);
+      EXPECT_EQ(*scenario.suite,
+                int(result.status),
+                int(MultiCurlClient::Status::success));
+      EXPECT_EQ(*scenario.suite, int(result.curlCode), int(CURLE_OK));
+      EXPECT_EQ(*scenario.suite, result.statusCode, 200L);
+      EXPECT_TRUE(*scenario.suite, result.location.empty());
+      scenario.clearedLocationDone = true;
+      scenario.beginShutdownIfDone();
+   }
+
+   static void duplicateLocationCallback(void *context,
+                                         MultiCurlClient::Ticket,
+                                         MultiCurlClient::Result&& result)
+   {
+      Scenario& scenario = *static_cast<Scenario *>(context);
+      EXPECT_EQ(*scenario.suite,
+                int(result.status),
+                int(MultiCurlClient::Status::invalidResponse));
+      scenario.duplicateLocationDone = true;
+      scenario.beginShutdownIfDone();
+   }
+
    void beginShutdownIfDone(void)
    {
       if (!fastDone || !slowDone || !canceledDone || !invalidHeaderDone || !invalidAuthorityDone ||
-          !capDone || !compressedCapDone || !deadlineDone)
+          !capDone || !compressedCapDone || !deadlineDone || !clearedLocationDone ||
+          !duplicateLocationDone)
       {
          return;
       }
@@ -555,6 +617,15 @@ static MultiCurlClient::Request requestFor(const HttpFixture& fixture)
    return request;
 }
 
+static MultiCurlClient::Request continueRequestFor(const HttpFixture& fixture)
+{
+   MultiCurlClient::Request request = requestFor(fixture);
+   request.method = MultiCurlClient::Method::post;
+   request.headers.push_back({"Expect", "100-continue"});
+   request.body.assign("x"_ctv);
+   return request;
+}
+
 static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
 {
    (void)setenv("HTTP_PROXY", "http://127.0.0.1:1", 1);
@@ -571,6 +642,19 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
    const String compressedBody = gzip(decompressedBody);
    HttpFixture compressedCapFixture(compressedBody, 0, 1, nullptr, "gzip");
    HttpFixture deadlineFixture("late", 400);
+   HttpResponse clearedLocationResponse;
+   clearedLocationResponse.informationalHeaders.assign("Location: /early\r\n"_ctv);
+   for (size_t index = 1; index < MultiCurlClient::maximumRequestHeaders; ++index)
+   {
+      String header;
+      header.snprintf<"X-{itoa}: value\r\n"_ctv>(uint64_t(index));
+      clearedLocationResponse.informationalHeaders.append(header);
+   }
+   HttpFixture clearedLocationFixture(std::move(clearedLocationResponse));
+   HttpResponse duplicateLocationResponse;
+   duplicateLocationResponse.informationalHeaders.assign(
+       "Location: /first\r\nLocation: /second\r\n"_ctv);
+   HttpFixture duplicateLocationFixture(std::move(duplicateLocationResponse));
    EXPECT_TRUE(suite, fast.ready());
    EXPECT_TRUE(suite, slow.ready());
    EXPECT_TRUE(suite, cancelFixture.ready());
@@ -578,8 +662,11 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
    EXPECT_TRUE(suite, compressedBody.size() < decompressedBody.size());
    EXPECT_TRUE(suite, compressedCapFixture.ready());
    EXPECT_TRUE(suite, deadlineFixture.ready());
+   EXPECT_TRUE(suite, clearedLocationFixture.ready());
+   EXPECT_TRUE(suite, duplicateLocationFixture.ready());
    if (!fast.ready() || !slow.ready() || !cancelFixture.ready() ||
-       !capFixture.ready() || !compressedCapFixture.ready() || !deadlineFixture.ready())
+       !capFixture.ready() || !compressedCapFixture.ready() || !deadlineFixture.ready() ||
+       !clearedLocationFixture.ready() || !duplicateLocationFixture.ready())
    {
       (void)unsetenv("HTTP_PROXY");
       (void)unsetenv("HTTPS_PROXY");
@@ -633,6 +720,10 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
    MultiCurlClient::Request deadline = requestFor(deadlineFixture);
    deadline.firstByteTimeout = std::chrono::milliseconds(50);
    scenario.client->submit(std::move(deadline), {&scenario, Scenario::deadlineCallback});
+   scenario.client->submit(continueRequestFor(clearedLocationFixture),
+                           {&scenario, Scenario::clearedLocationCallback});
+   scenario.client->submit(continueRequestFor(duplicateLocationFixture),
+                           {&scenario, Scenario::duplicateLocationCallback});
    scenario.guard.setTimeoutSeconds(5);
    scenario.guardArmed = true;
    Ring::queueTimeout(&scenario.guard);
@@ -648,6 +739,8 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
    EXPECT_TRUE(suite, scenario.compressedCapDone);
    EXPECT_TRUE(suite, scenario.compressedCapStatusCorrect);
    EXPECT_TRUE(suite, scenario.deadlineDone);
+   EXPECT_TRUE(suite, scenario.clearedLocationDone);
+   EXPECT_TRUE(suite, scenario.duplicateLocationDone);
    EXPECT_TRUE(suite, scenario.firstCompletedWhileSecondActive);
    EXPECT_EQ(suite, scenario.fastCalls, uint32_t(1));
    EXPECT_EQ(suite, scenario.slowCalls, uint32_t(1));

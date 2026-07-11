@@ -299,6 +299,7 @@ private:
       size_t responseHeaderCount = 0;
       size_t declaredContentLength = 0;
       bool contentLengthSeen = false;
+      bool locationSeen = false;
       bool firstByteSeen = false;
       bool headerOverflow = false;
       bool bodyOverflow = false;
@@ -529,6 +530,14 @@ private:
       const bool statusLine = bytes >= 5 && startsWithHeader(data, bytes, "http/", 5);
       const bool blankLine = (bytes == 1 && data[0] == '\n') ||
                              (bytes == 2 && data[0] == '\r' && data[1] == '\n');
+      if (statusLine)
+      {
+         transfer.responseHeaderCount = 0;
+         transfer.declaredContentLength = 0;
+         transfer.contentLengthSeen = false;
+         transfer.locationSeen = false;
+         transfer.result.location.clear();
+      }
       bool fieldLine = false;
       if (!statusLine && !blankLine)
       {
@@ -553,6 +562,12 @@ private:
 
       if (startsWithLocation(data, bytes))
       {
+         if (transfer.locationSeen)
+         {
+            transfer.invalidHeaders = true;
+            return 0;
+         }
+         transfer.locationSeen = true;
          size_t begin = 9;
          while (begin < bytes && (data[begin] == ' ' || data[begin] == '\t'))
          {
@@ -2045,7 +2060,8 @@ private:
       {
          finalStatus = Status::responseTooLarge;
       }
-      else if (transfer->invalidHeaders)
+      else if (transfer->invalidHeaders ||
+               (curlCode == CURLE_WEIRD_SERVER_REPLY && transfer->locationSeen))
       {
          finalStatus = Status::invalidResponse;
       }
