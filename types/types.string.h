@@ -1333,7 +1333,10 @@ public:
     }
 
     uint8_t diff = static_cast<uint8_t>(diffSigned);
-    memcpy(string + length + diff, buffer, bufferSize);
+    if (bufferSize > 0)
+    {
+      memcpy(string + length + diff, buffer, bufferSize);
+    }
     length += diff + bufferSize;
   }
 

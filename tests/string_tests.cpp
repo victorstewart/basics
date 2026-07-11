@@ -87,6 +87,24 @@ static void testLengthMutatorsClamp(TestSuite& suite)
   EXPECT_EQ(suite, empty.size(), uint64_t(0));
 }
 
+static void testEmptyAlignedAppendStillAlignsTail(TestSuite& suite)
+{
+  String destination;
+  EXPECT_TRUE(suite, destination.reserve(32));
+  destination.append(uint8_t(0x5a));
+
+  const String empty;
+  EXPECT_EQ(suite, empty.data(), nullptr);
+
+  uintptr_t unalignedTail = reinterpret_cast<uintptr_t>(destination.data() + destination.size());
+  uint64_t expectedPadding = (-unalignedTail) & (uint64_t(Alignment::eight) - 1);
+  destination.alignedAppend<Alignment::eight>(empty);
+
+  EXPECT_EQ(suite, destination.size(), uint64_t(1) + expectedPadding);
+  EXPECT_EQ(suite, reinterpret_cast<uintptr_t>(destination.data() + destination.size()) % uint64_t(Alignment::eight), uintptr_t(0));
+  EXPECT_EQ(suite, destination.data()[0], uint8_t(0x5a));
+}
+
 static void testNeedUsesGeometricGrowth(TestSuite& suite)
 {
   String builder;
@@ -207,6 +225,7 @@ int main()
   testSubstrClampsToBounds(suite);
   testAsRequiresEnoughBytes(suite);
   testLengthMutatorsClamp(suite);
+  testEmptyAlignedAppendStillAlignsTail(suite);
   testNeedUsesGeometricGrowth(suite);
   testCopyAssignmentReusesHeapStorage(suite);
   testFormatterNumericTokens(suite);
