@@ -1167,3 +1167,32 @@ inline AsyncDnsResolver::ResolveOperation AsyncDnsResolver::resolveAsync(
 {
    return ResolveOperation(*this, hostname, service, family, deadline, issuedTicket);
 }
+
+class AsyncDnsClient
+{
+public:
+
+   using Resolver = AsyncDnsResolver;
+   using Ticket = Resolver::Ticket;
+   using Callback = Resolver::Callback;
+   using Family = Resolver::Family;
+   using TimePoint = Resolver::TimePoint;
+
+   // The client is owner-thread-affine and must outlive every consumer. A
+   // resolve callback may run inline and is delivered exactly once. Successful
+   // cancellation delivers its canceled callback before cancel() returns.
+
+   virtual bool ready(void) const = 0;
+
+   virtual Ticket resolve(const String& hostname,
+                          const String& service,
+                          Family family,
+                          Callback callback,
+                          TimePoint deadline = TimePoint::max()) = 0;
+
+   virtual bool cancel(Ticket ticket) = 0;
+
+protected:
+
+   ~AsyncDnsClient() = default;
+};

@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <networking/async.dns.cares.h>
+#include <networking/async.dns.h>
 #include <networking/happy.eyeballs.h>
+#include <networking/multiplexer.h>
+#include <networking/socket.h>
+#include <networking/stream.h>
+#include <networking/ring.h>
 
 #include <curl/curl.h>
 #include <openssl/ssl.h>
@@ -99,10 +103,8 @@ public:
       ringDispatcherRequired,
       threadClientAlreadyExists,
       curlInitializationFailed,
-      asynchronousDnsRequired,
       sslRequired,
-      http2Required,
-      resolverInitializationFailed
+      http2Required
    };
 
    struct Ticket
@@ -179,7 +181,7 @@ public:
       std::chrono::milliseconds defaultFirstByteTimeout = std::chrono::seconds(15);
       std::chrono::milliseconds defaultIdleTimeout = std::chrono::seconds(15);
       std::chrono::milliseconds defaultOverallTimeout = std::chrono::seconds(30);
-      RingAsyncDnsResolver::BackendConfig dnsBackend;
+      LocalSocketBindSet localBinds;
    };
 
    struct Request
@@ -203,7 +205,6 @@ public:
       AsyncDnsResolver::Family family = AsyncDnsResolver::Family::any;
       AddressPolicy addressPolicy;
       OriginPolicy originPolicy;
-      LocalSocketBinds localBinds;
       std::chrono::milliseconds connectTimeout = {};
       std::chrono::milliseconds firstByteTimeout = {};
       std::chrono::milliseconds idleTimeout = {};
@@ -354,9 +355,10 @@ private:
 
    std::shared_ptr<LifetimeState> lifetimeState = std::make_shared<LifetimeState>();
    Config config;
+   LocalSocketBindPool bindPool;
+   AsyncDnsClient& resolver;
    InitializationStatus initialization = InitializationStatus::curlInitializationFailed;
    CURLM *multi = nullptr;
-   RingAsyncDnsResolver resolver;
    bytell_hash_map<uint64_t, std::unique_ptr<Transfer>> transfers;
    bytell_hash_map<CURL *, uint64_t> ticketByEasy;
    Vector<CURL *> orphanedEasyHandles;
@@ -411,6 +413,16 @@ private:
          value = 1;
       }
       return current;
+   }
+
+   static constexpr Status exhaustedBindStatus = Status::overloaded;
+   static_assert(exhaustedBindStatus == Status::overloaded);
+
+   static constexpr Status statusForBindFailure(LocalSocketBindPool::AcquireStatus status)
+   {
+      return status == LocalSocketBindPool::AcquireStatus::exhausted
+                 ? exhaustedBindStatus
+                 : Status::transportFailure;
    }
 
    Ticket issueTicket(void)
@@ -677,15 +689,29 @@ private:
       {
          return CURL_SOCKET_BAD;
       }
-      if (transfer.request.localBinds)
+      if (!transfer.owner->config.localBinds.empty())
       {
-         if (!transfer.request.localBinds.bind(fd))
+         const int socketType = address->socktype & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+         const LocalSocketBindPool::AcquireResult acquisition =
+             transfer.owner->bindPool.acquireAndBind(fd,
+                                                     &address->addr,
+                                                     address->addrlen,
+                                                     socketType);
+         if (!acquisition)
          {
+            transfer.forcedStatus = statusForBindFailure(acquisition.status);
             close(fd);
             return CURL_SOCKET_BAD;
          }
       }
       return fd;
+   }
+
+   static int closeSocketCallback(void *context, curl_socket_t fd)
+   {
+      MultiCurlClient& owner = *static_cast<MultiCurlClient *>(context);
+      owner.bindPool.release(fd);
+      return close(fd);
    }
 
    static int prerequisiteCallback(void *context,
@@ -742,30 +768,40 @@ private:
          return CURL_PREREQFUNC_ABORT;
       }
 
-      if (transfer.request.localBinds)
+      if (!transfer.owner->config.localBinds.empty())
       {
          if (localIp == nullptr || localPort <= 0 || localPort > 65535)
          {
             return CURL_PREREQFUNC_ABORT;
          }
-         const LocalSocketBinds::Endpoint *configuredBind =
-             transfer.request.localBinds.lookup(reinterpret_cast<const sockaddr *>(&peer)->sa_family);
-         if (configuredBind == nullptr)
+         sockaddr_storage local = {};
+         socklen_t localLength = 0;
+         if (reinterpret_cast<const sockaddr *>(&peer)->sa_family == AF_INET)
          {
-            return CURL_PREREQFUNC_ABORT;
+            sockaddr_in local4 = {};
+            local4.sin_family = AF_INET;
+            local4.sin_port = htons(uint16_t(localPort));
+            if (inet_pton(AF_INET, localIp, &local4.sin_addr) != 1)
+            {
+               return CURL_PREREQFUNC_ABORT;
+            }
+            std::memcpy(&local, &local4, sizeof(local4));
+            localLength = sizeof(local4);
          }
-         const sockaddr *configured = reinterpret_cast<const sockaddr *>(&configuredBind->address);
-         char expected[INET6_ADDRSTRLEN] = {};
-         const void *source = configured->sa_family == AF_INET
-                                  ? static_cast<const void *>(&reinterpret_cast<const sockaddr_in *>(
-                                        configured)->sin_addr)
-                                  : static_cast<const void *>(&reinterpret_cast<const sockaddr_in6 *>(
-                                        configured)->sin6_addr);
-         const uint16_t expectedPort = configured->sa_family == AF_INET
-                                           ? ntohs(reinterpret_cast<const sockaddr_in *>(configured)->sin_port)
-                                           : ntohs(reinterpret_cast<const sockaddr_in6 *>(configured)->sin6_port);
-         if (inet_ntop(configured->sa_family, source, expected, sizeof(expected)) == nullptr ||
-             std::strcmp(expected, localIp) != 0 || expectedPort != uint16_t(localPort))
+         else
+         {
+            sockaddr_in6 local6 = {};
+            local6.sin6_family = AF_INET6;
+            local6.sin6_port = htons(uint16_t(localPort));
+            if (inet_pton(AF_INET6, localIp, &local6.sin6_addr) != 1)
+            {
+               return CURL_PREREQFUNC_ABORT;
+            }
+            std::memcpy(&local, &local6, sizeof(local6));
+            localLength = sizeof(local6);
+         }
+         if (!transfer.owner->bindPool.containsLocal(
+                 reinterpret_cast<const sockaddr *>(&local), localLength))
          {
             return CURL_PREREQFUNC_ABORT;
          }
@@ -1072,7 +1108,7 @@ private:
    void tryFinishReset(void)
    {
       if (!resetting || !watches.empty() || !sockets.empty() || timerArmed ||
-          !stagedSocketEvents.empty())
+          !stagedSocketEvents.empty() || !bindPool.drained())
       {
          return;
       }
@@ -1153,8 +1189,13 @@ private:
       {
          return true;
       }
-      Transfer *transfer = position->second.get();
       std::shared_ptr<LifetimeState> lifetime = lifetimeState;
+      if (!resolver.ready())
+      {
+         finish(identifier, Status::dnsFailure, CURLE_COULDNT_RESOLVE_HOST);
+         return lifetime->alive;
+      }
+      Transfer *transfer = position->second.get();
       const AsyncDnsResolver::Ticket dnsTicket = resolver.resolve(transfer->connectHost,
                                                                   transfer->service,
                                                                   transfer->request.family,
@@ -1439,48 +1480,6 @@ private:
       return true;
    }
 
-   static void appendLocalBindEndpointIdentity(String& identity,
-                                               const LocalSocketBinds::Endpoint *endpoint,
-                                               sa_family_t family)
-   {
-      identity.append('\0');
-      if (endpoint == nullptr)
-      {
-         identity.append('0');
-         return;
-      }
-
-      const sockaddr *configured = reinterpret_cast<const sockaddr *>(&endpoint->address);
-      char text[INET6_ADDRSTRLEN] = {};
-      const void *source = family == AF_INET
-                               ? static_cast<const void *>(&reinterpret_cast<const sockaddr_in *>(
-                                     configured)->sin_addr)
-                               : static_cast<const void *>(&reinterpret_cast<const sockaddr_in6 *>(
-                                     configured)->sin6_addr);
-      const uint16_t port = family == AF_INET
-                                ? ntohs(reinterpret_cast<const sockaddr_in *>(configured)->sin_port)
-                                : ntohs(reinterpret_cast<const sockaddr_in6 *>(configured)->sin6_port);
-      identity.append(family == AF_INET ? '4' : '6');
-      identity.append(endpoint->freebind ? '1' : '0');
-      identity.append(':');
-      if (inet_ntop(family, source, text, sizeof(text)))
-      {
-         identity.append(text);
-      }
-      identity.append(':');
-      identity.append(String(port));
-      identity.append(':');
-      identity.append(String(family == AF_INET6
-                                 ? reinterpret_cast<const sockaddr_in6 *>(configured)->sin6_scope_id
-                                 : 0));
-   }
-
-   static void appendLocalBindsIdentity(String& identity, const LocalSocketBinds& localBinds)
-   {
-      appendLocalBindEndpointIdentity(identity, localBinds.lookup(AF_INET), AF_INET);
-      appendLocalBindEndpointIdentity(identity, localBinds.lookup(AF_INET6), AF_INET6);
-   }
-
    bool prepareEasy(Transfer& transfer)
    {
       transfer.easy = curl_easy_init();
@@ -1559,6 +1558,9 @@ private:
       code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_OPENSOCKETFUNCTION,
                                                  openSocketCallback) : code;
       code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_OPENSOCKETDATA, &transfer) : code;
+      code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_CLOSESOCKETFUNCTION,
+                                                 closeSocketCallback) : code;
+      code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_CLOSESOCKETDATA, this) : code;
       code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_PREREQFUNCTION,
                                                  prerequisiteCallback) : code;
       code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_PREREQDATA, &transfer) : code;
@@ -1723,8 +1725,7 @@ private:
             finish(ticket.identifier, Status::addressRejected, CURLE_COULDNT_CONNECT);
             return;
          }
-         if (transfer.request.localBinds &&
-             transfer.request.localBinds.lookup(address.family()) == nullptr)
+         if (!config.localBinds.empty() && config.localBinds.count(address.family()) == 0)
          {
             continue;
          }
@@ -1801,7 +1802,6 @@ private:
       connectionPins.append(transfer.request.authority.empty()
                                 ? transfer.host
                                 : transfer.request.authority);
-      appendLocalBindsIdentity(connectionPins, transfer.request.localBinds);
       const ConnectionIdentity identity {transfer.request.resolutionGeneration,
                                          transfer.request.identityGeneration,
                                          std::move(connectionPins)};
@@ -2026,7 +2026,7 @@ private:
    {
       return stopping && multi == nullptr && transfers.empty() && ticketByEasy.empty() &&
              sockets.empty() && watches.empty() && stagedSocketEvents.empty() &&
-             !timerArmed && resolver.shutdownSafe();
+             !timerArmed && bindPool.drained();
    }
 
    bool teardownSafe(void) const
@@ -2178,13 +2178,15 @@ private:
 
 public:
 
-   MultiCurlClient()
-       : MultiCurlClient(Config {})
+   explicit MultiCurlClient(AsyncDnsClient& requestedResolver)
+       : MultiCurlClient(requestedResolver, Config {})
    {}
 
-   explicit MultiCurlClient(Config requested)
+   MultiCurlClient(AsyncDnsClient& requestedResolver,
+                   Config requested)
        : config(std::move(requested)),
-         resolver({}, config.dnsBackend)
+         bindPool(config.localBinds),
+         resolver(requestedResolver)
    {
       config.transfers = std::clamp(config.transfers, size_t(1), maximumTransfers);
       config.requestBytes = std::clamp(config.requestBytes, size_t(1), maximumRequestBytes);
@@ -2231,12 +2233,7 @@ public:
          return;
       }
       const curl_version_info_data *version = curl_version_info(CURLVERSION_NOW);
-      if (version == nullptr || !(version->features & CURL_VERSION_ASYNCHDNS) || version->ares == nullptr)
-      {
-         initialization = InitializationStatus::asynchronousDnsRequired;
-         return;
-      }
-      if (!(version->features & CURL_VERSION_SSL))
+      if (version == nullptr || !(version->features & CURL_VERSION_SSL))
       {
          initialization = InitializationStatus::sslRequired;
          return;
@@ -2246,12 +2243,6 @@ public:
          initialization = InitializationStatus::http2Required;
          return;
       }
-      if (!resolver.ready())
-      {
-         initialization = InitializationStatus::resolverInitializationFailed;
-         return;
-      }
-
       if (!initializeMultiHandle())
       {
          initialization = InitializationStatus::curlInitializationFailed;
@@ -2476,7 +2467,6 @@ public:
          stopping = true;
          deferCallbacks = true;
          (void)completeAll(Status::shutdown, CURLE_ABORTED_BY_CALLBACK);
-         (void)resolver.shutdown();
 
          if (multi)
          {

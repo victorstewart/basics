@@ -3,6 +3,7 @@
 
 foreach(_basics_curl_source IN ITEMS
   networking/socket.h
+  networking/socket.bind.pool.h
   networking/multi.curl.client.h
   tests/multi_curl_client_contract_tests.cpp
   tests/multi_curl_client_tests.cpp
@@ -34,14 +35,116 @@ foreach(_basics_curl_source IN ITEMS
 endforeach()
 
 file(READ "${BASICS_SOURCE_DIR}/networking/multi.curl.client.h" _basics_multi_curl_header)
+foreach(_basics_forbidden_resolver_fragment IN ITEMS
+  "async.dns.cares.h"
+  "RingAsyncDnsResolver"
+  "dnsBackend"
+  "CURL_VERSION_ASYNCHDNS"
+  "resolver.shutdown"
+  "resolver.shutdownSafe"
+)
+  string(FIND
+    "${_basics_multi_curl_header}"
+    "${_basics_forbidden_resolver_fragment}"
+    _basics_forbidden_resolver_index
+  )
+  if (NOT _basics_forbidden_resolver_index EQUAL -1)
+    message(FATAL_ERROR "MultiCurlClient must use only the injected AsyncDnsClient, found '${_basics_forbidden_resolver_fragment}'.")
+  endif()
+endforeach()
+foreach(_basics_required_resolver_fragment IN ITEMS
+  "#include <networking/async.dns.h>"
+  "AsyncDnsClient& resolver"
+  "MultiCurlClient(AsyncDnsClient& requestedResolver"
+  "resolver(requestedResolver)"
+  "CURLOPT_RESOLVE, transfer.resolveRules"
+)
+  string(FIND
+    "${_basics_multi_curl_header}"
+    "${_basics_required_resolver_fragment}"
+    _basics_required_resolver_index
+  )
+  if (_basics_required_resolver_index EQUAL -1)
+    message(FATAL_ERROR "MultiCurlClient must preserve non-owning resolver injection; missing '${_basics_required_resolver_fragment}'.")
+  endif()
+endforeach()
+
+file(GLOB_RECURSE _basics_networking_production_sources
+  LIST_DIRECTORIES false
+  RELATIVE "${BASICS_SOURCE_DIR}"
+  "${BASICS_SOURCE_DIR}/networking/*.h"
+  "${BASICS_SOURCE_DIR}/networking/*.hh"
+  "${BASICS_SOURCE_DIR}/networking/*.hpp"
+  "${BASICS_SOURCE_DIR}/networking/*.cc"
+  "${BASICS_SOURCE_DIR}/networking/*.cpp"
+  "${BASICS_SOURCE_DIR}/networking/*.cxx"
+)
+list(SORT _basics_networking_production_sources)
+foreach(_basics_networking_source IN LISTS _basics_networking_production_sources)
+  file(READ
+    "${BASICS_SOURCE_DIR}/${_basics_networking_source}"
+    _basics_networking_contents
+  )
+  foreach(_basics_blocking_resolver IN ITEMS
+    getaddrinfo
+    getaddrinfo_a
+    freeaddrinfo
+    gethostbyaddr
+    gethostbyname
+    gethostent
+    getnameinfo
+    res_query
+    res_search
+    res_send
+  )
+    if (_basics_networking_contents MATCHES
+        "(^|[^A-Za-z0-9_])${_basics_blocking_resolver}[ \t\r\n]*\\(")
+      message(FATAL_ERROR
+        "${_basics_networking_source} owns blocking name resolution through '${_basics_blocking_resolver}'."
+      )
+    endif()
+  endforeach()
+
+  if (NOT _basics_networking_source STREQUAL "networking/async.dns.cares.h" AND
+      _basics_networking_contents MATCHES "(^|[^A-Za-z0-9_])ares_[A-Za-z0-9_]+")
+    message(FATAL_ERROR
+      "${_basics_networking_source} owns c-ares outside the explicit RingAsyncDnsResolver backend."
+    )
+  endif()
+endforeach()
+
+file(READ "${BASICS_SOURCE_DIR}/CMakeLists.txt" _basics_cmakelists)
+string(FIND
+  "${_basics_cmakelists}"
+  "bitsery::bitsery cares::cares gxhash::gxhash"
+  _basics_self_transitive_cares_index
+)
+if (NOT _basics_self_transitive_cares_index EQUAL -1)
+  message(FATAL_ERROR "CMakeLists.txt must not link c-ares transitively through basics::basics.")
+endif()
+
+file(READ
+  "${BASICS_SOURCE_DIR}/tools/generate_release_depofile.cmake"
+  _basics_release_depofile_generator
+)
+string(FIND
+  "${_basics_release_depofile_generator}"
+  "cares::cares"
+  _basics_release_transitive_cares_index
+)
+if (NOT _basics_release_transitive_cares_index EQUAL -1)
+  message(FATAL_ERROR "The release basics package must leave c-ares for explicit resolver-server linkage.")
+endif()
+
 string(FIND "${_basics_multi_curl_header}" "CURLMNWC_CLEAR_CONNS" _basics_curl_reuse_index)
 if (_basics_curl_reuse_index EQUAL -1)
   message(FATAL_ERROR "MultiCurlClient must preserve connection-identity reuse enforcement.")
 endif()
 
-file(READ "${BASICS_SOURCE_DIR}/networking/socket.h" _basics_socket_header)
+file(READ "${BASICS_SOURCE_DIR}/networking/socket.bind.pool.h" _basics_socket_header)
 foreach(_basics_required_transport_fragment IN ITEMS
-  "class LocalSocketBinds"
+  "class LocalSocketBindSet"
+  "class LocalSocketBindPool"
   "getsockname"
   "sin6_scope_id"
 )
@@ -51,7 +154,7 @@ foreach(_basics_required_transport_fragment IN ITEMS
     _basics_required_transport_index
   )
   if (_basics_required_transport_index EQUAL -1)
-    message(FATAL_ERROR "LocalSocketBinds must preserve exact endpoint enforcement; missing '${_basics_required_transport_fragment}'.")
+    message(FATAL_ERROR "Local socket bind pooling must preserve exact endpoint enforcement; missing '${_basics_required_transport_fragment}'.")
   endif()
 endforeach()
 

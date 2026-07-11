@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "tests/test_support.h"
 
+#include <networking/async.dns.cares.h>
 #include <networking/multi.curl.client.h>
 
 #include <arpa/inet.h>
@@ -701,10 +702,11 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
    Scenario scenario(suite);
    RingDispatcher::installMultiplexee(&scenario, &scenario);
    RingDispatcher::installMultiplexer(&scenario);
-   scenario.client = new MultiCurlClient();
+   RingAsyncDnsResolver resolver;
+   scenario.client = new MultiCurlClient(resolver);
    EXPECT_TRUE(suite, scenario.client->ready());
    {
-      MultiCurlClient duplicate;
+      MultiCurlClient duplicate(resolver);
       EXPECT_FALSE(suite, duplicate.ready());
       EXPECT_TRUE(suite,
                   duplicate.initializationStatus() ==
@@ -769,6 +771,8 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
    EXPECT_TRUE(suite, scenario.client->shutdownSafe());
    delete scenario.client;
    scenario.client = nullptr;
+   (void)resolver.shutdown();
+   EXPECT_TRUE(suite, resolver.shutdownSafe());
    RingDispatcher::eraseMultiplexee(&scenario);
    Ring::shutdownForExec();
    Ring::interfacer = nullptr;
@@ -867,7 +871,8 @@ static void testResetAndActiveShutdownBarriers(TestSuite& suite, bool resetMode)
    scenario.resetMode = resetMode;
    RingDispatcher::installMultiplexee(&scenario, &scenario);
    RingDispatcher::installMultiplexer(&scenario);
-   scenario.client = new MultiCurlClient();
+   RingAsyncDnsResolver resolver;
+   scenario.client = new MultiCurlClient(resolver);
    EXPECT_TRUE(suite, scenario.client->ready());
    scenario.client->submit(requestFor(delayed), {&scenario, ResetScenario::callback});
    if (resetMode)
@@ -889,6 +894,8 @@ static void testResetAndActiveShutdownBarriers(TestSuite& suite, bool resetMode)
    EXPECT_EQ(suite, scenario.calls, uint32_t(1));
    EXPECT_TRUE(suite, scenario.client->shutdownSafe());
    delete scenario.client;
+   (void)resolver.shutdown();
+   EXPECT_TRUE(suite, resolver.shutdownSafe());
    RingDispatcher::eraseMultiplexee(&scenario);
    Ring::shutdownForExec();
    Ring::interfacer = nullptr;
@@ -1008,8 +1015,10 @@ static void testQueuedPinExpiryReresolves(TestSuite& suite)
    MultiCurlClient::Config config;
    config.totalConnections = 1;
    config.hostConnections = 1;
-   config.dnsBackend.servers = dns.servers();
-   scenario.client = new MultiCurlClient(std::move(config));
+   RingAsyncDnsResolver::BackendConfig dnsConfig;
+   dnsConfig.servers = dns.servers();
+   RingAsyncDnsResolver resolver({}, std::move(dnsConfig));
+   scenario.client = new MultiCurlClient(resolver, std::move(config));
    EXPECT_TRUE(suite, scenario.client->ready());
 
    MultiCurlClient::Request request;
@@ -1035,6 +1044,8 @@ static void testQueuedPinExpiryReresolves(TestSuite& suite)
    EXPECT_TRUE(suite, dns.queryCount() >= 4);
    EXPECT_TRUE(suite, scenario.client->shutdownSafe());
    delete scenario.client;
+   (void)resolver.shutdown();
+   EXPECT_TRUE(suite, resolver.shutdownSafe());
    RingDispatcher::eraseMultiplexee(&scenario);
    Ring::shutdownForExec();
    Ring::interfacer = nullptr;
@@ -1044,23 +1055,40 @@ static void testQueuedPinExpiryReresolves(TestSuite& suite)
    RingDispatcher::dispatcher = nullptr;
 }
 
-static uint16_t reserveLoopbackSourcePort(void)
+struct ReservedSourcePorts
 {
-   const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-   if (fd < 0)
+   uint16_t first = 0;
+   uint16_t second = 0;
+};
+
+static ReservedSourcePorts reserveLoopbackSourcePorts(void)
+{
+   int descriptors[2] = {socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0),
+                         socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
+   ReservedSourcePorts result;
+   uint16_t *ports[2] = {&result.first, &result.second};
+   for (size_t index = 0; index < 2 && descriptors[index] >= 0; ++index)
    {
-      return 0;
+      const int enabled = 1;
+      (void)setsockopt(descriptors[index], SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+      sockaddr_in address = {};
+      address.sin_family = AF_INET;
+      address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      socklen_t length = sizeof(address);
+      if (bind(descriptors[index], reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 &&
+          getsockname(descriptors[index], reinterpret_cast<sockaddr *>(&address), &length) == 0)
+      {
+         *ports[index] = ntohs(address.sin_port);
+      }
    }
-   const int enabled = 1;
-   (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
-   sockaddr_in address = {};
-   address.sin_family = AF_INET;
-   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-   socklen_t length = sizeof(address);
-   const bool ready = bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 &&
-                      getsockname(fd, reinterpret_cast<sockaddr *>(&address), &length) == 0;
-   close(fd);
-   return ready ? ntohs(address.sin_port) : 0;
+   for (int fd : descriptors)
+   {
+      if (fd >= 0)
+      {
+         close(fd);
+      }
+   }
+   return result;
 }
 
 struct LocalBindsScenario final : RingMultiplexer
@@ -1073,6 +1101,8 @@ struct LocalBindsScenario final : RingMultiplexer
    bool timedOut = false;
    bool allSucceeded = true;
    uint32_t calls = 0;
+   MultiCurlClient::Status lastStatus = MultiCurlClient::Status::success;
+   CURLcode lastCurlCode = CURLE_OK;
 
    LocalBindsScenario()
    {
@@ -1085,6 +1115,8 @@ struct LocalBindsScenario final : RingMultiplexer
    {
       LocalBindsScenario& scenario = *static_cast<LocalBindsScenario *>(context);
       ++scenario.calls;
+      scenario.lastStatus = result.status;
+      scenario.lastCurlCode = result.curlCode;
       scenario.allSucceeded = scenario.allSucceeded && result.succeeded() &&
                               result.statusCode == 200 && result.body == "bound"_ctv;
       if (scenario.calls == 1)
@@ -1134,11 +1166,12 @@ static void testStructuredAuthorityAndReusableLocalBinds(TestSuite& suite)
 {
    DnsFixture dns(0, true);
    HttpFixture fixture("bound", 0, 2, "Host: service.example\r\n");
-   const uint16_t sourcePort = reserveLoopbackSourcePort();
+   const ReservedSourcePorts sourcePorts = reserveLoopbackSourcePorts();
    EXPECT_TRUE(suite, dns.ready());
    EXPECT_TRUE(suite, fixture.ready());
-   EXPECT_TRUE(suite, sourcePort != 0);
-   if (!dns.ready() || !fixture.ready() || sourcePort == 0)
+   EXPECT_TRUE(suite, sourcePorts.first != 0 && sourcePorts.second != 0 &&
+                      sourcePorts.first != sourcePorts.second);
+   if (!dns.ready() || !fixture.ready() || sourcePorts.first == 0 || sourcePorts.second == 0)
    {
       return;
    }
@@ -1157,14 +1190,21 @@ static void testStructuredAuthorityAndReusableLocalBinds(TestSuite& suite)
    MultiCurlClient::Config config;
    config.totalConnections = 1;
    config.hostConnections = 1;
-   config.dnsBackend.servers = dns.servers();
-   scenario.client = new MultiCurlClient(config);
-   EXPECT_TRUE(suite, scenario.client->ready());
-
    sockaddr_in local = {};
    local.sin_family = AF_INET;
-   local.sin_port = htons(sourcePort);
+   local.sin_port = htons(sourcePorts.first);
    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   EXPECT_TRUE(suite,
+               config.localBinds.add(reinterpret_cast<const sockaddr *>(&local), sizeof(local)));
+   local.sin_port = htons(sourcePorts.second);
+   EXPECT_TRUE(suite,
+               config.localBinds.add(reinterpret_cast<const sockaddr *>(&local), sizeof(local)));
+   RingAsyncDnsResolver::BackendConfig dnsConfig;
+   dnsConfig.servers = dns.servers();
+   RingAsyncDnsResolver resolver({}, std::move(dnsConfig));
+   scenario.client = new MultiCurlClient(resolver, config);
+   EXPECT_TRUE(suite, scenario.client->ready());
+
    MultiCurlClient::Request request;
    request.url.snprintf<"http://dual-bind.test:{itoa}/"_ctv>(uint64_t(fixture.port()));
    request.requireTls = false;
@@ -1172,15 +1212,6 @@ static void testStructuredAuthorityAndReusableLocalBinds(TestSuite& suite)
    request.responseBytes = 1024;
    request.overallDeadline = MultiCurlClient::Clock::now() + std::chrono::seconds(3);
    request.authority = "service.example";
-   EXPECT_TRUE(suite,
-               request.localBinds.set(reinterpret_cast<const sockaddr *>(&local), sizeof(local)));
-   sockaddr_in6 unusedLocal6 = {};
-   unusedLocal6.sin6_family = AF_INET6;
-   unusedLocal6.sin6_port = htons(sourcePort);
-   unusedLocal6.sin6_addr = in6addr_loopback;
-   EXPECT_TRUE(suite,
-               request.localBinds.set(reinterpret_cast<const sockaddr *>(&unusedLocal6),
-                                      sizeof(unusedLocal6)));
    scenario.secondRequest = request;
    scenario.client->submit(std::move(request), {&scenario, LocalBindsScenario::callback});
    scenario.guard.setTimeoutSeconds(5);
@@ -1190,11 +1221,15 @@ static void testStructuredAuthorityAndReusableLocalBinds(TestSuite& suite)
 
    EXPECT_FALSE(suite, scenario.timedOut);
    EXPECT_TRUE(suite, scenario.allSucceeded);
+   EXPECT_EQ(suite, int(scenario.lastStatus), int(MultiCurlClient::Status::success));
+   EXPECT_EQ(suite, int(scenario.lastCurlCode), int(CURLE_OK));
    EXPECT_EQ(suite, scenario.calls, uint32_t(2));
    EXPECT_TRUE(suite, fixture.sawExpectedAuthority());
    EXPECT_TRUE(suite, dns.queryCount() >= 2 && dns.queryCount() % 2 == 0);
    EXPECT_TRUE(suite, scenario.client->shutdownSafe());
    delete scenario.client;
+   (void)resolver.shutdown();
+   EXPECT_TRUE(suite, resolver.shutdownSafe());
    RingDispatcher::eraseMultiplexee(&scenario);
    Ring::shutdownForExec();
    Ring::interfacer = nullptr;

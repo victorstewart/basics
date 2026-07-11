@@ -284,21 +284,38 @@ public:
    }
 };
 
-static uint16_t reserveLoopbackUdpPort(void)
+struct ReservedUdpPorts
 {
-   const int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-   if (fd < 0)
+   uint16_t first = 0;
+   uint16_t second = 0;
+};
+
+static ReservedUdpPorts reserveLoopbackUdpPorts(void)
+{
+   int descriptors[2] = {socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0),
+                         socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+   ReservedUdpPorts result;
+   uint16_t *ports[2] = {&result.first, &result.second};
+   for (size_t index = 0; index < 2 && descriptors[index] >= 0; ++index)
    {
-      return 0;
+      sockaddr_in address = {};
+      address.sin_family = AF_INET;
+      address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      socklen_t length = sizeof(address);
+      if (bind(descriptors[index], reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 &&
+          getsockname(descriptors[index], reinterpret_cast<sockaddr *>(&address), &length) == 0)
+      {
+         *ports[index] = ntohs(address.sin_port);
+      }
    }
-   sockaddr_in address = {};
-   address.sin_family = AF_INET;
-   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-   socklen_t length = sizeof(address);
-   const bool ready = bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 &&
-                      getsockname(fd, reinterpret_cast<sockaddr *>(&address), &length) == 0;
-   close(fd);
-   return ready ? ntohs(address.sin_port) : 0;
+   for (int fd : descriptors)
+   {
+      if (fd >= 0)
+      {
+         close(fd);
+      }
+   }
+   return result;
 }
 
 static bool ringSupported(void)
@@ -429,15 +446,22 @@ static void runScenario(TestSuite& suite,
    Resolver::BackendConfig backend;
    backend.servers = fixture.servers();
    backend.udpMaximumQueries = 1;
+   const ReservedUdpPorts ports = reserveLoopbackUdpPorts();
    sockaddr_in local = {};
    local.sin_family = AF_INET;
-   local.sin_port = htons(reserveLoopbackUdpPort());
+   local.sin_port = htons(ports.first);
    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-   EXPECT_TRUE(suite, local.sin_port != 0);
+   sockaddr_in alternate = local;
+   alternate.sin_port = htons(ports.second);
+   EXPECT_TRUE(suite, ports.first != 0 && ports.second != 0 && ports.first != ports.second);
    EXPECT_TRUE(suite,
-               backend.udpBinds.set(reinterpret_cast<const sockaddr *>(&local), sizeof(local)));
+               backend.udpBinds.add(reinterpret_cast<const sockaddr *>(&local), sizeof(local)));
    EXPECT_TRUE(suite,
-               backend.tcpBinds.set(reinterpret_cast<const sockaddr *>(&local), sizeof(local)));
+               backend.tcpBinds.add(reinterpret_cast<const sockaddr *>(&local), sizeof(local)));
+   EXPECT_TRUE(suite,
+               backend.udpBinds.add(reinterpret_cast<const sockaddr *>(&alternate), sizeof(alternate)));
+   EXPECT_TRUE(suite,
+               backend.tcpBinds.add(reinterpret_cast<const sockaddr *>(&alternate), sizeof(alternate)));
    {
       Resolver resolver({}, backend);
       monitor.resolver = &resolver;
@@ -457,7 +481,7 @@ static void runScenario(TestSuite& suite,
    Ring::shuttingDown = false;
    RingDispatcher::dispatcher = nullptr;
    EXPECT_FALSE(suite, monitor.timedOut);
-   EXPECT_EQ(suite, fixture.sourcePort(), ntohs(local.sin_port));
+   EXPECT_TRUE(suite, fixture.sourcePort() == ports.first || fixture.sourcePort() == ports.second);
 }
 
 struct ReloadContext {

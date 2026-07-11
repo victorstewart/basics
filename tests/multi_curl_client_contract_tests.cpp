@@ -48,19 +48,20 @@ int main()
    local6.sin6_family = AF_INET6;
    local6.sin6_port = htons(43124);
    local6.sin6_addr = in6addr_loopback;
+   MultiCurlClient::Config config;
    EXPECT_TRUE(suite,
-               request.localBinds.set(reinterpret_cast<const sockaddr *>(&local4),
-                                      sizeof(local4),
-                                      true));
+               config.localBinds.add(reinterpret_cast<const sockaddr *>(&local4),
+                                     sizeof(local4),
+                                     true));
    EXPECT_TRUE(suite,
-               request.localBinds.set(reinterpret_cast<const sockaddr *>(&local6), sizeof(local6)));
-   const LocalSocketBinds::Endpoint *bound4 = request.localBinds.lookup(AF_INET);
-   const LocalSocketBinds::Endpoint *bound6 = request.localBinds.lookup(AF_INET6);
+               config.localBinds.add(reinterpret_cast<const sockaddr *>(&local6), sizeof(local6)));
+   const LocalSocketBindSet::Endpoint *bound4 = config.localBinds.at(AF_INET, 0);
+   const LocalSocketBindSet::Endpoint *bound6 = config.localBinds.at(AF_INET6, 0);
    EXPECT_TRUE(suite, bound4 != nullptr && bound4->freebind);
    EXPECT_TRUE(suite, bound6 != nullptr && !bound6->freebind);
-   EXPECT_TRUE(suite, request.localBinds.lookup(AF_UNSPEC) == nullptr);
+   EXPECT_TRUE(suite, config.localBinds.at(AF_UNSPEC, 0) == nullptr);
    EXPECT_TRUE(suite,
-               request.localBinds.set(reinterpret_cast<const sockaddr *>(&local4),
-                                      sizeof(local4) - 1) == false);
+               !config.localBinds.add(reinterpret_cast<const sockaddr *>(&local4),
+                                      sizeof(local4) - 1));
    return suite.finish("MultiCurlClient contract");
 }

@@ -66,7 +66,7 @@ public:
 // RingAsyncDnsResolver is deliberately both the coordinator owner and the
 // c-ares adapter. Keeping the coordinator private makes every request,
 // cancellation, and waiter-deadline change refresh the one Ring timer.
-class RingAsyncDnsResolver final : private RingInterface {
+class RingAsyncDnsResolver final : public AsyncDnsClient, private RingInterface {
 public:
 
    using Resolver = AsyncDnsResolver;
@@ -86,8 +86,9 @@ public:
       int maximumTimeoutMilliseconds = 2000;
       int udpMaximumQueries = 0;
       String servers;
-      LocalSocketBinds udpBinds;
-      LocalSocketBinds tcpBinds;
+      LocalSocketBindSet udpBinds;
+      LocalSocketBindSet tcpBinds;
+      bool stayOpen = false;
    };
 
    enum class InitializationStatus : uint8_t {
@@ -144,6 +145,8 @@ private:
 
    std::shared_ptr<LifetimeState> lifetimeState = std::make_shared<LifetimeState>();
    BackendConfig backendConfig;
+   LocalSocketBindPool udpBindPool;
+   LocalSocketBindPool tcpBindPool;
    InitializationStatus initialization = InitializationStatus::channelInitializationFailed;
    ares_channel_t *channel = nullptr;
    bytell_hash_map<uint64_t, std::unique_ptr<Query>> queries;
@@ -192,14 +195,152 @@ private:
       owner->refreshTimer();
    }
 
-   static int configureSocket(ares_socket_t fd, int type, void *context)
+   static ares_socket_t openSocket(int domain, int type, int protocol, void *context)
    {
       RingAsyncDnsResolver& owner = *static_cast<RingAsyncDnsResolver *>(context);
       owner.requireOwnerThread();
-      const LocalSocketBinds *binds = type == SOCK_DGRAM
-                                         ? &owner.backendConfig.udpBinds
-                                         : type == SOCK_STREAM ? &owner.backendConfig.tcpBinds : nullptr;
-      return binds && binds->bind(fd) ? 0 : -1;
+      const int fd = socket(domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol);
+      if (fd < 0)
+      {
+         return ARES_SOCKET_BAD;
+      }
+      if (type == SOCK_STREAM)
+      {
+         const int enabled = 1;
+         if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0)
+         {
+            close(fd);
+            return ARES_SOCKET_BAD;
+         }
+      }
+      return fd;
+   }
+
+   static int closeSocket(ares_socket_t fd, void *context)
+   {
+      RingAsyncDnsResolver& owner = *static_cast<RingAsyncDnsResolver *>(context);
+      owner.requireOwnerThread();
+      owner.udpBindPool.release(fd);
+      owner.tcpBindPool.release(fd);
+      return close(fd);
+   }
+
+   static int setSocketOption(ares_socket_t fd,
+                              ares_socket_opt_t option,
+                              const void *value,
+                              ares_socklen_t length,
+                              void *)
+   {
+      switch (option)
+      {
+         case ARES_SOCKET_OPT_SENDBUF_SIZE:
+         case ARES_SOCKET_OPT_RECVBUF_SIZE:
+            if (length != sizeof(int))
+            {
+               errno = EINVAL;
+               return -1;
+            }
+            return setsockopt(fd,
+                              SOL_SOCKET,
+                              option == ARES_SOCKET_OPT_SENDBUF_SIZE ? SO_SNDBUF : SO_RCVBUF,
+                              value,
+                              length);
+         case ARES_SOCKET_OPT_BIND_DEVICE:
+#ifdef SO_BINDTODEVICE
+            return setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, value, length);
+#else
+            errno = ENOSYS;
+            return -1;
+#endif
+         case ARES_SOCKET_OPT_TCP_FASTOPEN:
+#ifdef TCP_FASTOPEN_CONNECT
+         {
+            if (length != sizeof(ares_bool_t))
+            {
+               errno = EINVAL;
+               return -1;
+            }
+            const int enabled = *static_cast<const ares_bool_t *>(value) != ARES_FALSE;
+            return setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &enabled, sizeof(enabled));
+         }
+#else
+            errno = ENOSYS;
+            return -1;
+#endif
+      }
+      errno = ENOSYS;
+      return -1;
+   }
+
+   static int connectSocket(ares_socket_t fd,
+                            const sockaddr *address,
+                            ares_socklen_t length,
+                            unsigned int,
+                            void *context)
+   {
+      RingAsyncDnsResolver& owner = *static_cast<RingAsyncDnsResolver *>(context);
+      owner.requireOwnerThread();
+      int type = 0;
+      socklen_t typeLength = sizeof(type);
+      if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &typeLength) != 0)
+      {
+         return -1;
+      }
+      LocalSocketBindPool *pool = type == SOCK_DGRAM
+                                      ? &owner.udpBindPool
+                                      : type == SOCK_STREAM ? &owner.tcpBindPool : nullptr;
+      const LocalSocketBindSet *binds = type == SOCK_DGRAM
+                                            ? &owner.backendConfig.udpBinds
+                                            : type == SOCK_STREAM ? &owner.backendConfig.tcpBinds : nullptr;
+      if (pool == nullptr)
+      {
+         errno = EPROTOTYPE;
+         return -1;
+      }
+      if (!binds->empty() && !pool->acquireAndBind(fd, address, length, type))
+      {
+         return -1;
+      }
+      const int result = connect(fd, address, length);
+      const int error = errno;
+      if (result != 0 && error != EINPROGRESS && error != EALREADY && error != EWOULDBLOCK)
+      {
+         pool->release(fd);
+      }
+      errno = error;
+      return result;
+   }
+
+   static ares_ssize_t receiveSocket(ares_socket_t fd,
+                                     void *buffer,
+                                     size_t length,
+                                     int flags,
+                                     sockaddr *address,
+                                     ares_socklen_t *addressLength,
+                                     void *)
+   {
+      return recvfrom(fd, buffer, length, flags, address, addressLength);
+   }
+
+   static ares_ssize_t sendSocket(ares_socket_t fd,
+                                  const void *buffer,
+                                  size_t length,
+                                  int flags,
+                                  const sockaddr *address,
+                                  ares_socklen_t addressLength,
+                                  void *)
+   {
+      return address
+                 ? sendto(fd, buffer, length, flags, address, addressLength)
+                 : send(fd, buffer, length, flags);
+   }
+
+   static int socketName(ares_socket_t fd,
+                         sockaddr *address,
+                         ares_socklen_t *addressLength,
+                         void *)
+   {
+      return getsockname(fd, address, addressLength);
    }
 
    static Resolver::Status statusFromAres(int status, bool shuttingDown)
@@ -611,7 +752,9 @@ private:
              socketMasks.empty() &&
              stagedSocketStates.empty() &&
              !timerArmed &&
-             stagedCompletions.empty();
+             stagedCompletions.empty() &&
+             udpBindPool.drained() &&
+             tcpBindPool.drained();
    }
 
    void retireDispatcherIfSafe(void)
@@ -711,6 +854,8 @@ public:
 
    RingAsyncDnsResolver(Resolver::Config resolverConfig, BackendConfig requestedBackend)
        : backendConfig(std::move(requestedBackend)),
+         udpBindPool(backendConfig.udpBinds),
+         tcpBindPool(backendConfig.tcpBinds),
          coordinator(resolverConfig,
                      Resolver::Backend {.context = this, .start = startBackend},
                      Resolver::TimeSource {},
@@ -750,7 +895,8 @@ public:
       }
 
       ares_options options = {};
-      options.flags = ARES_FLAG_NOSEARCH | ARES_FLAG_NOALIASES;
+      options.flags = ARES_FLAG_NOSEARCH | ARES_FLAG_NOALIASES |
+                      (backendConfig.stayOpen ? ARES_FLAG_STAYOPEN : 0);
       options.timeout = std::clamp(backendConfig.timeoutMilliseconds, 1, maximumConfiguredTimeoutMilliseconds);
       options.tries = std::clamp(backendConfig.tries, 1, maximumConfiguredTries);
       options.maxtimeout = std::clamp(backendConfig.maximumTimeoutMilliseconds,
@@ -787,7 +933,23 @@ public:
          initialization = InitializationStatus::invalidServers;
          return;
       }
-      ares_set_socket_configure_callback(channel, configureSocket, this);
+      ares_socket_functions_ex socketFunctions = {};
+      socketFunctions.version = 1;
+      socketFunctions.flags = ARES_SOCKFUNC_FLAG_NONBLOCKING;
+      socketFunctions.asocket = openSocket;
+      socketFunctions.aclose = closeSocket;
+      socketFunctions.asetsockopt = setSocketOption;
+      socketFunctions.aconnect = connectSocket;
+      socketFunctions.arecvfrom = receiveSocket;
+      socketFunctions.asendto = sendSocket;
+      socketFunctions.agetsockname = socketName;
+      if (ares_set_socket_functions_ex(channel, &socketFunctions, this) != ARES_SUCCESS)
+      {
+         ares_destroy(channel);
+         channel = nullptr;
+         initialization = InitializationStatus::channelInitializationFailed;
+         return;
+      }
 
       threadOwner = this;
       RingDispatcher::installMultiplexee(this, this);
@@ -810,7 +972,7 @@ public:
    RingAsyncDnsResolver(const RingAsyncDnsResolver&) = delete;
    RingAsyncDnsResolver& operator=(const RingAsyncDnsResolver&) = delete;
 
-   bool ready(void) const
+   bool ready(void) const override
    {
       requireOwnerThread();
       return initialization == InitializationStatus::ready && !stopping;
@@ -826,13 +988,13 @@ public:
                   const String& service,
                   Family family,
                   Callback callback,
-                  TimePoint deadline = TimePoint::max())
+                  TimePoint deadline = TimePoint::max()) override
    {
       requireOwnerThread();
       return coordinator.resolve(hostname, service, family, callback, deadline);
    }
 
-   bool cancel(Ticket ticket)
+   bool cancel(Ticket ticket) override
    {
       requireOwnerThread();
       return coordinator.cancel(ticket);

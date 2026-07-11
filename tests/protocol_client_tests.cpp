@@ -2363,7 +2363,34 @@ static MultiCurlClient::Result runCurlTlsRequest(TestSuite& suite,
   CurlTlsScenario scenario;
   RingDispatcher::installMultiplexee(&scenario, &scenario);
   RingDispatcher::installMultiplexer(&scenario);
-  scenario.client = new MultiCurlClient();
+  class NumericDnsClient final : public AsyncDnsClient
+  {
+  private:
+
+    AsyncDnsResolver resolver;
+
+  public:
+
+    bool ready(void) const override
+    {
+      return !resolver.isShutdown();
+    }
+
+    Ticket resolve(const String& hostname,
+                   const String& service,
+                   Family family,
+                   Callback callback,
+                   TimePoint deadline = TimePoint::max()) override
+    {
+      return resolver.resolve(hostname, service, family, callback, deadline);
+    }
+
+    bool cancel(Ticket ticket) override
+    {
+      return resolver.cancel(ticket);
+    }
+  } dns;
+  scenario.client = new MultiCurlClient(dns);
   EXPECT_TRUE(suite, scenario.client->ready());
   scenario.guard.setTimeoutSeconds(5);
   scenario.guardArmed = true;
