@@ -39,6 +39,8 @@ int main()
                                                     "127.0.0.1"_ctv));
    EXPECT_TRUE(suite, request.httpPolicy == MultiCurlClient::HttpPolicy::preferHttp2);
    EXPECT_TRUE(suite, request.tlsMinimum == MultiCurlClient::TlsMinimum::tls12);
+   request.method = MultiCurlClient::Method::patch;
+   EXPECT_TRUE(suite, request.method == MultiCurlClient::Method::patch);
 
    sockaddr_in local4 = {};
    local4.sin_family = AF_INET;

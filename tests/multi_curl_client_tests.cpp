@@ -263,11 +263,13 @@ private:
    String body;
    String informationalHeaders;
    String expectedAuthority;
+   String expectedMethod;
    String contentEncoding;
    uint32_t delayMilliseconds = 0;
    uint32_t expectedConnections = 1;
    std::atomic<bool> stopping = false;
    std::atomic<bool> authorityMatched = true;
+   std::atomic<bool> methodMatched = true;
    std::thread worker;
 
    static bool sendAll(int fd, const String& response)
@@ -342,6 +344,11 @@ private:
          {
             authorityMatched.store(false, std::memory_order_relaxed);
          }
+         if (!expectedMethod.empty() &&
+             std::strncmp(request, expectedMethod.c_str(), expectedMethod.size()) != 0)
+         {
+            methodMatched.store(false, std::memory_order_relaxed);
+         }
          if (delayMilliseconds != 0 && completed == 0)
          {
             std::this_thread::sleep_for(std::chrono::milliseconds(delayMilliseconds));
@@ -380,9 +387,11 @@ public:
                uint32_t delay,
                uint32_t connections = 1,
                const char *requiredAuthority = nullptr,
-               const char *encoding = nullptr)
+               const char *encoding = nullptr,
+               const char *requiredMethod = nullptr)
        : body(responseBody),
          expectedAuthority(requiredAuthority ? requiredAuthority : ""),
+         expectedMethod(requiredMethod ? requiredMethod : ""),
          contentEncoding(encoding ? encoding : ""),
          delayMilliseconds(delay),
          expectedConnections(connections)
@@ -431,6 +440,12 @@ public:
    {
       return authorityMatched.load(std::memory_order_relaxed);
    }
+
+   bool sawExpectedMethod(void) const
+   {
+      return methodMatched.load(std::memory_order_relaxed);
+   }
+
 };
 
 struct Scenario final : RingMultiplexer
@@ -648,7 +663,7 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
    (void)setenv("HTTP_PROXY", "http://127.0.0.1:1", 1);
    (void)setenv("HTTPS_PROXY", "http://127.0.0.1:1", 1);
    (void)setenv("ALL_PROXY", "http://127.0.0.1:1", 1);
-   HttpFixture fast("fast", 0);
+   HttpFixture fast("fast", 0, 1, nullptr, nullptr, "PATCH");
    HttpFixture slow("slow", 150);
    HttpFixture cancelFixture("cancel", 1000);
    HttpFixture capFixture("response exceeds cap", 0);
@@ -727,7 +742,9 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
    EXPECT_TRUE(suite, scenario.client->cancel(canceledTicket));
 
    scenario.client->submit(requestFor(slow), {&scenario, Scenario::slowCallback});
-   scenario.client->submit(requestFor(fast), {&scenario, Scenario::fastCallback});
+   MultiCurlClient::Request patch = requestFor(fast);
+   patch.method = MultiCurlClient::Method::patch;
+   scenario.client->submit(std::move(patch), {&scenario, Scenario::fastCallback});
    MultiCurlClient::Request capped = requestFor(capFixture);
    capped.responseBytes = 4;
    scenario.client->submit(std::move(capped), {&scenario, Scenario::capCallback});
@@ -760,6 +777,7 @@ static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
    EXPECT_TRUE(suite, scenario.clearedLocationDone);
    EXPECT_TRUE(suite, scenario.duplicateLocationDone);
    EXPECT_TRUE(suite, scenario.firstCompletedWhileSecondActive);
+   EXPECT_TRUE(suite, fast.sawExpectedMethod());
    EXPECT_EQ(suite, scenario.fastCalls, uint32_t(1));
    EXPECT_EQ(suite, scenario.slowCalls, uint32_t(1));
    EXPECT_EQ(suite, scenario.canceledCalls, uint32_t(1));

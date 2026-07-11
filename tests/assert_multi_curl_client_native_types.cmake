@@ -113,6 +113,23 @@ foreach(_basics_networking_source IN LISTS _basics_networking_production_sources
   endif()
 endforeach()
 
+file(READ "${BASICS_SOURCE_DIR}/depofiles/libcurl.DepoFile" _basics_libcurl_depofile)
+foreach(_basics_forbidden_libcurl_source_patch IN ITEMS
+  "patch -p"
+  "CURL_PATCH"
+  "--- a/lib/"
+)
+  string(FIND
+    "${_basics_libcurl_depofile}"
+    "${_basics_forbidden_libcurl_source_patch}"
+    _basics_forbidden_libcurl_source_patch_index
+  )
+  if (NOT _basics_forbidden_libcurl_source_patch_index EQUAL -1)
+    message(FATAL_ERROR
+      "The generic Basics libcurl recipe must not patch third-party source; found '${_basics_forbidden_libcurl_source_patch}'."
+    )
+  endif()
+endforeach()
 file(READ "${BASICS_SOURCE_DIR}/CMakeLists.txt" _basics_cmakelists)
 string(FIND
   "${_basics_cmakelists}"
@@ -140,6 +157,22 @@ string(FIND "${_basics_multi_curl_header}" "CURLMNWC_CLEAR_CONNS" _basics_curl_r
 if (_basics_curl_reuse_index EQUAL -1)
   message(FATAL_ERROR "MultiCurlClient must preserve connection-identity reuse enforcement.")
 endif()
+
+foreach(_basics_required_http_method_fragment IN ITEMS
+  "case Method::patch:"
+  "CURLOPT_CUSTOMREQUEST, \"PATCH\""
+)
+  string(FIND
+    "${_basics_multi_curl_header}"
+    "${_basics_required_http_method_fragment}"
+    _basics_required_http_method_index
+  )
+  if (_basics_required_http_method_index EQUAL -1)
+    message(FATAL_ERROR
+      "MultiCurlClient is missing generic HTTP method support '${_basics_required_http_method_fragment}'."
+    )
+  endif()
+endforeach()
 
 file(READ "${BASICS_SOURCE_DIR}/networking/socket.bind.pool.h" _basics_socket_header)
 foreach(_basics_required_transport_fragment IN ITEMS

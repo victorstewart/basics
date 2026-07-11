@@ -73,6 +73,7 @@ public:
       head,
       post,
       put,
+      patch,
       delete_
    };
 
@@ -1450,7 +1451,8 @@ private:
       for (char character : header.value)
       {
          const unsigned char byte = static_cast<unsigned char>(character);
-         if (byte == '\r' || byte == '\n' || byte == 0 || (byte < 0x20 && byte != '\t') || byte == 0x7f)
+         if (byte == '\r' || byte == '\n' || byte == 0 ||
+             (byte < 0x20 && byte != '\t') || byte == 0x7f)
          {
             return false;
          }
@@ -1672,6 +1674,9 @@ private:
             break;
          case Method::put:
             code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_CUSTOMREQUEST, "PUT") : code;
+            break;
+         case Method::patch:
+            code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_CUSTOMREQUEST, "PATCH") : code;
             break;
          case Method::delete_:
             code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_CUSTOMREQUEST, "DELETE") : code;
@@ -2309,16 +2314,33 @@ public:
          }
          return ticket;
       }
-      size_t snapshotBytes = request.url.size() + request.resolveHost.size() + request.authority.size() +
-                             request.body.size() +
-                             request.originPolicy.requiredScheme.size() +
-                             request.originPolicy.requiredHost.size() +
-                             request.originPolicy.requiredAuthority.size() +
-                             request.originPolicy.requiredService.size() +
-                             request.originPolicy.requiredResolveHost.size() +
-                             request.caFile.size() + request.caPath.size() + request.caBlob.size() +
-                             request.clientCertificateFile.size() + request.clientKeyFile.size() +
-                             request.clientCertificateBlob.size() + request.clientKeyBlob.size();
+      const size_t fieldBytes[] = {
+          request.url.size(),
+          request.resolveHost.size(),
+          request.authority.size(),
+          request.body.size(),
+          request.originPolicy.requiredScheme.size(),
+          request.originPolicy.requiredHost.size(),
+          request.originPolicy.requiredAuthority.size(),
+          request.originPolicy.requiredService.size(),
+          request.originPolicy.requiredResolveHost.size(),
+          request.caFile.size(),
+          request.caPath.size(),
+          request.caBlob.size(),
+          request.clientCertificateFile.size(),
+          request.clientKeyFile.size(),
+          request.clientCertificateBlob.size(),
+          request.clientKeyBlob.size()};
+      size_t snapshotBytes = 0;
+      for (size_t bytes : fieldBytes)
+      {
+         if (bytes > std::numeric_limits<size_t>::max() - snapshotBytes)
+         {
+            snapshotBytes = std::numeric_limits<size_t>::max();
+            break;
+         }
+         snapshotBytes += bytes;
+      }
       for (const Header& header : request.headers)
       {
          const size_t headerBytes = header.name.size() + header.value.size();
