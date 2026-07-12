@@ -25,8 +25,6 @@ string(FIND "${_basics_package_depofile}" "DEPENDS libssh2 VERSION 1.11.1" _basi
 string(FIND "${_basics_package_depofile}" "libssh2::libssh2" _basics_libssh2_link_index)
 string(FIND "${_basics_package_depofile}" "DEPENDS liburing VERSION 2.14" _basics_liburing_depends_index)
 string(FIND "${_basics_package_depofile}" "liburing::liburing::" _basics_liburing_link_index)
-string(FIND "${_basics_package_depofile}" "DEPENDS nghttp2 VERSION 1.69.0" _basics_nghttp2_depends_index)
-string(FIND "${_basics_package_depofile}" "nghttp2::nghttp2" _basics_nghttp2_link_index)
 
 foreach(_basics_forbidden_surface_token IN ITEMS
   "DEPENDS libbpf" "DEPENDS simdjson" "DEPENDS zlib"
@@ -68,13 +66,6 @@ endif()
 if (_basics_liburing_link_index EQUAL -1)
   message(FATAL_ERROR "Generated basics package depofile must link liburing because networking/ring.h calls it.")
 endif()
-if (_basics_nghttp2_depends_index EQUAL -1)
-  message(FATAL_ERROR "Generated basics package depofile must depend on nghttp2 because networking/h2nb.client.h includes it.")
-endif()
-if (_basics_nghttp2_link_index EQUAL -1)
-  message(FATAL_ERROR "Generated basics package depofile must link nghttp2::nghttp2 because networking/h2nb.client.h calls it.")
-endif()
-
 if (EXPECT_TIDESDB)
   if (_basics_tidesdb_depends_index EQUAL -1)
     message(FATAL_ERROR "Expected generated basics package depofile to depend on tidesdb.")

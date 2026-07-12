@@ -3,7 +3,7 @@
 
 cmake_minimum_required(VERSION 3.21)
 
-project(basics VERSION 0.3.1 LANGUAGES CXX)
+project(basics VERSION 0.4.0 LANGUAGES CXX)
 
 include(CTest)
 include("${CMAKE_CURRENT_SOURCE_DIR}/.depos.cmake")
@@ -75,7 +75,7 @@ function(_basics_prepare_self_depofile out_var)
     message(FATAL_ERROR "Unsupported BASICS_DEPENDENCY_LINK_MODE='${BASICS_DEPENDENCY_LINK_MODE}'. Expected STATIC or SHARED.")
   endif()
 
-  set(BASICS_SELF_DIRECT_DEPENDENCY_LINKS "SG14::SG14 aegis::aegis bitsery::bitsery gxhash::gxhash itoa::itoa libcurl::libcurl libssh2::libssh2 ${BASICS_SELF_LIBURING_LINK} nghttp2::nghttp2 openssl static_type_info::static_type_info${BASICS_SELF_TIDESDB_LINK}")
+  set(BASICS_SELF_DIRECT_DEPENDENCY_LINKS "SG14::SG14 aegis::aegis bitsery::bitsery gxhash::gxhash itoa::itoa libcurl::libcurl libssh2::libssh2 ${BASICS_SELF_LIBURING_LINK} openssl static_type_info::static_type_info${BASICS_SELF_TIDESDB_LINK}")
 
   set(_basics_self_root "${CMAKE_BINARY_DIR}/.deps/basics-self")
   set(_basics_source_root "${_basics_self_root}/source")
@@ -283,6 +283,8 @@ _basics_add_test_executable(basics_netlink_tests tests/netlink_tests.cpp)
 _basics_add_test_executable(basics_networking_primitives_tests tests/networking_primitives_tests.cpp)
 _basics_add_test_executable(basics_networking_support_structures_tests tests/networking_support_structures_tests.cpp)
 _basics_add_test_executable(basics_protocol_client_tests tests/protocol_client_tests.cpp)
+depos_link(basics_protocol_client_tests__objects PRIVATE nghttp2::nghttp2)
+depos_link(basics_protocol_client_tests PRIVATE nghttp2::nghttp2)
 _basics_add_test_executable(basics_ring_integration_tests tests/ring_integration_tests.cpp)
 _basics_add_test_executable(basics_stream_tests tests/stream_tests.cpp)
 _basics_add_test_executable(basics_tls_tests tests/tls_tests.cpp)

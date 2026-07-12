@@ -152,6 +152,14 @@ string(FIND
 if (NOT _basics_release_transitive_cares_index EQUAL -1)
   message(FATAL_ERROR "The release basics package must leave c-ares for explicit resolver-server linkage.")
 endif()
+string(FIND
+  "${_basics_release_depofile_generator}"
+  "libcurl::libcurl"
+  _basics_release_libcurl_index
+)
+if (_basics_release_libcurl_index EQUAL -1)
+  message(FATAL_ERROR "The release basics package must link libcurl::libcurl for MultiCurlClient.")
+endif()
 
 string(FIND "${_basics_multi_curl_header}" "CURLMNWC_CLEAR_CONNS" _basics_curl_reuse_index)
 if (_basics_curl_reuse_index EQUAL -1)

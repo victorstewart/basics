@@ -1,5 +1,6 @@
 // Copyright 2026 Victor Stewart
 // SPDX-License-Identifier: Apache-2.0
+#include <networking/async.dns.cares.h>
 #include <networking/multi.curl.client.h>
 #include <networking/message.h>
 #include <services/filesystem.h>
@@ -8,8 +9,15 @@
 #include <databases/embedded/tidesdb.h>
 #endif
 
+static void instantiateAsyncTransport(void)
+{
+  RingAsyncDnsResolver resolver;
+  MultiCurlClient client(resolver);
+}
+
 int main()
 {
+  (void)&instantiateAsyncTransport;
   static_assert(MultiCurlClient::maximumConcurrentStreams == 32);
   String text("downstream package smoke");
   String packet;

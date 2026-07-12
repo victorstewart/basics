@@ -22,6 +22,6 @@ target_compile_features(basics_downstream_package_smoke PRIVATE cxx_std_20)
 if (BASICS_DOWNSTREAM_ENABLE_TIDESDB)
   target_compile_definitions(basics_downstream_package_smoke PRIVATE BASICS_DOWNSTREAM_ENABLE_TIDESDB=1)
 endif()
-depos_link(basics_downstream_package_smoke PRIVATE basics::basics)
+depos_link(basics_downstream_package_smoke PRIVATE basics::basics cares::cares)
 
 add_test(NAME basics_downstream_package_smoke COMMAND basics_downstream_package_smoke)
