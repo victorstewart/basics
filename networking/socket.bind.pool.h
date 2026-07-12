@@ -389,11 +389,7 @@ public:
    LocalSocketBindPool(LocalSocketBindSet configured, TimeSource clock)
        : bindSet(std::move(configured)),
          timeSource(clock)
-   {
-      leasesByFd.reserve(maximumActiveLeases);
-      activeTuples.reserve(maximumActiveLeases);
-      tcpQuarantines.reserve(maximumTcpQuarantines);
-   }
+   {}
 
    ~LocalSocketBindPool()
    {

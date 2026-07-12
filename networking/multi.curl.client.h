@@ -274,6 +274,7 @@ private:
       curl_slist *requestHeaders = nullptr;
       curl_slist *resolveRules = nullptr;
       String scheme;
+      String authorityHost;
       String host;
       String connectHost;
       String service;
@@ -295,6 +296,10 @@ private:
       bool bodyOverflow = false;
       bool invalidHeaders = false;
       bool pinExpired = false;
+      bool zeroTtl = false;
+      bool zeroTtlAdmissionOpen = false;
+      bool pinAdmitted = false;
+      bool numericHost = false;
       uint8_t pinRefreshes = 0;
       bool addedToMulti = false;
       Status forcedStatus = Status::success;
@@ -660,7 +665,8 @@ private:
                                            struct curl_sockaddr *address)
    {
       Transfer& transfer = *static_cast<Transfer *>(context);
-      if (Clock::now() >= transfer.resolutionExpires)
+      if ((transfer.zeroTtl && !transfer.zeroTtlAdmissionOpen) ||
+          (!transfer.zeroTtl && Clock::now() >= transfer.resolutionExpires))
       {
          transfer.pinExpired = true;
          return CURL_SOCKET_BAD;
@@ -705,6 +711,10 @@ private:
             return CURL_SOCKET_BAD;
          }
       }
+      if (transfer.zeroTtlAdmissionOpen)
+      {
+         transfer.pinAdmitted = true;
+      }
       return fd;
    }
 
@@ -722,7 +732,8 @@ private:
                                    int localPort)
    {
       Transfer& transfer = *static_cast<Transfer *>(context);
-      if (Clock::now() >= transfer.resolutionExpires)
+      if ((transfer.zeroTtl && !transfer.pinAdmitted && !transfer.zeroTtlAdmissionOpen) ||
+          (!transfer.zeroTtl && Clock::now() >= transfer.resolutionExpires))
       {
          transfer.pinExpired = true;
          return CURL_PREREQFUNC_ABORT;
@@ -828,6 +839,10 @@ private:
             transfer.forcedStatus = Status::httpVersionRejected;
             return CURL_PREREQFUNC_ABORT;
          }
+      }
+      if (transfer.zeroTtlAdmissionOpen)
+      {
+         transfer.pinAdmitted = true;
       }
       return CURL_PREREQFUNC_OK;
    }
@@ -1245,6 +1260,9 @@ private:
       transfer.firstByteSeen = false;
       transfer.lastActivity = Clock::now();
       transfer.pinExpired = false;
+      transfer.zeroTtl = false;
+      transfer.zeroTtlAdmissionOpen = false;
+      transfer.pinAdmitted = false;
       ++transfer.pinRefreshes;
       transfer.state = TransferState::resolving;
       return true;
@@ -1745,33 +1763,22 @@ private:
       }
 
       String rule;
-      rule.append('+');
-      if (transfer.host.findChar(':') >= 0)
+      if (!transfer.numericHost)
       {
-         rule.append('[');
-         rule.append(transfer.host);
-         rule.append(']');
+         rule.append('+');
+         rule.append(transfer.authorityHost);
+         rule.append(':');
+         rule.append(transfer.service);
+         rule.append(':');
       }
-      else
-      {
-         rule.append(transfer.host);
-      }
-      rule.append(':');
-      rule.append(transfer.service);
-      rule.append(':');
       const uint32_t minimumTtl = accepted.minimumTtlSeconds();
-      if (minimumTtl == 0)
-      {
-         finish(ticket.identifier, Status::addressRejected, CURLE_COULDNT_CONNECT);
-         return;
-      }
       for (size_t index = 0; index < plan.size(); ++index)
       {
-         if (index != 0)
+         if (!transfer.numericHost && index != 0)
          {
             rule.append(',');
          }
-         if (!appendResolveAddress(rule, plan[index].address))
+         if (!transfer.numericHost && !appendResolveAddress(rule, plan[index].address))
          {
             finish(ticket.identifier, Status::addressRejected, CURLE_COULDNT_CONNECT);
             return;
@@ -1779,12 +1786,19 @@ private:
          transfer.approvedAddresses.push_back(plan[index].address);
       }
       transfer.result.resolvedTtlSeconds = minimumTtl;
-      transfer.resolutionExpires = minimumTtl == std::numeric_limits<uint32_t>::max()
+      transfer.zeroTtl = minimumTtl == 0;
+      transfer.zeroTtlAdmissionOpen = false;
+      transfer.pinAdmitted = false;
+      transfer.resolutionExpires = transfer.zeroTtl ||
+                                   minimumTtl == std::numeric_limits<uint32_t>::max()
                                        ? transfer.overallDeadline
                                        : std::min(transfer.overallDeadline,
                                                   Clock::now() + std::chrono::seconds(minimumTtl));
-      transfer.resolveRules = curl_slist_append(nullptr, rule.c_str());
-      if (transfer.resolveRules == nullptr || !prepareEasy(transfer))
+      if (!transfer.numericHost)
+      {
+         transfer.resolveRules = curl_slist_append(nullptr, rule.c_str());
+      }
+      if ((!transfer.numericHost && transfer.resolveRules == nullptr) || !prepareEasy(transfer))
       {
          const Status status = transfer.result.status == Status::headersTooLarge ||
                                transfer.result.status == Status::deadlineExceeded ||
@@ -1852,7 +1866,19 @@ private:
       {
          connectionIdentityByOrigin.insert_or_assign(std::move(origin), identity);
       }
+      transfer.zeroTtlAdmissionOpen = transfer.zeroTtl;
       runCurlAction(CURL_SOCKET_TIMEOUT, 0);
+      position = transfers.find(ticket.identifier);
+      if (position != transfers.end() &&
+          position->second->ticket.generation == ticket.generation)
+      {
+         Transfer& current = *position->second;
+         current.zeroTtlAdmissionOpen = false;
+         if (current.zeroTtl && !current.pinAdmitted)
+         {
+            current.pinExpired = true;
+         }
+      }
    }
 
    bool parseEndpoint(Transfer& transfer)
@@ -1890,10 +1916,57 @@ private:
       if (status == CURLUE_OK && host && port && (https || http) &&
           (!transfer.request.requireTls || https))
       {
-         transfer.host.assign(host);
+         transfer.authorityHost.assign(host);
+         String normalizedHost(host);
+         const bool beginsBracket = !normalizedHost.empty() && normalizedHost[0] == '[';
+         const bool endsBracket = !normalizedHost.empty() &&
+                                  normalizedHost[normalizedHost.size() - 1] == ']';
+         if (beginsBracket != endsBracket ||
+             (beginsBracket && (normalizedHost.size() < 3 ||
+                                normalizedHost.findChar('[', 1) >= 0 ||
+                                normalizedHost.findChar(']', 0) != int64_t(normalizedHost.size() - 1))))
+         {
+            status = CURLUE_BAD_HOSTNAME;
+         }
+         if (status == CURLUE_OK && beginsBracket)
+         {
+            String unbracketed(normalizedHost.data() + 1,
+                               normalizedHost.size() - 2,
+                               Copy::yes);
+            normalizedHost = std::move(unbracketed);
+         }
+         in_addr numeric4 = {};
+         in6_addr numeric6 = {};
+         const bool ipv4Literal = status == CURLUE_OK &&
+                                  inet_pton(AF_INET, normalizedHost.c_str(), &numeric4) == 1;
+         const bool ipv6Literal = status == CURLUE_OK &&
+                                  inet_pton(AF_INET6, normalizedHost.c_str(), &numeric6) == 1;
+         if (status == CURLUE_OK &&
+             ((beginsBracket && !ipv6Literal) || (!beginsBracket && normalizedHost.findChar(':') >= 0)))
+         {
+            status = CURLUE_BAD_HOSTNAME;
+         }
+         transfer.numericHost = ipv4Literal || ipv6Literal;
+         if (status == CURLUE_OK && transfer.numericHost && !transfer.request.resolveHost.empty())
+         {
+            String overrideHost = transfer.request.resolveHost;
+            if (overrideHost.size() >= 2 && overrideHost[0] == '[' &&
+                overrideHost[overrideHost.size() - 1] == ']')
+            {
+               String unbracketed(overrideHost.data() + 1,
+                                  overrideHost.size() - 2,
+                                  Copy::yes);
+               overrideHost = std::move(unbracketed);
+            }
+            if (overrideHost != normalizedHost)
+            {
+               status = CURLUE_BAD_HOSTNAME;
+            }
+         }
+         transfer.host = std::move(normalizedHost);
          transfer.scheme.assign(scheme);
-         transfer.connectHost.assign(transfer.request.resolveHost.empty()
-                                         ? host
+         transfer.connectHost.assign(transfer.numericHost || transfer.request.resolveHost.empty()
+                                         ? transfer.host.c_str()
                                          : transfer.request.resolveHost.c_str());
          transfer.service.assign(port);
          std::shared_ptr<LifetimeState> originPolicyLifetime = lifetimeState;
@@ -1901,7 +1974,7 @@ private:
          const bool originAccepted = transfer.request.originPolicy.accepts(transfer.scheme,
                                                                            transfer.host,
                                                                            transfer.request.authority.empty()
-                                                                               ? transfer.host
+                                                                               ? transfer.authorityHost
                                                                                : transfer.request.authority,
                                                                            transfer.service,
                                                                            transfer.connectHost);

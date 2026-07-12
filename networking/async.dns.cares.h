@@ -79,6 +79,7 @@ public:
    static constexpr int maximumConfiguredTries = 3;
    static constexpr int maximumConfiguredUdpQueriesPerSocket = 10'000;
    static constexpr size_t maximumConfiguredServersBytes = 4096;
+   static constexpr size_t maximumConfiguredHostsPathBytes = 4096;
 
    struct BackendConfig {
       int timeoutMilliseconds = 1000;
@@ -86,6 +87,7 @@ public:
       int maximumTimeoutMilliseconds = 2000;
       int udpMaximumQueries = 0;
       String servers;
+      String hostsPath;
       LocalSocketBindSet udpBinds;
       LocalSocketBindSet tcpBinds;
       bool stayOpen = false;
@@ -98,7 +100,8 @@ public:
       libraryInitializationFailed,
       libraryNotThreadSafe,
       channelInitializationFailed,
-      invalidServers
+      invalidServers,
+      invalidHostsPath
    };
 
 private:
@@ -893,6 +896,11 @@ public:
          initialization = InitializationStatus::invalidServers;
          return;
       }
+      if (backendConfig.hostsPath.size() > maximumConfiguredHostsPathBytes)
+      {
+         initialization = InitializationStatus::invalidHostsPath;
+         return;
+      }
 
       ares_options options = {};
       options.flags = ARES_FLAG_NOSEARCH | ARES_FLAG_NOALIASES |
@@ -908,12 +916,19 @@ public:
       options.qcache_max_ttl = 0;
       options.sock_state_cb = socketStateCallback;
       options.sock_state_cb_data = this;
+      options.hosts_path = backendConfig.hostsPath.empty()
+                               ? nullptr
+                               : const_cast<char *>(backendConfig.hostsPath.c_str());
       int optionMask = ARES_OPT_FLAGS |
                        ARES_OPT_TIMEOUTMS |
                        ARES_OPT_TRIES |
                        ARES_OPT_MAXTIMEOUTMS |
                        ARES_OPT_QUERY_CACHE |
                        ARES_OPT_SOCK_STATE_CB;
+      if (options.hosts_path)
+      {
+         optionMask |= ARES_OPT_HOSTS_FILE;
+      }
       if (options.udp_max_queries > 0)
       {
          optionMask |= ARES_OPT_UDP_MAX_QUERIES;

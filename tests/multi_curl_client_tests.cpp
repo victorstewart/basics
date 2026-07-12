@@ -290,33 +290,49 @@ private:
       return true;
    }
 
-   void start(void)
+   void start(int family = AF_INET)
    {
-      listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      listener = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
       if (listener < 0)
       {
          return;
       }
       const int enabled = 1;
       (void)setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
-      sockaddr_in address = {};
-      address.sin_family = AF_INET;
-      address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-      if (bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
+      sockaddr_storage storage = {};
+      socklen_t length = 0;
+      if (family == AF_INET6)
+      {
+         sockaddr_in6 address = {};
+         address.sin6_family = AF_INET6;
+         address.sin6_addr = in6addr_loopback;
+         std::memcpy(&storage, &address, sizeof(address));
+         length = sizeof(address);
+      }
+      else
+      {
+         sockaddr_in address = {};
+         address.sin_family = AF_INET;
+         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+         std::memcpy(&storage, &address, sizeof(address));
+         length = sizeof(address);
+      }
+      if (bind(listener, reinterpret_cast<sockaddr *>(&storage), length) != 0 ||
           listen(listener, 8) != 0)
       {
          close(listener);
          listener = -1;
          return;
       }
-      socklen_t length = sizeof(address);
-      if (getsockname(listener, reinterpret_cast<sockaddr *>(&address), &length) != 0)
+      if (getsockname(listener, reinterpret_cast<sockaddr *>(&storage), &length) != 0)
       {
          close(listener);
          listener = -1;
          return;
       }
-      boundPort = ntohs(address.sin_port);
+      boundPort = family == AF_INET6
+                      ? ntohs(reinterpret_cast<sockaddr_in6 *>(&storage)->sin6_port)
+                      : ntohs(reinterpret_cast<sockaddr_in *>(&storage)->sin_port);
       worker = std::thread([this]
       {
          run();
@@ -388,7 +404,8 @@ public:
                uint32_t connections = 1,
                const char *requiredAuthority = nullptr,
                const char *encoding = nullptr,
-               const char *requiredMethod = nullptr)
+               const char *requiredMethod = nullptr,
+               int listenFamily = AF_INET)
        : body(responseBody),
          expectedAuthority(requiredAuthority ? requiredAuthority : ""),
          expectedMethod(requiredMethod ? requiredMethod : ""),
@@ -396,7 +413,7 @@ public:
          delayMilliseconds(delay),
          expectedConnections(connections)
    {
-      start();
+      start(listenFamily);
    }
 
    explicit HttpFixture(HttpResponse response)
@@ -447,6 +464,231 @@ public:
    }
 
 };
+
+class SequenceDnsClient final : public AsyncDnsClient
+{
+public:
+
+   struct Answer
+   {
+      Vector<String> addresses;
+      uint32_t ttlSeconds = 0;
+   };
+
+private:
+
+   Vector<Answer> answers;
+   uint64_t nextTicket = 1;
+   size_t calls = 0;
+
+public:
+
+   explicit SequenceDnsClient(Vector<Answer> configured)
+       : answers(std::move(configured))
+   {}
+
+   SequenceDnsClient(std::initializer_list<Answer> configured)
+   {
+      for (const Answer& answer : configured)
+      {
+         answers.push_back(answer);
+      }
+   }
+
+   static Answer makeAnswer(std::initializer_list<const char *> values, uint32_t ttlSeconds)
+   {
+      Answer answer;
+      answer.ttlSeconds = ttlSeconds;
+      for (const char *value : values)
+      {
+         answer.addresses.push_back(String(value));
+      }
+      return answer;
+   }
+
+   bool ready(void) const override
+   {
+      return true;
+   }
+
+   Ticket resolve(const String&,
+                  const String& service,
+                  Family,
+                  Callback callback,
+                  TimePoint = TimePoint::max()) override
+   {
+      Ticket ticket {nextTicket++, 1};
+      Answer& answer = answers[std::min(calls, answers.size() - 1)];
+      ++calls;
+      Resolver::Result result;
+      result.status = Resolver::Status::success;
+      String serviceCopy = service;
+      const uint16_t port = uint16_t(std::strtoul(serviceCopy.c_str(), nullptr, 10));
+      for (String& value : answer.addresses)
+      {
+         Resolver::Address address;
+         address.ttlSeconds = answer.ttlSeconds;
+         sockaddr_in ipv4 = {};
+         sockaddr_in6 ipv6 = {};
+         if (inet_pton(AF_INET, value.c_str(), &ipv4.sin_addr) == 1)
+         {
+            ipv4.sin_family = AF_INET;
+            ipv4.sin_port = htons(port);
+            std::memcpy(&address.storage, &ipv4, sizeof(ipv4));
+            address.length = sizeof(ipv4);
+         }
+         else
+         {
+            ipv6.sin6_family = AF_INET6;
+            ipv6.sin6_port = htons(port);
+            (void)inet_pton(AF_INET6, value.c_str(), &ipv6.sin6_addr);
+            std::memcpy(&address.storage, &ipv6, sizeof(ipv6));
+            address.length = sizeof(ipv6);
+         }
+         result.addresses.push_back(address);
+      }
+      callback.function(callback.context, ticket, std::move(result));
+      return ticket;
+   }
+
+   bool cancel(Ticket) override
+   {
+      return false;
+   }
+
+   size_t resolveCount(void) const
+   {
+      return calls;
+   }
+};
+
+class NumericDnsClient final : public AsyncDnsClient
+{
+private:
+
+   AsyncDnsResolver resolver;
+
+public:
+
+   bool ready(void) const override
+   {
+      return !resolver.isShutdown();
+   }
+
+   Ticket resolve(const String& hostname,
+                  const String& service,
+                  Family family,
+                  Callback callback,
+                  TimePoint deadline = TimePoint::max()) override
+   {
+      return resolver.resolve(hostname, service, family, callback, deadline);
+   }
+
+   bool cancel(Ticket ticket) override
+   {
+      return resolver.cancel(ticket);
+   }
+};
+
+struct CurlBatchScenario final : RingMultiplexer
+{
+   MultiCurlClient *client = nullptr;
+   TimeoutPacket guard;
+   Vector<MultiCurlClient::Result> results;
+   size_t expected = 0;
+   bool guardArmed = false;
+   bool timedOut = false;
+
+   CurlBatchScenario()
+   {
+      guard.originator = this;
+   }
+
+   static void callback(void *context,
+                        MultiCurlClient::Ticket,
+                        MultiCurlClient::Result&& result)
+   {
+      CurlBatchScenario& scenario = *static_cast<CurlBatchScenario *>(context);
+      scenario.results.push_back(std::move(result));
+      if (scenario.results.size() == scenario.expected)
+      {
+         (void)scenario.client->shutdown();
+         if (scenario.guardArmed)
+         {
+            Ring::queueCancelTimeout(&scenario.guard);
+         }
+      }
+   }
+
+   void timeoutHandler(TimeoutPacket *packet, int result) override
+   {
+      if (packet != &guard)
+      {
+         return;
+      }
+      guardArmed = false;
+      guard.clear();
+      if (result != -ECANCELED)
+      {
+         timedOut = true;
+         (void)client->shutdown();
+      }
+      if (client->shutdownSafe())
+      {
+         Ring::exit = true;
+      }
+   }
+
+   void completionBatchHandler(uint32_t) override
+   {
+      if (client->shutdownSafe() && !guardArmed)
+      {
+         Ring::exit = true;
+      }
+   }
+};
+
+static Vector<MultiCurlClient::Result> runCurlBatch(TestSuite& suite,
+                                                     AsyncDnsClient& resolver,
+                                                     MultiCurlClient::Config config,
+                                                     Vector<MultiCurlClient::Request> requests)
+{
+   Ring::interfacer = nullptr;
+   Ring::lifecycler = nullptr;
+   Ring::exit = false;
+   Ring::shuttingDown = false;
+   RingDispatcher::dispatcher = nullptr;
+   RingDispatcher dispatcher;
+   Ring::createRing(128, 256, 8, 2, -1, -1, 8);
+
+   CurlBatchScenario scenario;
+   scenario.expected = requests.size();
+   RingDispatcher::installMultiplexee(&scenario, &scenario);
+   RingDispatcher::installMultiplexer(&scenario);
+   scenario.client = new MultiCurlClient(resolver, std::move(config));
+   EXPECT_TRUE(suite, scenario.client->ready());
+   scenario.guard.setTimeoutSeconds(8);
+   scenario.guardArmed = true;
+   Ring::queueTimeout(&scenario.guard);
+   for (MultiCurlClient::Request& request : requests)
+   {
+      scenario.client->submit(std::move(request), {&scenario, CurlBatchScenario::callback});
+   }
+   Ring::start();
+
+   EXPECT_FALSE(suite, scenario.timedOut);
+   EXPECT_EQ(suite, scenario.results.size(), scenario.expected);
+   EXPECT_TRUE(suite, scenario.client->shutdownSafe());
+   delete scenario.client;
+   RingDispatcher::eraseMultiplexee(&scenario);
+   Ring::shutdownForExec();
+   Ring::interfacer = nullptr;
+   Ring::lifecycler = nullptr;
+   Ring::exit = false;
+   Ring::shuttingDown = false;
+   RingDispatcher::dispatcher = nullptr;
+   return std::move(scenario.results);
+}
 
 struct Scenario final : RingMultiplexer
 {
@@ -656,6 +898,172 @@ static MultiCurlClient::Request continueRequestFor(const HttpFixture& fixture)
    request.headers.push_back({"Expect", "100-continue"});
    request.body.assign("x"_ctv);
    return request;
+}
+
+static MultiCurlClient::Request plainRequest(const String& host, uint16_t port)
+{
+   MultiCurlClient::Request request;
+   request.url.assign("http://"_ctv);
+   request.url.append(host);
+   String service;
+   service.snprintf<":{itoa}/"_ctv>(uint64_t(port));
+   request.url.append(service);
+   request.requireTls = false;
+   request.httpPolicy = MultiCurlClient::HttpPolicy::requireHttp1;
+   request.responseBytes = 1024;
+   request.overallDeadline = MultiCurlClient::Clock::now() + std::chrono::seconds(5);
+   return request;
+}
+
+static void testZeroTtlImmediateAndQueuedAdmission(TestSuite& suite)
+{
+   HttpFixture available("zero", 0);
+   EXPECT_TRUE(suite, available.ready());
+   SequenceDnsClient immediate({SequenceDnsClient::makeAnswer({"127.0.0.1"}, 0)});
+   Vector<MultiCurlClient::Request> immediateRequests;
+   immediateRequests.push_back(plainRequest("zero.test", available.port()));
+   Vector<MultiCurlClient::Result> immediateResults =
+       runCurlBatch(suite, immediate, {}, std::move(immediateRequests));
+   EXPECT_EQ(suite, immediate.resolveCount(), size_t(1));
+   EXPECT_EQ(suite, immediateResults.size(), size_t(1));
+   if (!immediateResults.empty())
+   {
+      EXPECT_TRUE(suite, immediateResults[0].succeeded());
+      EXPECT_EQ(suite, immediateResults[0].resolvedTtlSeconds, uint32_t(0));
+   }
+
+   HttpFixture queued("queued", 400, 2);
+   EXPECT_TRUE(suite, queued.ready());
+   SequenceDnsClient queuedDns({SequenceDnsClient::makeAnswer({"127.0.0.1"}, 0),
+                                SequenceDnsClient::makeAnswer({"127.0.0.2"}, 0),
+                                SequenceDnsClient::makeAnswer({"127.0.0.1"}, 0)});
+   MultiCurlClient::Config config;
+   config.totalConnections = 1;
+   config.hostConnections = 1;
+   Vector<MultiCurlClient::Request> queuedRequests;
+   queuedRequests.push_back(plainRequest("queued.test", queued.port()));
+   queuedRequests.push_back(plainRequest("queued.test", queued.port()));
+   Vector<MultiCurlClient::Result> queuedResults =
+       runCurlBatch(suite, queuedDns, config, std::move(queuedRequests));
+   EXPECT_EQ(suite, queuedDns.resolveCount(), size_t(3));
+   EXPECT_EQ(suite, queuedResults.size(), size_t(2));
+   for (const MultiCurlClient::Result& result : queuedResults)
+   {
+      EXPECT_TRUE(suite, result.succeeded());
+      EXPECT_EQ(suite, result.resolvedTtlSeconds, uint32_t(0));
+   }
+}
+
+static void testRealHappyEyeballsFamilyFallback(TestSuite& suite)
+{
+   HttpFixture ipv4Only("fallback", 0);
+   EXPECT_TRUE(suite, ipv4Only.ready());
+   SequenceDnsClient resolver({SequenceDnsClient::makeAnswer({"::1", "127.0.0.1"}, 30)});
+   Vector<MultiCurlClient::Request> requests;
+   requests.push_back(plainRequest("dual.test", ipv4Only.port()));
+   Vector<MultiCurlClient::Result> results = runCurlBatch(suite, resolver, {}, std::move(requests));
+   EXPECT_EQ(suite, resolver.resolveCount(), size_t(1));
+   EXPECT_EQ(suite, results.size(), size_t(1));
+   if (!results.empty())
+   {
+      EXPECT_TRUE(suite, results[0].succeeded());
+      EXPECT_TRUE(suite, results[0].body == "fallback"_ctv);
+   }
+}
+
+struct LiteralPolicyCapture
+{
+   String host;
+   String authority;
+   String connectHost;
+   size_t calls = 0;
+
+   static bool origin(void *context,
+                      const String&,
+                      const String& host,
+                      const String& authority,
+                      const String&,
+                      const String& connectHost)
+   {
+      LiteralPolicyCapture& capture = *static_cast<LiteralPolicyCapture *>(context);
+      capture.host = host;
+      capture.authority = authority;
+      capture.connectHost = connectHost;
+      ++capture.calls;
+      return true;
+   }
+
+   static bool rejectAddress(void *, const AsyncDnsResolver::Address&)
+   {
+      return false;
+   }
+};
+
+static MultiCurlClient::Request literalRequest(const String& literal,
+                                                uint16_t port,
+                                                LiteralPolicyCapture& capture,
+                                                bool rejectAddress)
+{
+   MultiCurlClient::Request request = plainRequest(literal, port);
+   request.originPolicy.context = &capture;
+   request.originPolicy.accept = LiteralPolicyCapture::origin;
+   if (rejectAddress)
+   {
+      request.addressPolicy.accept = LiteralPolicyCapture::rejectAddress;
+   }
+   return request;
+}
+
+static void testIpv6LiteralCanonicalizationAndPolicy(TestSuite& suite)
+{
+   HttpFixture ipv6("literal", 0, 1, nullptr, nullptr, nullptr, AF_INET6);
+   EXPECT_TRUE(suite, ipv6.ready());
+   NumericDnsClient resolver;
+   LiteralPolicyCapture generic;
+   Vector<MultiCurlClient::Request> requests;
+   requests.push_back(literalRequest("[::1]", ipv6.port(), generic, false));
+   Vector<MultiCurlClient::Result> results = runCurlBatch(suite, resolver, {}, std::move(requests));
+   EXPECT_EQ(suite, results.size(), size_t(1));
+   if (!results.empty())
+   {
+      EXPECT_TRUE(suite, results[0].succeeded());
+   }
+   EXPECT_EQ(suite, generic.calls, size_t(1));
+   EXPECT_TRUE(suite, generic.host == "::1"_ctv);
+   EXPECT_TRUE(suite, generic.connectHost == "::1"_ctv);
+   EXPECT_TRUE(suite, generic.authority == "[::1]"_ctv);
+
+   LiteralPolicyCapture rejected;
+   Vector<MultiCurlClient::Request> rejectedRequests;
+   rejectedRequests.push_back(literalRequest("[::1]", ipv6.port(), rejected, true));
+   rejectedRequests.push_back(literalRequest("[2001:db8::1]", 80, rejected, true));
+   rejectedRequests.push_back(literalRequest("[2606:4700:4700::1111]", 80, rejected, true));
+   Vector<MultiCurlClient::Result> rejectedResults =
+       runCurlBatch(suite, resolver, {}, std::move(rejectedRequests));
+   EXPECT_EQ(suite, rejectedResults.size(), size_t(3));
+   for (const MultiCurlClient::Result& result : rejectedResults)
+   {
+      EXPECT_TRUE(suite, result.status == MultiCurlClient::Status::addressRejected);
+   }
+   EXPECT_EQ(suite, rejected.calls, size_t(3));
+   EXPECT_TRUE(suite, rejected.host == "2606:4700:4700::1111"_ctv);
+   EXPECT_TRUE(suite, rejected.connectHost == "2606:4700:4700::1111"_ctv);
+
+   LiteralPolicyCapture malformedCapture;
+   Vector<MultiCurlClient::Request> malformed;
+   malformed.push_back(literalRequest("[[::1]]", 80, malformedCapture, true));
+   malformed.push_back(literalRequest("[::1]]", 80, malformedCapture, true));
+   malformed.push_back(literalRequest("[[::1]", 80, malformedCapture, true));
+   MultiCurlClient::Request override = literalRequest("[::1]", 80, malformedCapture, true);
+   override.resolveHost = "::2";
+   malformed.push_back(std::move(override));
+   Vector<MultiCurlClient::Result> malformedResults =
+       runCurlBatch(suite, resolver, {}, std::move(malformed));
+   EXPECT_EQ(suite, malformedResults.size(), size_t(4));
+   for (const MultiCurlClient::Result& result : malformedResults)
+   {
+      EXPECT_TRUE(suite, result.status == MultiCurlClient::Status::unsupportedProtocol);
+   }
 }
 
 static void testConcurrentCompletionCancellationAndShutdown(TestSuite& suite)
@@ -1270,6 +1678,9 @@ int main()
    testConcurrentCompletionCancellationAndShutdown(suite);
    testResetAndActiveShutdownBarriers(suite, true);
    testResetAndActiveShutdownBarriers(suite, false);
+   testZeroTtlImmediateAndQueuedAdmission(suite);
+   testIpv6LiteralCanonicalizationAndPolicy(suite);
+   testRealHappyEyeballsFamilyFallback(suite);
    testQueuedPinExpiryReresolves(suite);
    testStructuredAuthorityAndReusableLocalBinds(suite);
    return suite.finish("MultiCurlClient");

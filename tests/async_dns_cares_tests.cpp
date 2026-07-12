@@ -26,6 +26,7 @@ static_assert(Resolver::maximumConfiguredTimeoutMilliseconds == 30'000);
 static_assert(Resolver::maximumConfiguredTries == 3);
 static_assert(Resolver::maximumConfiguredUdpQueriesPerSocket == 10'000);
 static_assert(Resolver::maximumConfiguredServersBytes == 4096);
+static_assert(Resolver::maximumConfiguredHostsPathBytes == 4096);
 
 static void append16(Vector<uint8_t>& packet, uint16_t value)
 {
@@ -66,10 +67,12 @@ static void appendName(Vector<uint8_t>& packet, const String& name)
 class DnsFixture {
 private:
 
-   int fd = -1;
+   int udpFd = -1;
+   int tcpFd = -1;
    uint16_t boundPort = 0;
    std::atomic<bool> stopping = false;
    std::atomic<uint32_t> receivedQueries = 0;
+   std::atomic<uint32_t> receivedTcpQueries = 0;
    std::atomic<uint16_t> lastSourcePort = 0;
    std::thread worker;
 
@@ -115,19 +118,22 @@ private:
    static Vector<uint8_t> answer(const uint8_t *query,
                                  const String& name,
                                  uint16_t type,
-                                 size_t questionEnd)
+                                 size_t questionEnd,
+                                 bool tcp)
    {
       const bool missing = name == "missing.test"_ctv;
+      const bool servfail = name == "servfail.test"_ctv;
+      const bool truncated = name == "truncated.test"_ctv && !tcp;
       Vector<uint8_t> response;
       response.reserve(128);
       response.insert(response.end(), query, query + 2);
-      append16(response, missing ? 0x8183 : 0x8180);
+      append16(response, missing ? 0x8183 : servfail ? 0x8182 : truncated ? 0x8380 : 0x8180);
       append16(response, 1);
-      append16(response, missing ? 0 : 2);
+      append16(response, missing || servfail || truncated ? 0 : 2);
       append16(response, 0);
       append16(response, 0);
       response.insert(response.end(), query + 12, query + questionEnd);
-      if (missing)
+      if (missing || servfail || truncated)
       {
          return response;
       }
@@ -164,12 +170,118 @@ private:
       return response;
    }
 
+   static bool receiveAll(int fd, uint8_t *bytes, size_t size)
+   {
+      size_t received = 0;
+      while (received < size)
+      {
+         const ssize_t count = recv(fd, bytes + received, size - received, 0);
+         if (count <= 0)
+         {
+            return false;
+         }
+         received += size_t(count);
+      }
+      return true;
+   }
+
+   static bool sendAll(int fd, const uint8_t *bytes, size_t size)
+   {
+      size_t sent = 0;
+      while (sent < size)
+      {
+         const ssize_t count = send(fd, bytes + sent, size - sent, MSG_NOSIGNAL);
+         if (count <= 0)
+         {
+            return false;
+         }
+         sent += size_t(count);
+      }
+      return true;
+   }
+
+   Vector<uint8_t> responseFor(const uint8_t *packet, size_t size, bool tcp)
+   {
+      String name;
+      uint16_t type = 0;
+      size_t questionEnd = 0;
+      if (!parseQuestion(packet, size, name, type, questionEnd) ||
+          (type != 1 && type != 28) || name == "drop.test"_ctv)
+      {
+         return {};
+      }
+      if (name == "slow.test"_ctv)
+      {
+         std::this_thread::sleep_for(std::chrono::milliseconds(80));
+      }
+      if (name == "truncated.test"_ctv && tcp)
+      {
+         std::this_thread::sleep_for(std::chrono::milliseconds(30));
+      }
+      receivedQueries.fetch_add(1, std::memory_order_relaxed);
+      if (tcp)
+      {
+         receivedTcpQueries.fetch_add(1, std::memory_order_relaxed);
+      }
+      return answer(packet, name, type, questionEnd, tcp);
+   }
+
+   void handleTcp(void)
+   {
+      const int connection = accept(tcpFd, nullptr, nullptr);
+      if (connection < 0)
+      {
+         return;
+      }
+      while (!stopping.load(std::memory_order_relaxed))
+      {
+         pollfd descriptor {.fd = connection, .events = POLLIN, .revents = 0};
+         if (poll(&descriptor, 1, 100) <= 0)
+         {
+            break;
+         }
+         uint8_t lengthBytes[2] = {};
+         if (!receiveAll(connection, lengthBytes, sizeof(lengthBytes)))
+         {
+            break;
+         }
+         const size_t size = size_t(lengthBytes[0] << 8 | lengthBytes[1]);
+         if (size == 0 || size > 4096)
+         {
+            break;
+         }
+         Vector<uint8_t> packet;
+         packet.resize(size);
+         if (!receiveAll(connection, packet.data(), packet.size()))
+         {
+            break;
+         }
+         Vector<uint8_t> response = responseFor(packet.data(), packet.size(), true);
+         const uint8_t responseLength[2] = {uint8_t(response.size() >> 8), uint8_t(response.size())};
+         if (response.empty() || !sendAll(connection, responseLength, sizeof(responseLength)) ||
+             !sendAll(connection, response.data(), response.size()))
+         {
+            break;
+         }
+      }
+      close(connection);
+   }
+
    void run(void)
    {
       while (!stopping.load(std::memory_order_relaxed))
       {
-         pollfd descriptor {.fd = fd, .events = POLLIN, .revents = 0};
-         if (poll(&descriptor, 1, 50) <= 0)
+         pollfd descriptors[2] = {{.fd = udpFd, .events = POLLIN, .revents = 0},
+                                  {.fd = tcpFd, .events = POLLIN, .revents = 0}};
+         if (poll(descriptors, 2, 50) <= 0)
+         {
+            continue;
+         }
+         if (descriptors[1].revents & POLLIN)
+         {
+            handleTcp();
+         }
+         if (!(descriptors[0].revents & POLLIN))
          {
             continue;
          }
@@ -177,7 +289,7 @@ private:
          uint8_t packet[512] = {};
          sockaddr_storage peer = {};
          socklen_t peerLength = sizeof(peer);
-         const ssize_t size = recvfrom(fd,
+         const ssize_t size = recvfrom(udpFd,
                                        packet,
                                        sizeof(packet),
                                        0,
@@ -194,22 +306,12 @@ private:
                 std::memory_order_relaxed);
          }
 
-         receivedQueries.fetch_add(1, std::memory_order_relaxed);
-         String name;
-         uint16_t type = 0;
-         size_t questionEnd = 0;
-         if (!parseQuestion(packet, size_t(size), name, type, questionEnd) ||
-             (type != 1 && type != 28) || name == "drop.test"_ctv)
+         Vector<uint8_t> response = responseFor(packet, size_t(size), false);
+         if (response.empty())
          {
             continue;
          }
-         if (name == "slow.test"_ctv)
-         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(80));
-         }
-
-         Vector<uint8_t> response = answer(packet, name, type, questionEnd);
-         (void)sendto(fd,
+         (void)sendto(udpFd,
                       response.data(),
                       response.size(),
                       0,
@@ -222,8 +324,9 @@ public:
 
    DnsFixture()
    {
-      fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-      if (fd < 0)
+      udpFd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+      tcpFd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      if (udpFd < 0 || tcpFd < 0)
       {
          return;
       }
@@ -231,39 +334,49 @@ public:
       address.sin_family = AF_INET;
       address.sin_port = 0;
       inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
-      if (bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0)
+      if (bind(udpFd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0)
       {
-         close(fd);
-         fd = -1;
          return;
       }
       socklen_t length = sizeof(address);
-      if (getsockname(fd, reinterpret_cast<sockaddr *>(&address), &length) != 0)
+      if (getsockname(udpFd, reinterpret_cast<sockaddr *>(&address), &length) != 0)
       {
-         close(fd);
-         fd = -1;
          return;
       }
       boundPort = ntohs(address.sin_port);
+      if (bind(tcpFd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
+          listen(tcpFd, 8) != 0)
+      {
+         boundPort = 0;
+         return;
+      }
       worker = std::thread([this]() { run(); });
    }
 
    ~DnsFixture()
    {
       stopping.store(true, std::memory_order_relaxed);
+      if (tcpFd >= 0)
+      {
+         shutdown(tcpFd, SHUT_RDWR);
+      }
       if (worker.joinable())
       {
          worker.join();
       }
-      if (fd >= 0)
+      if (udpFd >= 0)
       {
-         close(fd);
+         close(udpFd);
+      }
+      if (tcpFd >= 0)
+      {
+         close(tcpFd);
       }
    }
 
    bool ready(void) const
    {
-      return fd >= 0 && boundPort != 0;
+      return udpFd >= 0 && tcpFd >= 0 && boundPort != 0;
    }
 
    String servers(void) const
@@ -281,6 +394,11 @@ public:
    uint16_t sourcePort(void) const
    {
       return lastSourcePort.load(std::memory_order_relaxed);
+   }
+
+   uint32_t tcpQueryCount(void) const
+   {
+      return receivedTcpQueries.load(std::memory_order_relaxed);
    }
 };
 
@@ -431,7 +549,9 @@ template <typename Start>
 static void runScenario(TestSuite& suite,
                         DnsFixture& fixture,
                         ScenarioMonitor& monitor,
-                        Start&& start)
+                        Start&& start,
+                        const String& hostsPath = {},
+                        bool expectNetwork = true)
 {
    Ring::interfacer = nullptr;
    Ring::lifecycler = nullptr;
@@ -445,6 +565,7 @@ static void runScenario(TestSuite& suite,
 
    Resolver::BackendConfig backend;
    backend.servers = fixture.servers();
+   backend.hostsPath = hostsPath;
    backend.udpMaximumQueries = 1;
    const ReservedUdpPorts ports = reserveLoopbackUdpPorts();
    sockaddr_in local = {};
@@ -481,7 +602,10 @@ static void runScenario(TestSuite& suite,
    Ring::shuttingDown = false;
    RingDispatcher::dispatcher = nullptr;
    EXPECT_FALSE(suite, monitor.timedOut);
-   EXPECT_TRUE(suite, fixture.sourcePort() == ports.first || fixture.sourcePort() == ports.second);
+   if (expectNetwork)
+   {
+      EXPECT_TRUE(suite, fixture.sourcePort() == ports.first || fixture.sourcePort() == ports.second);
+   }
 }
 
 struct ReloadContext {
@@ -595,6 +719,76 @@ static void testNXDomainAndNegativeCache(TestSuite& suite, DnsFixture& fixture)
    EXPECT_TRUE(suite, context.second.fromCache);
 }
 
+struct SingleQueryContext {
+   ScenarioMonitor *monitor = nullptr;
+   AsyncDnsResolver::Result result;
+   size_t calls = 0;
+
+   static void callback(void *context,
+                        AsyncDnsResolver::Ticket,
+                        AsyncDnsResolver::Result&& result)
+   {
+      SingleQueryContext& state = *static_cast<SingleQueryContext *>(context);
+      ++state.calls;
+      state.result = std::move(result);
+      state.monitor->finish();
+   }
+};
+
+static void testTruncatedUdpFallsBackToTcp(TestSuite& suite, DnsFixture& fixture)
+{
+   const uint32_t beforeTcp = fixture.tcpQueryCount();
+   ScenarioMonitor monitor;
+   SingleQueryContext context;
+   context.monitor = &monitor;
+   runScenario(suite, fixture, monitor, [&](Resolver& resolver, ScenarioMonitor&) {
+      resolver.resolve("truncated.test",
+                       "443",
+                       Resolver::Family::any,
+                       {&context, SingleQueryContext::callback});
+   });
+   EXPECT_EQ(suite, context.calls, size_t(1));
+   EXPECT_TRUE(suite, context.result.status == Status::success);
+   EXPECT_TRUE(suite, fixture.tcpQueryCount() > beforeTcp);
+   EXPECT_TRUE(suite, monitor.heartbeats >= 1);
+}
+
+struct ServfailContext {
+   Resolver *resolver = nullptr;
+   ScenarioMonitor *monitor = nullptr;
+   AsyncDnsResolver::Result result;
+   size_t calls = 0;
+   size_t negativeCacheCount = std::numeric_limits<size_t>::max();
+
+   static void callback(void *context,
+                        AsyncDnsResolver::Ticket,
+                        AsyncDnsResolver::Result&& result)
+   {
+      ServfailContext& state = *static_cast<ServfailContext *>(context);
+      ++state.calls;
+      state.result = std::move(result);
+      state.negativeCacheCount = state.resolver->negativeCacheCount();
+      state.monitor->finish();
+   }
+};
+
+static void testServfailIsNotNegativeCached(TestSuite& suite, DnsFixture& fixture)
+{
+   ScenarioMonitor monitor;
+   ServfailContext context;
+   context.monitor = &monitor;
+   runScenario(suite, fixture, monitor, [&](Resolver& resolver, ScenarioMonitor&) {
+      context.resolver = &resolver;
+      resolver.resolve("servfail.test",
+                       "443",
+                       Resolver::Family::any,
+                       {&context, ServfailContext::callback});
+   });
+   EXPECT_EQ(suite, context.calls, size_t(1));
+   EXPECT_TRUE(suite, context.result.status == Status::backendFailure);
+   EXPECT_EQ(suite, context.negativeCacheCount, size_t(0));
+}
+
 struct CancellationContext {
    ScenarioMonitor *monitor = nullptr;
    size_t calls = 0;
@@ -615,6 +809,70 @@ struct CancellationContext {
       }
    }
 };
+
+struct HostsContext {
+   Resolver *resolver = nullptr;
+   ScenarioMonitor *monitor = nullptr;
+   AsyncDnsResolver::Result first;
+   AsyncDnsResolver::Result second;
+   size_t calls = 0;
+   bool cacheStayedEmpty = true;
+
+   static void callback(void *context,
+                        AsyncDnsResolver::Ticket,
+                        AsyncDnsResolver::Result&& result)
+   {
+      HostsContext& state = *static_cast<HostsContext *>(context);
+      state.cacheStayedEmpty = state.cacheStayedEmpty &&
+                              state.resolver->positiveCacheCount() == 0;
+      if (state.calls++ == 0)
+      {
+         state.first = std::move(result);
+         state.resolver->resolve("zero-ttl.test",
+                                 "443",
+                                 Resolver::Family::any,
+                                 {&state, callback});
+         return;
+      }
+      state.second = std::move(result);
+      state.monitor->finish();
+   }
+};
+
+static void testHostsFileZeroTtlIsNeverCached(TestSuite& suite, DnsFixture& fixture)
+{
+   char path[] = "/tmp/basics-hosts-XXXXXX";
+   const int fd = mkstemp(path);
+   EXPECT_TRUE(suite, fd >= 0);
+   if (fd < 0)
+   {
+      return;
+   }
+   constexpr char contents[] = "127.0.0.1 zero-ttl.test\n";
+   EXPECT_EQ(suite, write(fd, contents, sizeof(contents) - 1), ssize_t(sizeof(contents) - 1));
+   close(fd);
+
+   ScenarioMonitor monitor;
+   HostsContext context;
+   context.monitor = &monitor;
+   runScenario(suite, fixture, monitor, [&](Resolver& resolver, ScenarioMonitor&) {
+      context.resolver = &resolver;
+      resolver.resolve("zero-ttl.test",
+                       "443",
+                       Resolver::Family::any,
+                       {&context, HostsContext::callback});
+   }, String(path), false);
+   unlink(path);
+
+   EXPECT_EQ(suite, context.calls, size_t(2));
+   EXPECT_TRUE(suite, context.first.status == Status::success);
+   EXPECT_TRUE(suite, context.second.status == Status::success);
+   EXPECT_EQ(suite, context.first.minimumTtlSeconds(), uint32_t(0));
+   EXPECT_EQ(suite, context.second.minimumTtlSeconds(), uint32_t(0));
+   EXPECT_FALSE(suite, context.first.fromCache);
+   EXPECT_FALSE(suite, context.second.fromCache);
+   EXPECT_TRUE(suite, context.cacheStayedEmpty);
+}
 
 static void testCancellationDeadlineAndShutdownBarrier(TestSuite& suite, DnsFixture& fixture)
 {
@@ -862,6 +1120,9 @@ int main()
    {
       testDelayedDualStackAndReload(suite, fixture);
       testNXDomainAndNegativeCache(suite, fixture);
+      testTruncatedUdpFallsBackToTcp(suite, fixture);
+      testServfailIsNotNegativeCached(suite, fixture);
+      testHostsFileZeroTtlIsNeverCached(suite, fixture);
       testCancellationDeadlineAndShutdownBarrier(suite, fixture);
       testDispatcherAndSingleOwnerAdmission(suite, fixture);
       testCachedCallbackCanReleaseIdleWrapper(suite, fixture);
