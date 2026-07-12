@@ -3,7 +3,28 @@
 NAME gxhash
 VERSION 3.5.0
 SOURCE URL https://github.com/ogxd/gxhash/archive/refs/tags/3.5.0.tar.gz
+SHA256 2193998ffd0ae6e3db5e4a53d364d98255c2a44f268a11cafbe70a44fbec6768
 BUILD_SYSTEM CARGO
-CARGO_BUILD env "RUSTFLAGS=-C target-cpu=x86-64 -C target-feature=+aes,+sse2" cargo build --release --target-dir "${DEPO_BUILD_DIR}/cargo-target" --manifest-path ffi/Cargo.toml
+CARGO_BUILD_SH <<'EOF'
+grep -Fqx 'gxhash = { path = "../", default-features = false }' ffi/Cargo.toml
+python3 - <<'PY'
+from pathlib import Path
+
+path = Path("Cargo.toml")
+line = 'rustversion = "1.0" # Compile-time cfg based on rustc version for compatibility'
+text = path.read_text()
+if text.count(line) != 1:
+    raise SystemExit("gxhash rustversion dependency contract changed")
+path.write_text(text.replace(line, "# The no-std FFI build does not compile the rustversion-gated std hasher."))
+PY
+
+case "${DEPO_TARGET_ARCH}" in
+  x86_64) rustflags='-C target-cpu=x86-64 -C target-feature=+aes,+sse2' ;;
+  aarch64|arm64) rustflags='-C target-cpu=generic -C target-feature=+aes,+neon' ;;
+  *) echo "Unsupported gxhash target architecture: ${DEPO_TARGET_ARCH}" >&2; exit 1 ;;
+esac
+
+RUSTFLAGS="$rustflags" cargo build --offline --release --target-dir "${DEPO_BUILD_DIR}/cargo-target" --manifest-path ffi/Cargo.toml
+EOF
 STAGE_FILE BUILD cargo-target/release/libgxhash.a lib/libgxhash.a
 TARGET gxhash::gxhash STATIC lib/libgxhash.a
