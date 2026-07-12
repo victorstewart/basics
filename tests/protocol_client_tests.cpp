@@ -429,31 +429,11 @@ static bool sslWriteAll(SSL *ssl, std::string_view data)
   return true;
 }
 
-static bool sslReadLine(SSL *ssl, std::string& line)
-{
-  line.clear();
-
-  while (true)
-  {
-    char byte = 0;
-    int readBytes = SSL_read(ssl, &byte, 1);
-    if (readBytes <= 0)
-    {
-      return false;
-    }
-
-    line.push_back(byte);
-    if (line.size() >= 2 && line[line.size() - 2] == '\r' && line.back() == '\n')
-    {
-      return true;
-    }
-  }
-}
-
-static bool sslReadUntil(SSL *ssl, std::string_view terminator, std::string& data)
+static bool sslReadUntilNative(SSL *ssl, const char *terminator, String& data)
 {
   data.clear();
-  std::array<char, 2048> buffer = {};
+  const size_t terminatorBytes = std::strlen(terminator);
+  std::array<uint8_t, 2048> buffer = {};
 
   while (true)
   {
@@ -464,29 +444,29 @@ static bool sslReadUntil(SSL *ssl, std::string_view terminator, std::string& dat
     }
 
     data.append(buffer.data(), size_t(readBytes));
-    if (data.find(terminator) != std::string::npos)
+    for (size_t offset = 0; offset + terminatorBytes <= data.size(); offset += 1)
     {
-      return true;
+      if (std::memcmp(data.data() + offset, terminator, terminatorBytes) == 0)
+      {
+        return true;
+      }
     }
   }
 }
 
-static bool sslReadUntilNative(SSL *ssl, const char *terminator, String& data)
-{
-  std::string fixtureData;
-  if (!sslReadUntil(ssl, terminator, fixtureData))
-  {
-    return false;
-  }
-  data.assign(fixtureData.data(), fixtureData.size());
-  return true;
-}
-
 static bool sslWriteAllNative(SSL *ssl, const String& data)
 {
-  return sslWriteAll(ssl,
-                     std::string_view(reinterpret_cast<const char *>(data.data()),
-                                      size_t(data.size())));
+  size_t offset = 0;
+  while (offset < data.size())
+  {
+    int written = SSL_write(ssl, data.data() + offset, int(data.size() - offset));
+    if (written <= 0)
+    {
+      return false;
+    }
+    offset += size_t(written);
+  }
+  return true;
 }
 
 class TLSLoopbackServer {
