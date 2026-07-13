@@ -27,7 +27,10 @@ template <typename T> concept VoidPointer = std::is_void_v<std::remove_pointer_t
 
 template <typename T> concept Pointer = VoidPointer<T> || std::is_pointer_v<std::remove_cvref_t<T>>;
 
-template <typename T> concept Integral = std::is_integral_v<std::remove_cvref_t<T>> || std::is_enum_v<std::remove_cvref_t<T>>;
+template <typename T> concept Integral = std::is_integral_v<std::remove_cvref_t<T>> ||
+                                         std::is_enum_v<std::remove_cvref_t<T>> ||
+                                         std::same_as<std::remove_cvref_t<T>, __int128_t> ||
+                                         std::same_as<std::remove_cvref_t<T>, __uint128_t>;
 
 template <typename T> concept isHashable = requires (const T& a) {
   { a.hash() } -> std::convertible_to<uint64_t>;

@@ -2664,7 +2664,7 @@ public:
 
         if (exit)
         {
-          return;
+          break;
         }
       }
 

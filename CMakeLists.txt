@@ -3,7 +3,7 @@
 
 cmake_minimum_required(VERSION 3.21)
 
-project(basics VERSION 0.4.1 LANGUAGES CXX)
+project(basics VERSION 0.4.2 LANGUAGES CXX)
 
 include(CTest)
 include("${CMAKE_CURRENT_SOURCE_DIR}/.depos.cmake")
@@ -261,6 +261,8 @@ if (NOT BUILD_TESTING)
   return()
 endif()
 
+depos_depend("${CMAKE_CURRENT_SOURCE_DIR}/depofiles/libbpf.DepoFile")
+
 _basics_add_test_executable(basics_codec_tests tests/codec_tests.cpp)
 _basics_add_test_executable(basics_async_dns_tests tests/async_dns_tests.cpp)
 _basics_add_test_executable(basics_async_dns_cares_tests tests/async_dns_cares_tests.cpp)
@@ -276,6 +278,8 @@ _basics_add_test_executable(basics_codec_fuzz_tests tests/codec_fuzz_tests.cpp)
 _basics_add_test_executable(basics_bitsery_tests tests/bitsery_tests.cpp)
 _basics_add_test_executable(basics_containers_tests tests/containers_tests.cpp)
 _basics_add_test_executable(basics_ebpf_program_tests tests/ebpf_program_tests.cpp)
+depos_link(basics_ebpf_program_tests__objects PRIVATE libbpf::libbpf)
+depos_link(basics_ebpf_program_tests PRIVATE libbpf::libbpf)
 _basics_add_test_executable(basics_filesystem_tests tests/filesystem_tests.cpp)
 _basics_add_test_executable(basics_linux_integration_tests tests/linux_integration_tests.cpp)
 _basics_add_test_executable(basics_memfd_reflection_tests tests/memfd_reflection_tests.cpp)

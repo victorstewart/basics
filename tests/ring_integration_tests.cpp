@@ -848,6 +848,54 @@ static void testCompletionBatchCanQuiesceRing(TestSuite& suite)
   EXPECT_TRUE(suite, interfacer.batchHandled);
 }
 
+static void testRingStartAdvancesCompletionBeforeExit(TestSuite& suite)
+{
+  struct ExitOnTimeoutInterface : RingInterface {
+    TimeoutPacket first = {};
+    TimeoutPacket second = {};
+    uint32_t firstCount = 0;
+    uint32_t secondCount = 0;
+
+    ExitOnTimeoutInterface()
+    {
+      first.setTimeoutMs(1);
+      second.setTimeoutMs(1);
+    }
+
+    void timeoutHandler(TimeoutPacket *packet, int result) override
+    {
+      if (result == -ETIME && packet == &first)
+      {
+        ++firstCount;
+      }
+      else if (result == -ETIME && packet == &second)
+      {
+        ++secondCount;
+      }
+      Ring::exit = true;
+    }
+  } interfacer;
+
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(32, 32, 4, 2, -1, -1, 4);
+  Ring::queueTimeout(&interfacer.first);
+  Ring::start();
+  Ring::exit = false;
+  Ring::queueTimeout(&interfacer.second);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  EXPECT_EQ(suite, interfacer.firstCount, uint32_t(1));
+  EXPECT_EQ(suite, interfacer.secondCount, uint32_t(1));
+}
+
 static void runRingScenario(TestSuite& suite)
 {
   RingScenarioInterface interfacer(suite);
@@ -1505,6 +1553,7 @@ int main()
   testIsolatedWorkerRingPreservesProcessIntegration(suite);
   runRingScenario(suite);
   testCompletionBatchCanQuiesceRing(suite);
+  testRingStartAdvancesCompletionBeforeExit(suite);
   testRawFDPollReadinessCancellationAndRace(suite);
   testRingletSendRecvAndTimeout(suite);
   testCanceledWaitidReachesOwner(suite);

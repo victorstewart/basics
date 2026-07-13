@@ -75,6 +75,9 @@ static void testNoncryptoHasher(TestSuite& suite)
   uint64_t integral = 0x0102030405060708ULL;
   EXPECT_EQ(suite, hasher(integral), size_t(Hasher::hash<Hasher::SeedPolicy::thread_shared>(reinterpret_cast<const uint8_t *>(&integral), sizeof(integral))));
 
+  uint128_t wideIntegral = (uint128_t(0x0102030405060708ULL) << 64) | uint128_t(0x1112131415161718ULL);
+  EXPECT_EQ(suite, hasher(wideIntegral), size_t(Hasher::hash<Hasher::SeedPolicy::thread_shared>(reinterpret_cast<const uint8_t *>(&wideIntegral), sizeof(wideIntegral))));
+
   int pointedValue = 41;
   int *pointer = &pointedValue;
   EXPECT_EQ(suite, hasher(pointer), size_t(Hasher::hash<Hasher::SeedPolicy::thread_shared>(reinterpret_cast<const uint8_t *>(&pointer), sizeof(pointer))));
