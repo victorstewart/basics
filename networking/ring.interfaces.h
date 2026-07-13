@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <networking/includes.h>
-#include <networking/time.h>
+#include <cstdlib>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+
+#include <networking/includes.h>
+#include <networking/time.h>
 
 struct io_uring_recvmsg_out;
 
@@ -47,6 +49,14 @@ public:
   virtual void rawFDPollHandler(void *owner, uint64_t generation, uint64_t ticket, int result) {}
 
   virtual void waitidHandler(void *waiter) {}
+  virtual void waitidResultHandler(void *waiter, int result)
+  {
+    if (result < 0)
+    {
+      std::abort();
+    }
+    waitidHandler(waiter);
+  }
 
   virtual void restartMultishotRecvMsgOn(void *socket) {}
   virtual void timeoutHandler(TimeoutPacket *packet, int result) {}

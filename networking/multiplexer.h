@@ -107,6 +107,13 @@ public:
     });
   }
 
+  void waitidResultHandler(void *waiter, int result) override
+  {
+    distributeContains(waiter, [&](RingInterface *interface) {
+      interface->waitidResultHandler(waiter, result);
+    });
+  }
+
   void timeoutHandler(TimeoutPacket *packet, int result)
   {
     if (packet && packet->dispatcher)

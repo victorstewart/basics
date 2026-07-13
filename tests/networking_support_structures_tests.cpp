@@ -67,11 +67,13 @@ struct RecordingRingInterface : RingInterface {
   int rawPollCalls = 0;
   int timeoutCalls = 0;
   int waitidCalls = 0;
+  int waitidResultCalls = 0;
   int lastAcceptSlot = -1;
   int lastRecvResult = 0;
   int lastPollResult = 0;
   int lastRawPollResult = 0;
   int lastTimeoutResult = 0;
+  int lastWaitidResult = 0;
   void *lastSocket = nullptr;
   void *lastRawPollOwner = nullptr;
   uint64_t lastRawPollGeneration = 0;
@@ -126,6 +128,13 @@ struct RecordingRingInterface : RingInterface {
   {
     ++waitidCalls;
     lastWaiter = waiter;
+  }
+
+  void waitidResultHandler(void *waiter, int result) override
+  {
+    ++waitidResultCalls;
+    lastWaiter = waiter;
+    lastWaitidResult = result;
   }
 };
 
@@ -516,6 +525,10 @@ static void testRingDispatcherRoutesHandlers(TestSuite& suite)
   scope.localDispatcher.waitidHandler(&waiterToken);
   EXPECT_EQ(suite, interfaceTarget.waitidCalls, 1);
   EXPECT_TRUE(suite, interfaceTarget.lastWaiter == &waiterToken);
+
+  scope.localDispatcher.waitidResultHandler(&waiterToken, -ECANCELED);
+  EXPECT_EQ(suite, interfaceTarget.waitidResultCalls, 1);
+  EXPECT_EQ(suite, interfaceTarget.lastWaitidResult, -ECANCELED);
 
   RingDispatcher::eraseMultiplexee(&socketToken);
   scope.localDispatcher.closeHandler(&socketToken);

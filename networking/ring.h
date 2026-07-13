@@ -828,7 +828,6 @@ public:
     // idtype_t
     // P_PID    == pid of child
     // P_PIDFD  == pid of pidfd
-
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_waitid(sqe, idtype, id, &waiter->infop, WEXITED, 0);
     sqe->flags |= IOSQE_ASYNC;
@@ -1318,10 +1317,18 @@ public:
    static void queueCancel(T *socket, Operation op)
    {
       struct io_uring_sqe *sqe = getSQESafe();
-      uint64_t targetUserData = socketOperationUserData(socket, op);
-      if (targetUserData == 0)
+      uint64_t targetUserData = 0;
+      if (op == Operation::waitid)
       {
-        targetUserData = getUserDataFor(op, socketIdentity(socket), uint8_t(socket->ioGeneration));
+        targetUserData = getUserDataFor(op, socketIdentity(socket));
+      }
+      else
+      {
+        targetUserData = socketOperationUserData(socket, op);
+        if (targetUserData == 0)
+        {
+          targetUserData = getUserDataFor(op, socketIdentity(socket), uint8_t(socket->ioGeneration));
+        }
       }
       io_uring_prep_cancel64(sqe, targetUserData, IORING_ASYNC_CANCEL_ANY);
       setUserData(sqe, Operation::cancel, socketIdentity(socket), socket->ioGeneration);
@@ -2377,11 +2384,7 @@ public:
             }
           case Operation::waitid:
             {
-              if (result < 0)
-              {
-                std::abort();
-              }
-              interfacer->waitidHandler(object);
+              interfacer->waitidResultHandler(object, result);
               break;
             }
           case Operation::connect:

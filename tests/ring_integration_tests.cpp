@@ -1077,6 +1077,68 @@ static void testRingletSendRecvAndTimeout(TestSuite& suite)
   ::close(fds[1]);
 }
 
+static void testCanceledWaitidReachesOwner(TestSuite& suite)
+{
+  WaitableSigChldScope waitableSigChld;
+  pid_t child = fork();
+  if (child == 0)
+  {
+    pause();
+    _exit(0);
+  }
+  EXPECT_TRUE(suite, child > 0);
+  if (child <= 0)
+  {
+    return;
+  }
+
+  struct Target final : RingInterface, UnixSocket, WaitableProcess
+  {
+    TimeoutPacket deadline;
+    int waitResult = 0;
+    bool completed = false;
+
+    Target()
+    {
+      deadline.setTimeoutSeconds(2);
+    }
+
+    void waitidResultHandler(void *waiter, int result) override
+    {
+      completed = (waiter == this);
+      waitResult = result;
+      Ring::exit = true;
+    }
+
+    void timeoutHandler(TimeoutPacket *packet, int result) override
+    {
+      if (packet == &deadline && result != -ECANCELED)
+      {
+        Ring::exit = true;
+      }
+    }
+  } target;
+
+  Ring::interfacer = &target;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(32, 32, 8, 2, -1, -1, 8);
+  Ring::queueWaitid(&target, P_PID, id_t(child));
+  Ring::queueCancel(&target, Ring::Operation::waitid);
+  Ring::queueTimeout(&target.deadline);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  EXPECT_TRUE(suite, target.completed);
+  EXPECT_EQ(suite, target.waitResult, -ECANCELED);
+  (void)kill(child, SIGKILL);
+  (void)waitpid(child, nullptr, 0);
+}
+
 static void testDuplicateQueueCloseIsIdempotent(TestSuite& suite)
 {
   int fds[2] = {-1, -1};
@@ -1445,6 +1507,7 @@ int main()
   testCompletionBatchCanQuiesceRing(suite);
   testRawFDPollReadinessCancellationAndRace(suite);
   testRingletSendRecvAndTimeout(suite);
+  testCanceledWaitidReachesOwner(suite);
   testDuplicateQueueCloseIsIdempotent(suite);
   testAcceptedCloseRawReturnsDynamicSlot(suite);
   testQueuedSendDrainsFramesBehindCompletedHandshake(suite);
