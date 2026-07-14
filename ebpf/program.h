@@ -85,6 +85,7 @@ private:
 	enum bpf_attach_type attachtype = static_cast<enum bpf_attach_type>(0);
 	bool progFDOwnedByObject = false;
 	bool loadedFromPreattached = false;
+	struct bpf_link *link = nullptr;
 	__u32 expectedPreattachedMapCount = 0;
 	std::vector<char> kernelLog;
 
@@ -727,6 +728,30 @@ public:
 		{
 			attachidx = ifidx;
 			attachtype = progtype;
+			if (progtype == BPF_TCX_INGRESS || progtype == BPF_TCX_EGRESS)
+			{
+				struct bpf_tcx_opts opts = {};
+				opts.sz = sizeof(opts);
+				link = bpf_program__attach_tcx(prog, ifidx, &opts);
+				int error = int(libbpf_get_error(link));
+				if (error == 0)
+				{
+					return true;
+				}
+
+				link = nullptr;
+				errno = -error;
+				basics_log("BPFProgram::loadAttach TCX link failed fd=%d ifidx=%d attach_type=%d error=%d errno=%d path=%s program=%s\n",
+					prog_fd,
+					ifidx,
+					int(progtype),
+					error,
+					errno,
+					progpath.c_str(),
+					progname.c_str());
+				close();
+				return false;
+			}
 
 			// https://github.com/torvalds/linux/blob/b401b621758e46812da61fa58a67c3fd8d91de0d/include/uapi/linux/bpf.h#L1000
 
@@ -754,6 +779,23 @@ public:
 
 	void detach(void)
 	{
+		if (link != nullptr)
+		{
+			int result = bpf_link__destroy(link);
+			if (result != 0)
+			{
+				basics_log("BPFProgram::detach link failed fd=%d ifidx=%d attach_type=%d result=%d errno=%d\n",
+					prog_fd,
+					attachidx,
+					int(attachtype),
+					result,
+					errno);
+			}
+			link = nullptr;
+			attachidx = -1;
+			return;
+		}
+
 		if (attachidx > -1)
 		{
 			int result = bpf_prog_detach_opts(prog_fd, attachidx, attachtype, nullptr);

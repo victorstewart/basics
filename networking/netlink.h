@@ -1700,11 +1700,15 @@ public:
 
       bpf_progs.erase(it);
 
-      generateRequest([&](NetlinkMessage *request) -> void {
-        socket.detachXDPProgFromInterface(request, 0, ifidx, xdp_flags);
-      });
-
-      flushDiscard();
+      int result = bpf_xdp_detach(ifidx, xdp_flags, nullptr);
+      if (result != 0)
+      {
+        basics_log("NetDevice::detachXDP failed ifidx=%u flags=%u result=%d errno=%d\n",
+          ifidx,
+          xdp_flags,
+          result,
+          errno);
+      }
       xdp_flags = 0;
     }
   }

@@ -31,6 +31,7 @@
 namespace {
 
 constexpr const char *kProgramName = "xdp_pass";
+constexpr const char *kTCXProgramName = "tcx_pass";
 constexpr const char *kMapName = "counters";
 constexpr const char *kOverlapMap4Name = "owned_routable_prefixes4";
 constexpr const char *kOverlapMap6Name = "owned_routable_prefixes6";
@@ -280,6 +281,53 @@ static bool compileTruncatedMapFixtureProgram(CompiledProgramFixture& fixture)
   return exitCode == 0;
 }
 
+static bool compileTCXFixtureProgram(CompiledProgramFixture& fixture)
+{
+  if (fixture.tempDirectory.valid() == false)
+  {
+    return false;
+  }
+
+  fixture.sourcePath = fixture.tempDirectory.child("tcx_pass.c");
+  fixture.objectPath = fixture.tempDirectory.child("tcx_pass.o");
+
+  std::ofstream source(fixture.sourcePath);
+  if (source.is_open() == false)
+  {
+    return false;
+  }
+
+  source
+    << "#include <linux/bpf.h>\n"
+    << "#include <bpf/bpf_helpers.h>\n"
+    << "\n"
+    << "SEC(\"tcx/egress\")\n"
+    << "int " << kTCXProgramName << "(struct __sk_buff *skb)\n"
+    << "{\n"
+    << "  return TCX_NEXT;\n"
+    << "}\n"
+    << "\n"
+    << "char LICENSE[] SEC(\"license\") = \"GPL\";\n";
+
+  source.close();
+  if (source.good() == false)
+  {
+    return false;
+  }
+
+  return runCommand({
+    "clang",
+    "-O2",
+    "-g",
+    "-target",
+    "bpf",
+    "-c",
+    fixture.sourcePath,
+    "-o",
+    fixture.objectPath,
+  }) == 0;
+}
+
 static size_t countProgramsNamed(std::string_view programName)
 {
   size_t count = 0;
@@ -505,6 +553,64 @@ static void testLoopbackXDPAttach(EBPFTestContext& context, const CompiledProgra
   EXPECT_EQ(context.suite(), countProgramsNamed(kProgramName), baselineProgramCount);
 }
 
+static void testTCXLinkAttach(EBPFTestContext& context, const CompiledProgramFixture& fixture)
+{
+  if (haveRuntimeLoadSupport() == false)
+  {
+    context.skip("TCX attach requires root or CAP_BPF on this host");
+    return;
+  }
+
+  std::string deviceName = "btcx" + std::to_string(getpid());
+  std::string peerName = "btcp" + std::to_string(getpid());
+  deviceName.resize(std::min(deviceName.size(), size_t(IFNAMSIZ - 1)));
+  peerName.resize(std::min(peerName.size(), size_t(IFNAMSIZ - 1)));
+  if (runCommand({"ip", "link", "add", deviceName, "type", "veth", "peer", "name", peerName}) != 0)
+  {
+    context.skip("TCX test veth creation is unavailable on this host");
+    return;
+  }
+
+  auto removeVeth = [&] (void) -> void {
+    (void)runCommand({"ip", "link", "del", deviceName});
+  };
+
+  NetDevice device;
+  initializeNetDevice(device);
+  device.name.assign(deviceName.c_str(), deviceName.size());
+  device.getInfo();
+  if (device.ifidx == 0)
+  {
+    removeVeth();
+    context.skip("TCX test veth lookup failed");
+    return;
+  }
+
+  size_t baselineProgramCount = countProgramsNamed(kTCXProgramName);
+  BPFProgram *program = device.attachBPF(BPF_TCX_EGRESS, fixture.objectPath, String(kTCXProgramName));
+  EXPECT_TRUE(context.suite(), program != nullptr);
+  if (program != nullptr)
+  {
+    __u32 programID = 0;
+    struct bpf_prog_query_opts opts = {};
+    opts.sz = sizeof(opts);
+    opts.prog_ids = &programID;
+    opts.prog_cnt = 1;
+    EXPECT_EQ(context.suite(), bpf_prog_query_opts(device.ifidx, BPF_TCX_EGRESS, &opts), 0);
+    EXPECT_TRUE(context.suite(), programID != 0);
+    EXPECT_EQ(context.suite(), countProgramsNamed(kTCXProgramName), baselineProgramCount + 1);
+
+    device.detachBPF(BPF_TCX_EGRESS);
+    programID = 0;
+    opts.prog_cnt = 1;
+    EXPECT_EQ(context.suite(), bpf_prog_query_opts(device.ifidx, BPF_TCX_EGRESS, &opts), 0);
+    EXPECT_EQ(context.suite(), programID, 0U);
+    EXPECT_EQ(context.suite(), countProgramsNamed(kTCXProgramName), baselineProgramCount);
+  }
+
+  removeVeth();
+}
+
 static void testPreattachedMapReopenDisambiguatesTruncatedNames(EBPFTestContext& context, const CompiledProgramFixture& fixture)
 {
   if (haveRuntimeLoadSupport() == false)
@@ -629,6 +735,14 @@ int main()
 
   testLoadAndCleanup(context, fixture);
   testLoopbackXDPAttach(context, fixture);
+
+  CompiledProgramFixture tcxFixture;
+  if (compileTCXFixtureProgram(tcxFixture) == false)
+  {
+    context.skip("clang with TCX BPF support is unavailable");
+    return context.finish();
+  }
+  testTCXLinkAttach(context, tcxFixture);
 
   CompiledProgramFixture truncatedMapFixture;
   if (compileTruncatedMapFixtureProgram(truncatedMapFixture) == false)
