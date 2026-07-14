@@ -919,6 +919,8 @@ public:
       options.hosts_path = backendConfig.hostsPath.empty()
                                ? nullptr
                                : const_cast<char *>(backendConfig.hostsPath.c_str());
+      char hostsFirstLookups[] = "fb";
+      options.lookups = options.hosts_path ? hostsFirstLookups : nullptr;
       int optionMask = ARES_OPT_FLAGS |
                        ARES_OPT_TIMEOUTMS |
                        ARES_OPT_TRIES |
@@ -927,7 +929,7 @@ public:
                        ARES_OPT_SOCK_STATE_CB;
       if (options.hosts_path)
       {
-         optionMask |= ARES_OPT_HOSTS_FILE;
+         optionMask |= ARES_OPT_HOSTS_FILE | ARES_OPT_LOOKUPS;
       }
       if (options.udp_max_queries > 0)
       {

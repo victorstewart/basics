@@ -69,6 +69,20 @@ foreach(_basics_required_bind_fragment IN ITEMS
     message(FATAL_ERROR "RingAsyncDnsResolver must retain bounded transport-specific local binds; missing '${_basics_required_bind_fragment}'.")
   endif()
 endforeach()
+foreach(_basics_required_hosts_fragment IN ITEMS
+  "char hostsFirstLookups[] = \"fb\""
+  "options.lookups = options.hosts_path ? hostsFirstLookups : nullptr"
+  "ARES_OPT_HOSTS_FILE | ARES_OPT_LOOKUPS"
+)
+  string(FIND
+    "${_basics_cares_header}"
+    "${_basics_required_hosts_fragment}"
+    _basics_required_hosts_index
+  )
+  if (_basics_required_hosts_index EQUAL -1)
+    message(FATAL_ERROR "An explicit c-ares hosts path must remain files-first regardless of system NSS order; missing '${_basics_required_hosts_fragment}'.")
+  endif()
+endforeach()
 
 file(READ "${BASICS_SOURCE_DIR}/networking/multi.curl.client.h" _basics_multi_curl_header)
 foreach(_basics_required_http_fragment IN ITEMS
