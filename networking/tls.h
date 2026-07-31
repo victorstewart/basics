@@ -516,9 +516,12 @@ public:
           int sslError = SSL_get_error(ssl, bytesRead);
           switch (sslError)
           {
+            case SSL_ERROR_ZERO_RETURN:
+              {
+                return false;
+              }
             case SSL_ERROR_SYSCALL:
             case SSL_ERROR_SSL:
-            case SSL_ERROR_ZERO_RETURN:
               {
                 unsigned long opensslError = ERR_peek_last_error();
                 std::fprintf(stderr,
@@ -551,11 +554,17 @@ public:
   {
     SSL_CTX *context = tlsctx;
     bool isServer = tlsServer;
+    if (context != nullptr && SSL_CTX_up_ref(context) != 1)
+    {
+      destroyTLS();
+      return;
+    }
     destroyTLS();
 
     if (context != nullptr)
     {
       setupTLS(context, isServer);
+      SSL_CTX_free(context);
     }
   }
 

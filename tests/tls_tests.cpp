@@ -3,8 +3,11 @@
 #include "tests/test_support.h"
 #include "tests/tls_support.h"
 
+#include <array>
+#include <cstdio>
 #include <string>
 #include <string_view>
+#include <unistd.h>
 
 #include <openssl/x509.h>
 
@@ -18,6 +21,70 @@ using tls_test_support::negotiateTLS;
 using tls_test_support::pumpTLS;
 using tls_test_support::readPeerMaterial;
 using tls_test_support::TLSMaterial;
+
+struct CapturedStderr {
+  bool completed = false;
+  bool result = false;
+  std::string output;
+};
+
+struct ContextLifetimeProbe {
+  bool freed = false;
+};
+
+static void noteContextFreed(
+    void *,
+    void *value,
+    CRYPTO_EX_DATA *,
+    int,
+    long,
+    void *)
+{
+  if (value != nullptr)
+  {
+    static_cast<ContextLifetimeProbe *>(value)->freed = true;
+  }
+}
+
+template <typename Operation>
+static CapturedStderr captureStderr(Operation&& operation)
+{
+  CapturedStderr capture;
+  FILE *sink = std::tmpfile();
+  if (sink == nullptr)
+  {
+    return capture;
+  }
+
+  int savedStderr = dup(STDERR_FILENO);
+  if (savedStderr < 0)
+  {
+    std::fclose(sink);
+    return capture;
+  }
+
+  std::fflush(stderr);
+  if (dup2(fileno(sink), STDERR_FILENO) != STDERR_FILENO)
+  {
+    close(savedStderr);
+    std::fclose(sink);
+    return capture;
+  }
+
+  capture.result = operation();
+  std::fflush(stderr);
+  capture.completed = (dup2(savedStderr, STDERR_FILENO) == STDERR_FILENO);
+  close(savedStderr);
+
+  std::rewind(sink);
+  std::array<char, 256> bytes = {};
+  while (size_t count = std::fread(bytes.data(), 1, bytes.size(), sink))
+  {
+    capture.output.append(bytes.data(), count);
+  }
+  std::fclose(sink);
+  return capture;
+}
 
 static void clearBasicsCtx()
 {
@@ -173,12 +240,58 @@ static void testHandshakeDataFlowAndReset(TestSuite& suite)
   EXPECT_TRUE(suite, madeProgress);
   EXPECT_STRING_EQ(suite, clientPlain, "response payload");
 
+  clientWire.append("final payload");
+  EXPECT_TRUE(suite, client.encryptInto(clientWire));
+  uint32_t finalPayloadCiphertextBytes =
+      static_cast<uint32_t>(clientWire.outstandingBytes());
+  EXPECT_TRUE(suite, finalPayloadCiphertextBytes > 0);
+
+  EXPECT_EQ(suite, SSL_shutdown(client.ssl), 0);
+  BIO *clientOutbound = SSL_get_wbio(client.ssl);
+  uint32_t closeNotifyBytes = static_cast<uint32_t>(BIO_ctrl_pending(clientOutbound));
+  EXPECT_TRUE(suite, closeNotifyBytes > 0);
+  EXPECT_TRUE(suite, ensureTailCapacity(clientWire, closeNotifyBytes));
+  int closeNotifyRead =
+      BIO_read(clientOutbound, clientWire.pTail(), static_cast<int>(closeNotifyBytes));
+  EXPECT_EQ(suite, closeNotifyRead, static_cast<int>(closeNotifyBytes));
+  if (closeNotifyRead > 0)
+  {
+    clientWire.advance(static_cast<uint32_t>(closeNotifyRead));
+  }
+
+  Buffer orderlyShutdown(128, MemoryType::heap);
+  orderlyShutdown.append("keep");
+  uint32_t coalescedCiphertextBytes =
+      static_cast<uint32_t>(clientWire.outstandingBytes());
+  EXPECT_EQ(
+      suite,
+      coalescedCiphertextBytes,
+      finalPayloadCiphertextBytes + closeNotifyBytes);
+  EXPECT_TRUE(suite, ensureTailCapacity(orderlyShutdown, coalescedCiphertextBytes));
+  std::memcpy(
+      orderlyShutdown.pTail(),
+      clientWire.pHead(),
+      coalescedCiphertextBytes);
+  CapturedStderr closeNotifyCapture =
+      captureStderr([&] {
+        return server.decryptFrom(orderlyShutdown, coalescedCiphertextBytes);
+      });
+  EXPECT_TRUE(suite, closeNotifyCapture.completed);
+  EXPECT_FALSE(suite, closeNotifyCapture.result);
+  EXPECT_TRUE(suite, closeNotifyCapture.output.empty());
+  EXPECT_STRING_EQ(suite, orderlyShutdown, "keepfinal payload");
+  EXPECT_TRUE(suite, (SSL_get_shutdown(server.ssl) & SSL_RECEIVED_SHUTDOWN) != 0);
+
   Buffer preserved(128, MemoryType::heap);
   preserved.append("keep");
   uint8_t invalidRecord[] = {0x17, 0x03, 0x03, 0x00, 0x02, 0xff, 0xff};
   EXPECT_TRUE(suite, ensureTailCapacity(preserved, sizeof(invalidRecord)));
   std::memcpy(preserved.pTail(), invalidRecord, sizeof(invalidRecord));
-  EXPECT_FALSE(suite, client.decryptFrom(preserved, sizeof(invalidRecord)));
+  CapturedStderr invalidRecordCapture =
+      captureStderr([&] { return client.decryptFrom(preserved, sizeof(invalidRecord)); });
+  EXPECT_TRUE(suite, invalidRecordCapture.completed);
+  EXPECT_FALSE(suite, invalidRecordCapture.result);
+  EXPECT_TRUE(suite, invalidRecordCapture.output.find("SSL_ERROR_SSL") != std::string::npos);
   EXPECT_STRING_EQ(suite, preserved, "keep");
 
   client.resetTLS();
@@ -196,6 +309,60 @@ static void testHandshakeDataFlowAndReset(TestSuite& suite)
 
   freeCtx(clientContext);
   freeCtx(serverContext);
+}
+
+static void testResetRetainsRotatedContext(TestSuite& suite)
+{
+  TLSMaterial peerA = readPeerMaterial("peer-a");
+  clearBasicsCtx();
+  EXPECT_TRUE(suite, TLSBase::configureBasicsCtxFromPEM(
+      peerA.chain.data(), static_cast<uint32_t>(peerA.chain.size()),
+      peerA.cert.data(), static_cast<uint32_t>(peerA.cert.size()),
+      peerA.key.data(), static_cast<uint32_t>(peerA.key.size())));
+  SSL_CTX *originalContext = TLSBase::basicsCtx;
+  if (originalContext == nullptr)
+  {
+    return;
+  }
+
+  int probeIndex = SSL_CTX_get_ex_new_index(
+      0,
+      nullptr,
+      nullptr,
+      nullptr,
+      noteContextFreed);
+  ContextLifetimeProbe probe;
+  EXPECT_TRUE(suite, probeIndex >= 0);
+  if (probeIndex < 0)
+  {
+    clearBasicsCtx();
+    return;
+  }
+  int probeInstalled = SSL_CTX_set_ex_data(originalContext, probeIndex, &probe);
+  EXPECT_EQ(suite, probeInstalled, 1);
+  if (probeInstalled != 1)
+  {
+    clearBasicsCtx();
+    return;
+  }
+
+  TLSBase stream(originalContext, true);
+  EXPECT_TRUE(suite, stream.ssl != nullptr);
+  EXPECT_TRUE(suite, TLSBase::configureBasicsCtxFromPEM(
+      peerA.chain.data(), static_cast<uint32_t>(peerA.chain.size()),
+      peerA.cert.data(), static_cast<uint32_t>(peerA.cert.size()),
+      peerA.key.data(), static_cast<uint32_t>(peerA.key.size())));
+  EXPECT_TRUE(suite, TLSBase::basicsCtx != originalContext);
+  EXPECT_FALSE(suite, probe.freed);
+
+  stream.resetTLS();
+  EXPECT_FALSE(suite, probe.freed);
+  EXPECT_TRUE(suite, stream.ssl != nullptr);
+  EXPECT_TRUE(suite, SSL_get_SSL_CTX(stream.ssl) == originalContext);
+
+  stream.destroyTLS();
+  EXPECT_TRUE(suite, probe.freed);
+  clearBasicsCtx();
 }
 
 static void testVerificationFailureAndNullSetup(TestSuite& suite)
@@ -263,6 +430,7 @@ int main()
   TestSuite suite;
   testContextLoadingAndStaticConfiguration(suite);
   testHandshakeDataFlowAndReset(suite);
+  testResetRetainsRotatedContext(suite);
   testVerificationFailureAndNullSetup(suite);
   return suite.finish("tls_tests");
 }
