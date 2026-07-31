@@ -5,6 +5,7 @@ VERSION 1.7.0
 DEPENDS libelf VERSION 0.195
 DEPENDS zlib VERSION 1.3.2
 SOURCE URL https://github.com/libbpf/libbpf/archive/refs/tags/v1.7.0.tar.gz
+SHA256 7ab5feffbf78557f626f2e3e3204788528394494715a30fc2070fcddc2051b7b
 BUILD_SYSTEM AUTOCONF
 AUTOCONF_SKIP_CONFIGURE
 AUTOCONF_BUILD env BUILD_STATIC_ONLY=y NO_PKG_CONFIG=1 OBJDIR="${DEPO_BUILD_DIR}" "EXTRA_CFLAGS=-Wno-error=incompatible-pointer-types-discards-qualifiers -I${dep:libelf}/include -I${dep:zlib}/include" "EXTRA_LDFLAGS=-L${dep:libelf}/lib -L${dep:zlib}/lib" make -C src -j$(nproc)

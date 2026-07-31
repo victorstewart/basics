@@ -3,6 +3,7 @@
 NAME simdjson
 VERSION 4.6.3
 SOURCE URL https://github.com/simdjson/simdjson/archive/refs/tags/v4.6.3.tar.gz
+SHA256 bde0c42f43899c4c5c48be826c09abd22500ed537b89f16b3cced5eec477c263
 BUILD_SYSTEM CMAKE
 CMAKE_DEFINE CMAKE_INSTALL_INCLUDEDIR=include/simdjson
 CMAKE_DEFINE SIMDJSON_ENABLE_THREADS=OFF

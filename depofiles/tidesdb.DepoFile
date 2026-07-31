@@ -8,6 +8,7 @@ DEPENDS zstd VERSION 1.5.7
 DEPENDS snappy VERSION 1.2.2
 DEPENDS lz4 VERSION 1.10.0
 SOURCE URL https://github.com/tidesdb/tidesdb/archive/refs/tags/v9.3.5.tar.gz
+SHA256 1cf1cbb677662c62fcf719c801e9be130b94843fab47c9a33a0acb8b407261cd
 BUILD_SYSTEM CMAKE
 CMAKE_ARG "-DCMAKE_PREFIX_PATH=${dep:zstd};${dep:snappy};${dep:lz4}"
 CMAKE_ARG "-DCMAKE_C_FLAGS=-I${dep:zstd}/include -I${dep:snappy}/include -I${dep:lz4}/include"

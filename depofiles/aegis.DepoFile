@@ -1,6 +1,7 @@
 NAME aegis
 VERSION 0.10.1
 SOURCE URL https://github.com/aegis-aead/libaegis/archive/refs/tags/0.10.1.tar.gz
+SHA256 0f3350dabf1d54ddb94a34a8fc8509ba21cb8431a841a98be78ec274238a86fc
 BUILD_SYSTEM CMAKE
 CMAKE_DEFINE CMAKE_INSTALL_INCLUDEDIR=include/aegis
 TARGET aegis::aegis STATIC lib/libaegis.a INTERFACE include

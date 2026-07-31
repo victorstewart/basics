@@ -4,6 +4,7 @@ NAME mimalloc
 VERSION 3.3.2
 PRIMARY_TARGET mimalloc::mimalloc
 SOURCE URL https://github.com/microsoft/mimalloc/archive/refs/tags/v3.3.2.tar.gz
+SHA256 ca02384e007f46950598500dfaebde5ff9948c1d231f5a81b058799afa64bbbb
 BUILD_SYSTEM CMAKE
 CMAKE_DEFINE MI_BUILD_SHARED=ON
 CMAKE_DEFINE MI_BUILD_STATIC=ON
