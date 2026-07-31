@@ -189,6 +189,7 @@ public:
   using Base = std::vector<Value, VectorAllocator<Value>>;
   using typename Base::const_iterator;
   using typename Base::iterator;
+  using Base::Base;
 
   iterator erase(iterator position)
   {
@@ -203,6 +204,16 @@ public:
   iterator erase(const_iterator first, const_iterator last)
   {
     return Base::erase(first, last);
+  }
+
+  bool operator==(const Vector& opposing) const
+  {
+    return static_cast<const Base&>(*this) == static_cast<const Base&>(opposing);
+  }
+
+  bool operator!=(const Vector& opposing) const
+  {
+    return (*this == opposing) == false;
   }
 
   bool contains(const Value& value) const

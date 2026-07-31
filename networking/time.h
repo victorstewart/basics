@@ -64,10 +64,10 @@ public:
 class TimeoutPacket : public Timeout {
 public:
 
-  uint128_t identifier; // you can't trust pointers across async bounds, might've been destroyed
-  uint64_t flags;
-  void *payload;
-  void *originator;
+  uint128_t identifier = 0; // you can't trust pointers across async bounds, might've been destroyed
+  uint64_t flags = 0;
+  void *payload = nullptr;
+  void *originator = nullptr;
   TimeoutDispatcher *dispatcher = nullptr;
 
   TimeoutPacket() = default;

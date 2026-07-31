@@ -3,6 +3,7 @@
 #include <limits>
 
 #include "tests/test_support.h"
+#include "types/types.containers.h"
 
 static void testRawBufferConstructorRespectsExplicitLength(TestSuite& suite)
 {
@@ -141,6 +142,31 @@ static void testFormatterNumericTokens(TestSuite& suite)
   output.snprintf<"int={itoa} hex={itoh} float={dtoa:2}"_ctv>(int64_t(-42), uint32_t(0x1f), 3.14159);
 
   EXPECT_STRING_EQ(suite, output, "int=-42 hex=0x1f float=3.14"_ctv);
+
+  constexpr uint128_t uuid = (uint128_t(0x08537fb70ea8d4bc) << 64) | 0x789b3da6ccacf74f;
+  String assigned;
+  assigned.assignItoa(uuid);
+  EXPECT_STRING_EQ(suite, assigned, "11067374974848015842483059175252096847"_ctv);
+
+  output.snprintf<"uuid={itoa}"_ctv>(uuid);
+  EXPECT_STRING_EQ(suite, output, "uuid=11067374974848015842483059175252096847"_ctv);
+}
+
+static void testIntegerDecimalBoundaries(TestSuite& suite)
+{
+  String falseValue(false);
+  String trueValue(true);
+  EXPECT_STRING_EQ(suite, falseValue, "0"_ctv);
+  EXPECT_STRING_EQ(suite, trueValue, "1"_ctv);
+
+  String zero(uint128_t(0));
+  EXPECT_STRING_EQ(suite, zero, "0"_ctv);
+
+  String unsignedMaximum(std::numeric_limits<uint128_t>::max());
+  EXPECT_STRING_EQ(suite, unsignedMaximum, "340282366920938463463374607431768211455"_ctv);
+
+  String signedMinimum(std::numeric_limits<int128_t>::min());
+  EXPECT_STRING_EQ(suite, signedMinimum, "-170141183460469231731687303715884105728"_ctv);
 }
 
 static void testAppendTabsAndPlus(TestSuite& suite)
@@ -153,6 +179,24 @@ static void testAppendTabsAndPlus(TestSuite& suite)
   String right("world");
   EXPECT_STRING_EQ(suite, left + right, "helloworld"_ctv);
   EXPECT_STRING_EQ(suite, left + ""_ctv, "hello"_ctv);
+}
+
+static void testVectorEqualityIsElementWise(TestSuite& suite)
+{
+  static_assert(StringType<Vector<uint8_t>>);
+  static_assert(!StringType<Vector<uint16_t>>);
+  static_assert(StringPointerType<Vector<uint8_t> *>);
+  static_assert(!StringPointerType<Vector<uint16_t> *>);
+
+  Vector<uint16_t> left = {1, 2};
+  Vector<uint16_t> same = {1, 2};
+  Vector<uint16_t> different = {1, 3};
+  Vector<uint32_t> threeElements = {0, 0, 0};
+  EXPECT_EQ(suite, threeElements.size(), uint64_t(3));
+  EXPECT_TRUE(suite, left == same);
+  EXPECT_FALSE(suite, left != same);
+  EXPECT_FALSE(suite, left == different);
+  EXPECT_TRUE(suite, left != different);
 }
 
 static void testCStringAndSecureReset(TestSuite& suite)
@@ -216,6 +260,65 @@ static void testReserveFailurePreservesMmapState(TestSuite& suite)
   EXPECT_EQ(suite, mapped.tentativeCapacity(), originalCapacity);
 }
 
+static void testReadOnlyProvenanceAndMutableViews(TestSuite& suite)
+{
+  String readOnly("read-only"_ctv);
+  uint8_t *originalData = readOnly.data();
+  EXPECT_FALSE(suite, readOnly.reserve(1));
+  readOnly.append('x');
+  readOnly.zeroOut();
+  EXPECT_STRING_EQ(suite, readOnly, "read-only"_ctv);
+
+  String copied = readOnly;
+  EXPECT_FALSE(suite, copied.reserve(1));
+
+  String substring = readOnly.substr(1, 4, Copy::no);
+  EXPECT_STRING_EQ(suite, substring, "ead-"_ctv);
+  EXPECT_FALSE(suite, substring.reserve(1));
+  substring.zeroOut();
+  EXPECT_STRING_EQ(suite, substring, "ead-"_ctv);
+
+  auto compileTime = "compile-time"_ctv;
+  String converted = compileTime.operator String();
+  EXPECT_FALSE(suite, converted.reserve(1));
+
+  const char constant[] = "constant";
+  String constantView;
+  constantView.setInvariant(constant, sizeof(constant), sizeof(constant) - 1);
+  EXPECT_FALSE(suite, constantView.reserve(1));
+
+  std::string_view standardView("standard");
+  String constructedStandardView(standardView, Copy::no);
+  EXPECT_FALSE(suite, constructedStandardView.reserve(1));
+
+  String invariantStandardView;
+  invariantStandardView.setInvariant(standardView);
+  EXPECT_FALSE(suite, invariantStandardView.reserve(1));
+
+  readOnly.secureReset();
+  EXPECT_TRUE(suite, readOnly.empty());
+  EXPECT_EQ(suite, std::memcmp(originalData, "read-only", 9), 0);
+
+  uint8_t mutableStorage[16] = {'a', 'b', 'c'};
+  String mutableView(mutableStorage, sizeof(mutableStorage), Copy::no, 3);
+  EXPECT_TRUE(suite, mutableView.reserve(4));
+  mutableView.append('d');
+  EXPECT_STRING_EQ(suite, mutableView, "abcd"_ctv);
+
+  String mutableSubstring = mutableView.substr(1, 2, Copy::no);
+  EXPECT_TRUE(suite, mutableSubstring.reserve(1));
+  mutableSubstring.zeroOut();
+  EXPECT_EQ(suite, mutableStorage[1], uint8_t(0));
+  EXPECT_EQ(suite, mutableStorage[2], uint8_t(0));
+
+  String invariantMutableView;
+  invariantMutableView.setInvariant(mutableStorage, sizeof(mutableStorage), 0);
+  EXPECT_TRUE(suite, invariantMutableView.reserve(1));
+  invariantMutableView.append('x');
+  EXPECT_EQ(suite, mutableStorage[0], uint8_t('x'));
+  EXPECT_FALSE(suite, invariantMutableView.reserve(sizeof(mutableStorage) + 1));
+}
+
 int main()
 {
   TestSuite suite;
@@ -229,10 +332,13 @@ int main()
   testNeedUsesGeometricGrowth(suite);
   testCopyAssignmentReusesHeapStorage(suite);
   testFormatterNumericTokens(suite);
+  testIntegerDecimalBoundaries(suite);
   testAppendTabsAndPlus(suite);
+  testVectorEqualityIsElementWise(suite);
   testCStringAndSecureReset(suite);
   testReserveFailurePreservesHeapState(suite);
   testReserveFailurePreservesMmapState(suite);
+  testReadOnlyProvenanceAndMutableViews(suite);
 
   return suite.finish("string tests");
 }

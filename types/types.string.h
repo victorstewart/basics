@@ -23,6 +23,49 @@
 template <typename T>
 using typeof_unqual_t = std::remove_cv_t<std::remove_reference_t<T>>;
 
+template <typename Integer>
+static uint8_t *integerToDecimal(uint8_t *output, Integer number)
+{
+  if constexpr (sizeof(Integer) < 16)
+  {
+    return (uint8_t *)jeaiii::to_text_from_integer((char *)output, number);
+  }
+  else
+  {
+    using Unsigned = std::make_unsigned_t<Integer>;
+    bool negative = false;
+    Unsigned value = static_cast<Unsigned>(number);
+    if constexpr (std::is_signed_v<Integer>)
+    {
+      negative = number < 0;
+      if (negative)
+      {
+        value = Unsigned(0) - value;
+      }
+    }
+
+    uint8_t reversed[39] = {};
+    uint8_t nDigits = 0;
+    do
+    {
+      reversed[nDigits++] = uint8_t('0' + value % 10);
+      value /= 10;
+    }
+    while (value != 0);
+
+    uint8_t *tail = output;
+    if (negative)
+    {
+      *tail++ = '-';
+    }
+    while (nDigits > 0)
+    {
+      *tail++ = reversed[--nDigits];
+    }
+    return tail;
+  }
+}
+
 constexpr bool equals(const char *a, const char *b, uint32_t length)
 {
   while (length-- > 0)
@@ -257,7 +300,8 @@ enum class MemoryType : uint8_t {
 
   view,
   mmap,
-  heap
+  heap,
+  readOnly
 };
 
 static uint64_t roundUpToMultiple(uint64_t size, uint64_t multiple)
@@ -307,9 +351,17 @@ static void avoidHugePagesForSmallMmap(uint8_t *mapping, uint64_t capacity)
 #endif
 }
 
-template <typename T> concept StringType = requires (T string) { string.data(); string.size(); };
+template <typename T> concept StringType = requires (T string) {
+  string.data();
+  string.size();
+  requires (sizeof(*string.data()) == 1);
+};
 
-template <typename T> concept StringPointerType = requires (T string) { string->data(); string->size(); };
+template <typename T> concept StringPointerType = requires (T string) {
+  string->data();
+  string->size();
+  requires (sizeof(*string->data()) == 1);
+};
 
 struct ByteStringView {
 
@@ -428,21 +480,21 @@ protected:
 
     uint64_t originalLength = boundedLength(original.length, original.capacity);
 
-    if (original.memory == MemoryType::view)
+    if (original.memory == MemoryType::view || original.memory == MemoryType::readOnly)
     {
-      if (memory != MemoryType::view)
+      if (memory != MemoryType::view && memory != MemoryType::readOnly)
       {
         deallocateMemory(false);
       }
 
-      memory = MemoryType::view;
+      memory = original.memory;
       string = original.string;
       capacity = original.capacity;
       length = originalLength;
       return;
     }
 
-    if (memory != MemoryType::view && string != nullptr && capacity >= originalLength)
+    if (memory != MemoryType::view && memory != MemoryType::readOnly && string != nullptr && capacity >= originalLength)
     {
       if (originalLength > 0 && string != original.string)
       {
@@ -487,6 +539,7 @@ protected:
           break;
         }
       case MemoryType::view:
+      case MemoryType::readOnly:
         {
           string = original.string;
           capacity = original.capacity;
@@ -518,7 +571,7 @@ protected:
   {
     if (string)
     {
-      if (scrub)
+      if (scrub && memory != MemoryType::readOnly)
       {
         zeroOut();
       }
@@ -541,6 +594,7 @@ protected:
             break;
           }
         case MemoryType::view:
+        case MemoryType::readOnly:
           break;
       }
     }
@@ -754,14 +808,15 @@ public:
     }
   }
 
-  // `_ctv` initializes a view-backed String (`String s = "literal"_ctv`).
-  // Views cannot grow; `reserve()` returns false, so mutation via append,
-  // snprintf_add, resize, or reserve is a bug. Materialize first:
+  // `_ctv` initializes a read-only view-backed String (`String s = "literal"_ctv`).
+  // Read-only views reject reserve-backed writes. Materialize before modifying:
   // `String s = {}; s.assign("literal"_ctv);`.
   template <typename T> requires (CompileTimeStringViewType_Sloppy<T>)
   String(T&& anon)
       : String((uint8_t *)anon.data(), anon.size() + 1, Copy::no, anon.size())
-  {}
+  {
+    memory = MemoryType::readOnly;
+  }
 
   template <typename T> requires (StringPointerType<T>)
   String(T anon)
@@ -775,7 +830,12 @@ public:
 
   String(const std::string_view& sv, Copy copy = Copy::yes)
       : String((uint8_t *)sv.data(), sv.size(), copy)
-  {}
+  {
+    if (copy == Copy::no)
+    {
+      memory = MemoryType::readOnly;
+    }
+  }
 
   template <typename T> requires (SimdjsonObject<T>)
   String(T&& json_object)
@@ -802,7 +862,7 @@ public:
   String& operator=(T&& anon)
   {
     reset();
-    setInvariant((uint8_t *)anon.data(), anon.size() + 1, anon.size());
+    setInvariant(anon.data(), anon.size() + 1, anon.size());
     return *this;
   }
 
@@ -921,7 +981,7 @@ public:
       return;
     }
 
-    uint8_t *tail = (uint8_t *)jeaiii::to_text_from_integer((char *)string, number);
+    uint8_t *tail = integerToDecimal(string, number);
 
     resize(tail - string);
   }
@@ -1083,6 +1143,11 @@ public:
 
   void eraseAndFold(uint8_t *eraseHead, uint64_t nBytes)
   {
+    if (memory == MemoryType::readOnly)
+    {
+      return;
+    }
+
     // we could bounds check to make this safe... but just don't be a moron
 
     // memset is technically unnecessary, but we might as well for hypothetical security reasons?
@@ -1102,7 +1167,7 @@ public:
   template <typename Type> requires (sizeof(Type) == 1)
   void setInvariant(Type *buffer, uint64_t fixedCapacity, int64_t _length = -1)
   {
-    memory = MemoryType::view;
+    memory = std::is_const_v<Type> ? MemoryType::readOnly : MemoryType::view;
     string = (uint8_t *)buffer;
     capacity = fixedCapacity;
     length = (buffer == nullptr) ? 0 : boundedLength((_length < 0) ? fixedCapacity : uint64_t(_length), fixedCapacity);
@@ -1153,6 +1218,11 @@ public:
 
   void zeroOut(void)
   {
+    if (memory == MemoryType::readOnly)
+    {
+      return;
+    }
+
     clampLengthToCapacity();
     if (string != nullptr && length > 0)
     {
@@ -1196,7 +1266,12 @@ public:
     }
 
     uint64_t safeSize = boundedLength(size, length - location);
-    return String(string + location, safeSize, copy, safeSize);
+    String result(string + location, safeSize, copy, safeSize);
+    if (copy == Copy::no && memory == MemoryType::readOnly)
+    {
+      result.memory = MemoryType::readOnly;
+    }
+    return result;
   }
 
   uint8_t *data() const
@@ -1206,6 +1281,11 @@ public:
 
   bool addNullTerminator(void)
   {
+    if (memory == MemoryType::readOnly)
+    {
+      return false;
+    }
+
     if (string != nullptr && length < capacity)
     {
       string[length] = '\0';
@@ -1229,7 +1309,7 @@ public:
       return "";
     }
 
-    if (unlikely(memory == MemoryType::view))
+    if (unlikely(memory == MemoryType::view || memory == MemoryType::readOnly))
     {
       if (length < capacity && string[length] == '\0')
       {
@@ -1316,6 +1396,10 @@ public:
     }
 
     uint8_t diff = static_cast<uint8_t>(diffSigned);
+    if (diff > 0)
+    {
+      memset(string + length, 0, diff);
+    }
 
     memcpy(string + length + diff, &scalar, sizeof(T));
     // *(std::remove_reference_t<T> *)(string + length + diff) = scalar;
@@ -1333,6 +1417,10 @@ public:
     }
 
     uint8_t diff = static_cast<uint8_t>(diffSigned);
+    if (diff > 0)
+    {
+      memset(string + length, 0, diff);
+    }
     if (bufferSize > 0)
     {
       memcpy(string + length + diff, buffer, bufferSize);
@@ -1355,7 +1443,12 @@ public:
       return;
     }
 
-    length += static_cast<uint8_t>(diffSigned);
+    uint8_t diff = static_cast<uint8_t>(diffSigned);
+    if (diff > 0)
+    {
+      memset(string + length, 0, diff);
+    }
+    length += diff;
   }
 
   void alignTail(Alignment alignment)
@@ -1366,7 +1459,12 @@ public:
       return;
     }
 
-    length += static_cast<uint8_t>(diffSigned);
+    uint8_t diff = static_cast<uint8_t>(diffSigned);
+    if (diff > 0)
+    {
+      memset(string + length, 0, diff);
+    }
+    length += diff;
   }
 
   template <auto format, typename... Args>
@@ -1586,6 +1684,11 @@ public:
   // bitsery will ask us to resize the buffer, without having updated the length, in that case we need to copy the whole telling us
   virtual bool reserve(uint64_t newCapacity, uint64_t lengthToCopy = 0)
   {
+    if (memory == MemoryType::readOnly)
+    {
+      return false;
+    }
+
     if (newCapacity > capacity)
     {
       switch (memory)
@@ -1691,6 +1794,7 @@ public:
             break;
           }
         case MemoryType::view:
+        case MemoryType::readOnly:
           {
             return false;
           }
@@ -1826,7 +1930,7 @@ public:
 
       explicit ItoaSegment(Integer value)
       {
-        uint8_t *tail = (uint8_t *)jeaiii::to_text_from_integer((char *)buffer, value);
+        uint8_t *tail = integerToDecimal(buffer, value);
         length = uint32_t(tail - buffer);
       }
 
@@ -2310,7 +2414,9 @@ public:
 template <char... Chars>
 CompileTimeStringView<Chars...>::operator String() const
 {
-  return String((uint8_t *)string, length);
+  String view;
+  view.setInvariant(string, length + 1, length);
+  return view;
 }
 
 template <typename A, typename B>
@@ -2325,7 +2431,7 @@ template <typename A, typename B>
 requires (StringType<A> && StringType<B> && !CompileTimeStringViewType<A> && !CompileTimeStringViewType<B>)
 static bool operator!=(const A& lhs, const B& rhs)
 {
-  return !lhs.equal(rhs);
+  return (lhs == rhs) == false;
 }
 
 static String operator+(const String& lhs, const String& rhs)

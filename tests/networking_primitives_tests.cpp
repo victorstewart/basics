@@ -3,6 +3,7 @@
 #include "tests/test_support.h"
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <array>
 #include <bitset>
 #include <memory>
@@ -163,8 +164,59 @@ static void testMsgHelpers(TestSuite& suite)
   EXPECT_EQ(suite, packet.payloadLen(), uint32_t(32));
 }
 
+static void testTimeoutPacketDefaults(TestSuite& suite)
+{
+  alignas(TimeoutPacket) std::array<uint8_t, sizeof(TimeoutPacket)> storage;
+  storage.fill(0xa5);
+  TimeoutPacket *packet = std::construct_at(reinterpret_cast<TimeoutPacket *>(storage.data()));
+
+  EXPECT_TRUE(suite, packet->identifier == uint128_t(0));
+  EXPECT_EQ(suite, packet->flags, uint64_t(0));
+  EXPECT_EQ(suite, packet->payload, nullptr);
+  EXPECT_EQ(suite, packet->originator, nullptr);
+  EXPECT_EQ(suite, packet->dispatcher, nullptr);
+  EXPECT_FALSE(suite, packet->isLive());
+  std::destroy_at(packet);
+
+  TimeoutPacket flagged(17);
+  EXPECT_TRUE(suite, flagged.identifier == uint128_t(0));
+  EXPECT_EQ(suite, flagged.flags, uint64_t(17));
+  EXPECT_EQ(suite, flagged.payload, nullptr);
+  EXPECT_EQ(suite, flagged.originator, nullptr);
+  EXPECT_EQ(suite, flagged.dispatcher, nullptr);
+}
+
 static void testMessageHelpers(TestSuite& suite)
 {
+  String deterministicBytes;
+  EXPECT_TRUE(suite, deterministicBytes.reserve(64));
+  std::memset(
+      deterministicBytes.data(), 0xa5, deterministicBytes.tentativeCapacity());
+  Message::construct(
+      deterministicBytes, PrimitiveTopic::values, String("abc"));
+  Message *deterministicMessage =
+      reinterpret_cast<Message *>(deterministicBytes.data());
+  const uint64_t valuePaddingBegin =
+      Message::headerBytes + sizeof(uint32_t);
+  const uint64_t valuePayloadBegin = roundUpToMultiple(
+      valuePaddingBegin, uint64_t(Alignment::eight));
+  const uint64_t terminalOffset = uint64_t(
+      deterministicMessage->terminal() - deterministicBytes.data());
+  EXPECT_EQ(suite, deterministicBytes.size(), uint64_t(32));
+  EXPECT_EQ(suite, terminalOffset, uint64_t(19));
+  EXPECT_TRUE(
+      suite,
+      std::all_of(
+          deterministicBytes.data() + valuePaddingBegin,
+          deterministicBytes.data() + valuePayloadBegin,
+          [](uint8_t byte) { return byte == 0; }));
+  EXPECT_TRUE(
+      suite,
+      std::all_of(
+          deterministicBytes.data() + terminalOffset,
+          deterministicBytes.data() + deterministicBytes.size(),
+          [](uint8_t byte) { return byte == 0; }));
+
   String messageBytes;
   Message::construct(messageBytes, PrimitiveTopic::first, uint32_t(0x11223344), "hello"_ctv, uint16_t(0x5566));
 
@@ -374,6 +426,7 @@ int main()
   testIpAddressAndPrefixHelpers(suite);
   testSubnetAndPrivateHelpers(suite);
   testMsgHelpers(suite);
+  testTimeoutPacketDefaults(suite);
   testMessageHelpers(suite);
   testIpSocketAndArpHelpers(suite);
 
