@@ -109,6 +109,7 @@ private:
 
     void *socket;
     struct msghdr *msg;
+    uint64_t generation;
   };
 
   struct SocketCommandPackage {
@@ -134,11 +135,20 @@ private:
     uint64_t generation = 0;
   };
 
+  struct SocketCloseRetirementTracking {
+
+    CloseCompletionTracking close = {};
+    bool closeCompletionObserved = false;
+    void *streamOwner = nullptr;
+    void (*retireStreamSend)(void *) = nullptr;
+  };
+
   struct RecvmsgMultishotTracking {
 
     void *socket = nullptr;
     uint64_t generation = 0;
     uint64_t serial = 0;
+    uint32_t bgid = 0;
   };
 
   struct SocketOperationTracking {
@@ -156,6 +166,12 @@ private:
     bool terminalCompletionObserved = false;
   };
 
+  struct AcceptedPeerAddress {
+
+    struct sockaddr_storage storage = {};
+    socklen_t length = 0;
+  };
+
   static thread_local inline Pool<MsghdrPackage, true, true> msghdrPackagePool;
   struct FileBufferPackage {
     int fslot;
@@ -171,10 +187,12 @@ private:
 
   static thread_local inline bytell_hash_map<uint32_t, BufferRing> bufferRingsByBgid;
   static thread_local inline bytell_hash_map<void *, uint64_t> socketGenerationByIdentity;
+  static thread_local inline bytell_hash_map<void *, uint64_t> socketLifetimeOperationCountByIdentity;
   static thread_local inline bytell_hash_map<uint64_t, LinkTimeoutTracking> linkTimeoutTrackingByUserData;
   static thread_local inline bytell_hash_set<uint64_t> retiredLinkTimeoutTrackingUserData;
   static thread_local inline bytell_hash_map<void *, RecvmsgMultishoter *> recvmsgMultishoterByIdentity;
   static thread_local inline bytell_hash_map<uint64_t, CloseCompletionTracking> closeTrackingByUserData;
+  static thread_local inline bytell_hash_map<void *, SocketCloseRetirementTracking> socketCloseRetirementByIdentity;
   static thread_local inline bytell_hash_set<uint64_t> retiredCloseTrackingUserData;
   static thread_local inline bytell_hash_map<uint64_t, RecvmsgMultishotTracking> recvmsgMultishotTrackingByUserData;
   static thread_local inline bytell_hash_set<uint64_t> retiredRecvmsgMultishotTrackingUserData;
@@ -323,6 +341,29 @@ private:
     socketGenerationByIdentity[socketIdentity(socket)] = socket->ioGeneration;
   }
 
+  static void retainSocketLifetimeOperation(void *socketKey)
+  {
+    uint64_t& count = socketLifetimeOperationCountByIdentity[socketKey];
+    if (count == UINT64_MAX)
+    {
+      std::abort();
+    }
+    ++count;
+  }
+
+  static void releaseSocketLifetimeOperation(void *socketKey)
+  {
+    auto position = socketLifetimeOperationCountByIdentity.find(socketKey);
+    if (position == socketLifetimeOperationCountByIdentity.end() || position->second == 0)
+    {
+      std::abort();
+    }
+    if (--position->second == 0)
+    {
+      socketLifetimeOperationCountByIdentity.erase(position);
+    }
+  }
+
   static uint64_t allocateCloseTicket(void)
   {
     uint64_t ticket = nextCloseTicket++;
@@ -364,6 +405,7 @@ private:
     tracking.generation = generation;
     tracking.linkedOp = linkedOp;
     linkTimeoutTrackingByUserData.insert_or_assign(userData, tracking);
+    retainSocketLifetimeOperation(socketKey);
     return userData;
   }
 
@@ -394,6 +436,7 @@ private:
       .generation = generation,
       .operation = operation
     };
+    retainSocketLifetimeOperation(socketKey);
 
     return userData;
   }
@@ -445,7 +488,11 @@ private:
     rawPollTrackingByUserData.erase(ticket);
   }
 
-  static bool resolveSocketOperationTracking(uint64_t userData, Operation operation, SocketOperationTracking& tracking)
+  static bool resolveSocketOperationTracking(
+      uint64_t userData,
+      Operation operation,
+      SocketOperationTracking& tracking,
+      bool retire = true)
   {
     auto trackingIt = socketOperationTrackingByUserData.find(userData);
     if (trackingIt == socketOperationTrackingByUserData.end())
@@ -454,8 +501,18 @@ private:
     }
 
     tracking = trackingIt->second;
-    socketOperationTrackingByUserData.erase(trackingIt);
-    return tracking.operation == operation;
+    if (tracking.operation != operation)
+    {
+      socketOperationTrackingByUserData.erase(trackingIt);
+      releaseSocketLifetimeOperation(tracking.socket);
+      return false;
+    }
+    if (retire)
+    {
+      socketOperationTrackingByUserData.erase(trackingIt);
+      releaseSocketLifetimeOperation(tracking.socket);
+    }
+    return true;
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
@@ -496,6 +553,23 @@ private:
       default:
         return 0;
     }
+  }
+
+  static uint64_t trackedSocketOperationUserData(
+      void *socketKey,
+      Operation operation,
+      uint64_t generation)
+  {
+    for (const auto& [userData, tracking] : socketOperationTrackingByUserData)
+    {
+      if (tracking.socket == socketKey &&
+          tracking.operation == operation &&
+          tracking.generation == generation)
+      {
+        return userData;
+      }
+    }
+    return 0;
   }
 
   static uint64_t issueCloseTracking(void *socketKey, int slot, uint64_t serial, uint64_t generation)
@@ -541,7 +615,11 @@ private:
     return ticket;
   }
 
-  static uint64_t issueRecvmsgMultishotTracking(void *socketKey, uint64_t generation, uint64_t serial)
+  static uint64_t issueRecvmsgMultishotTracking(
+      void *socketKey,
+      uint64_t generation,
+      uint64_t serial,
+      uint32_t bgid)
   {
     uint64_t userData = 0;
 
@@ -555,7 +633,9 @@ private:
     tracking.socket = socketKey;
     tracking.generation = generation;
     tracking.serial = serial;
+    tracking.bgid = bgid;
     recvmsgMultishotTrackingByUserData.insert_or_assign(userData, tracking);
+    retainSocketLifetimeOperation(socketKey);
     return userData;
   }
 
@@ -659,6 +739,7 @@ private:
 
     tracking = it->second;
     linkTimeoutTrackingByUserData.erase(it);
+    releaseSocketLifetimeOperation(tracking.socket);
     noteRetiredLinkTimeoutTracking(userData);
 
     if (std::getenv("BASICS_RING_TRACE_LINK_TIMEOUT"))
@@ -682,7 +763,9 @@ private:
     auto it = recvmsgMultishotTrackingByUserData.find(userData);
     if (it != recvmsgMultishotTrackingByUserData.end())
     {
+      void *socketKey = it->second.socket;
       recvmsgMultishotTrackingByUserData.erase(it);
+      releaseSocketLifetimeOperation(socketKey);
     }
 
     noteRetiredRecvmsgMultishotTracking(userData);
@@ -788,6 +871,31 @@ private:
     std::abort();
   }
 
+  static void getLinkedSQEPairSafe(
+      struct io_uring_sqe *&first,
+      struct io_uring_sqe *&second)
+  {
+    if (io_uring_sq_space_left(&ring) < 2)
+    {
+      (void)io_uring_submit(&ring);
+    }
+    if (io_uring_sq_space_left(&ring) < 2)
+    {
+      (void)io_uring_submit_and_wait(&ring, 1);
+    }
+    if (io_uring_sq_space_left(&ring) < 2)
+    {
+      std::abort();
+    }
+
+    first = io_uring_get_sqe(&ring);
+    second = io_uring_get_sqe(&ring);
+    if (first == nullptr || second == nullptr)
+    {
+      std::abort();
+    }
+  }
+
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
   static void appendTimeoutMs(T *socket, uint64_t timeoutMs, Operation linkedOp)
   {
@@ -812,15 +920,6 @@ private:
   }
 
 public:
-
-  template <typename T> requires (std::is_base_of_v<SocketBase, T>)
-  static void publishSocketGeneration(T *socket)
-  {
-    // Accepted/adopted sockets can receive stale close completions before their
-    // first recv/send arm publishes a new generation. Let callers republish the
-    // fresh generation as soon as a new transport incarnation owns the identity.
-    noteSocketGeneration(socket);
-  }
 
   template <typename T> requires (std::is_base_of_v<WaitableProcess, T>)
   static void queueWaitid(T *waiter, idtype_t idtype, id_t id)
@@ -863,6 +962,13 @@ public:
     setUserData(sqe, Operation::cancel, payload);
   }
 
+  static void queueCancelTimeoutMultishot(TimeoutPacket *payload)
+  {
+    struct io_uring_sqe *sqe = getSQESafe();
+    io_uring_prep_timeout_remove(sqe, getUserDataFor(Operation::timeoutMultishot, payload), 0);
+    setUserData(sqe, Operation::cancel, payload);
+  }
+
   static void waitForSignals(void)
   {
 
@@ -898,7 +1004,8 @@ public:
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT);
     sqe->buf_group = socket->bgid;
     sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
-    sqe->user_data = issueRecvmsgMultishotTracking(socketKey, socket->ioGeneration, serial);
+    sqe->user_data = issueRecvmsgMultishotTracking(
+        socketKey, socket->ioGeneration, serial, shoter->bgid);
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T> && !std::is_base_of_v<RecvmsgMultishoter, T>)
@@ -907,9 +1014,11 @@ public:
     MsghdrPackage *package = msghdrPackagePool.get();
     package->socket = socketIdentity(socket);
     package->msg = msg;
+    package->generation = socket->ioGeneration;
 
     requireFixedFileSocket(socket, "queueRecvmsg");
     noteSocketGeneration(socket);
+    retainSocketLifetimeOperation(package->socket);
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_recvmsg(sqe, socket->fslot, msg, 0);
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
@@ -923,9 +1032,11 @@ public:
     MsghdrPackage *package = msghdrPackagePool.get();
     package->socket = socketIdentity(socket);
     package->msg = msg;
+    package->generation = socket->ioGeneration;
 
     requireFixedFileSocket(socket, "queueSendmsg");
     noteSocketGeneration(socket);
+    retainSocketLifetimeOperation(package->socket);
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_sendmsg(sqe, socket->fslot, msg, 0);
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
@@ -1107,17 +1218,20 @@ public:
   static void queueAcceptMultishot(T *socket)
   {
     requireFixedFileSocket(socket, "queueAcceptMultishot");
+    void *socketKey = socketIdentity(socket);
     noteSocketGeneration(socket);
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_multishot_accept(sqe, socket->fslot, nullptr, nullptr, 0);
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
-    setUserData(sqe, Operation::acceptMultishot, socket, socket->ioGeneration);
+    sqe->user_data = issueSocketOperationTracking(
+        Operation::acceptMultishot, socketKey, socket->ioGeneration);
   }
 
   template <typename T> requires (std::is_base_of_v<TCPSocket, T> || std::is_base_of_v<UnixSocket, T>)
   static void queueAccept(T *socket, struct sockaddr *saddr = nullptr, socklen_t *saddrlen = nullptr, int flags = 0)
   {
     requireFixedFileSocket(socket, "queueAccept");
+    void *socketKey = socketIdentity(socket);
     noteSocketGeneration(socket);
     struct io_uring_sqe *sqe = getSQESafe();
     // Accept into a process fd first, then adopt it into our dynamic fixed-file
@@ -1125,7 +1239,8 @@ public:
     // local control even on kernels that ignore file-allocation ranges.
     io_uring_prep_accept(sqe, socket->fslot, saddr, saddrlen, flags);
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
-    setUserData(sqe, Operation::accept, socket, socket->ioGeneration);
+    sqe->user_data = issueSocketOperationTracking(
+        Operation::accept, socketKey, socket->ioGeneration);
   }
 
   template <typename T> requires (std::is_base_of_v<TCPSocket, T> || std::is_base_of_v<UnixSocket, T>)
@@ -1182,7 +1297,37 @@ public:
       return;
     }
 
-    struct io_uring_sqe *sqe = getSQESafe();
+    const bool cancelLifetimeOperations = socketHasLifetimeOperations(socketKey);
+    struct io_uring_sqe *sqe = nullptr;
+    if (cancelLifetimeOperations)
+    {
+      struct io_uring_sqe *cancelSqe = nullptr;
+      getLinkedSQEPairSafe(cancelSqe, sqe);
+      if (socket->isFixedFile)
+      {
+        if (socket->fslot < 0 || static_cast<uint32_t>(socket->fslot) >= fixedFileCapacity)
+        {
+          std::abort();
+        }
+        io_uring_prep_cancel_fd(cancelSqe, socket->fslot, IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED);
+      }
+      else
+      {
+        if (socket->fd < 0)
+        {
+          std::abort();
+        }
+        io_uring_prep_cancel_fd(cancelSqe, socket->fd, IORING_ASYNC_CANCEL_ALL);
+      }
+      // The close must run even when every target completed before cancellation.
+      // Hard-linking also prevents fixed-slot removal from racing ahead of cancel.
+      io_uring_sqe_set_flags(cancelSqe, IOSQE_IO_HARDLINK);
+      setUserData(cancelSqe, Operation::cancel, socketKey, socket->ioGeneration);
+    }
+    else
+    {
+      sqe = getSQESafe();
+    }
     bool hadPendingSend = socket->pendingSend;
     int closeSlot = -1;
 
@@ -1199,14 +1344,19 @@ public:
     // the socket pointer is reused for a reconnect.
     socket->bumpIoGeneration();
     noteSocketGeneration(socket);
+    void (*retireStreamSend)(void *) = nullptr;
     if constexpr (requires (T *s) { s->noteSendCompleted(); s->clearQueuedSendBytes(); })
     {
-      socket->noteSendCompleted();
       // Closing with an in-flight send means the peer may have already consumed a
-      // partial frame. Never replay buffered bytes from this generation after reconnect.
+      // partial frame. Keep its allocation alive until the terminal CQE, then
+      // prevent those bytes from being replayed on a later transport generation.
       if (hadPendingSend)
       {
-        socket->clearQueuedSendBytes();
+        retireStreamSend = [](void *owner) {
+          T *stream = static_cast<T *>(owner);
+          stream->noteSendCompleted();
+          stream->clearQueuedSendBytes();
+        };
       }
     }
 
@@ -1237,6 +1387,7 @@ public:
                      socket->isFixedFile);
       io_uring_prep_close_direct(sqe, socket->fslot);
       socket->fslot = -1;
+      socket->fd = -1;
       socket->isFixedFile = false;
     }
     else
@@ -1260,6 +1411,7 @@ public:
     }
 
     uint64_t userData = issueCloseTracking(socketKey, closeSlot, closeSerial, socket->ioGeneration);
+    beginSocketCloseRetirement(closeTrackingByUserData.find(userData)->second, socket, retireStreamSend);
     sqe->user_data = userData;
   }
 
@@ -1301,6 +1453,92 @@ public:
     return dispatchCloseHandler;
   }
 
+  static bool socketHasLifetimeOperations(void *socketKey)
+  {
+    // Accepted/adopted sockets can reuse an old identity address. Close retirement
+    // spans every transport generation so no tracked completion can outlive the
+    // closeHandler that is allowed to destroy or replace that socket object.
+    return socketLifetimeOperationCountByIdentity.contains(socketKey);
+  }
+
+  static void beginSocketCloseRetirement(
+      const CloseCompletionTracking& close,
+      void *streamOwner = nullptr,
+      void (*retireStreamSend)(void *) = nullptr)
+  {
+    if (socketCloseRetirementByIdentity.contains(close.socket))
+    {
+      std::abort();
+    }
+    socketCloseRetirementByIdentity[close.socket] = {
+      .close = close,
+      .closeCompletionObserved = false,
+      .streamOwner = streamOwner,
+      .retireStreamSend = retireStreamSend
+    };
+  }
+
+  static bool tryCompleteSocketCloseRetirement(void *socketKey, bool *dispatchedCloseHandler = nullptr)
+  {
+    if (dispatchedCloseHandler)
+    {
+      *dispatchedCloseHandler = false;
+    }
+    auto retirementIt = socketCloseRetirementByIdentity.find(socketKey);
+    if (retirementIt == socketCloseRetirementByIdentity.end() ||
+        retirementIt->second.closeCompletionObserved == false ||
+        socketHasLifetimeOperations(socketKey))
+    {
+      return false;
+    }
+
+    SocketCloseRetirementTracking retirement = retirementIt->second;
+    socketCloseRetirementByIdentity.erase(retirementIt);
+    const bool dispatchCloseHandler = shouldDispatchTrackedCloseCompletion(
+        socketKey, retirement.close.serial, retirement.close.generation);
+    if (dispatchedCloseHandler)
+    {
+      *dispatchedCloseHandler = dispatchCloseHandler;
+    }
+    if (dispatchCloseHandler && retirement.retireStreamSend)
+    {
+      retirement.retireStreamSend(retirement.streamOwner);
+    }
+    if (dispatchCloseHandler && interfacer)
+    {
+      interfacer->closeHandler(socketKey);
+    }
+    return true;
+  }
+
+  static bool retireClosingSocketOperation(void *socketKey)
+  {
+    auto retirementIt = socketCloseRetirementByIdentity.find(socketKey);
+    if (retirementIt == socketCloseRetirementByIdentity.end())
+    {
+      return false;
+    }
+
+    (void)tryCompleteSocketCloseRetirement(socketKey);
+    return true;
+  }
+
+  static bool noteSocketCloseCompletion(
+      const CloseCompletionTracking& close,
+      bool *dispatchedCloseHandler = nullptr)
+  {
+    auto retirementIt = socketCloseRetirementByIdentity.find(close.socket);
+    if (retirementIt == socketCloseRetirementByIdentity.end() ||
+        retirementIt->second.close.serial != close.serial)
+    {
+      return false;
+    }
+
+    retirementIt->second.closeCompletionObserved = true;
+    (void)tryCompleteSocketCloseRetirement(close.socket, dispatchedCloseHandler);
+    return true;
+  }
+
   static void queueCloseRaw(int fslot) // maybe you accepted direct, but want to reject it
   {
     if (fslot < 0 || static_cast<uint32_t>(fslot) >= fixedFileCapacity)
@@ -1327,10 +1565,15 @@ public:
         targetUserData = socketOperationUserData(socket, op);
         if (targetUserData == 0)
         {
+          targetUserData = trackedSocketOperationUserData(
+              socketIdentity(socket), op, socket->ioGeneration);
+        }
+        if (targetUserData == 0)
+        {
           targetUserData = getUserDataFor(op, socketIdentity(socket), uint8_t(socket->ioGeneration));
         }
       }
-      io_uring_prep_cancel64(sqe, targetUserData, IORING_ASYNC_CANCEL_ANY);
+      io_uring_prep_cancel64(sqe, targetUserData, 0);
       setUserData(sqe, Operation::cancel, socketIdentity(socket), socket->ioGeneration);
    }
 
@@ -1347,27 +1590,33 @@ public:
   static void queueShutdown(T *socket)
   {
     requireFixedFileSocket(socket, "queueShutdown");
+    void *socketKey = socketIdentity(socket);
+    noteSocketGeneration(socket);
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_shutdown(sqe, socket->fslot, SHUT_WR);
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
-    setUserData(sqe, Operation::shutdown, socket);
+    sqe->user_data = issueSocketOperationTracking(
+        Operation::shutdown, socketKey, socket->ioGeneration);
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
   static void queuePoll(T *socket, unsigned poll_mask)
   {
     requireFixedFileSocket(socket, "queuePoll");
+    void *socketKey = socketIdentity(socket);
     noteSocketGeneration(socket);
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_poll_add(sqe, socket->fslot, poll_mask);
     io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
-    setUserData(sqe, Operation::poll, socket, socket->ioGeneration);
+    sqe->user_data = issueSocketOperationTracking(
+        Operation::poll, socketKey, socket->ioGeneration);
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
   static void queuePoll(T *socket, unsigned poll_mask, uint64_t timeoutMs)
   {
     requireFixedFileSocket(socket, "queuePoll");
+    void *socketKey = socketIdentity(socket);
     noteSocketGeneration(socket);
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_poll_add(sqe, socket->fslot, poll_mask);
@@ -1382,7 +1631,8 @@ public:
       io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
     }
 
-    setUserData(sqe, Operation::poll, socket, socket->ioGeneration);
+    sqe->user_data = issueSocketOperationTracking(
+        Operation::poll, socketKey, socket->ioGeneration);
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
@@ -1393,6 +1643,7 @@ public:
       return;
     }
 
+    void *socketKey = socketIdentity(socket);
     noteSocketGeneration(socket);
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_poll_add(sqe, submitFD, poll_mask);
@@ -1400,7 +1651,8 @@ public:
     {
       io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
     }
-    setUserData(sqe, Operation::poll, socket, socket->ioGeneration);
+    sqe->user_data = issueSocketOperationTracking(
+        Operation::poll, socketKey, socket->ioGeneration);
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
@@ -1411,6 +1663,7 @@ public:
       return;
     }
 
+    void *socketKey = socketIdentity(socket);
     noteSocketGeneration(socket);
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_poll_add(sqe, submitFD, poll_mask);
@@ -1425,7 +1678,8 @@ public:
       io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
     }
 
-    setUserData(sqe, Operation::poll, socket, socket->ioGeneration);
+    sqe->user_data = issueSocketOperationTracking(
+        Operation::poll, socketKey, socket->ioGeneration);
   }
 
   // Raw-fd watchers are independent of SocketBase and keep their full owner
@@ -1520,6 +1774,7 @@ private:
   static thread_local inline uint32_t fixedFileReserveLimit = 0;
   static thread_local inline bytell_hash_set<int> vacantFixedFileSlots;
   static thread_local inline bytell_hash_set<int> vacantAcceptedFixedFileSlots;
+  static thread_local inline bytell_hash_map<int, AcceptedPeerAddress> acceptedPeerAddressByFixedFileSlot;
   static thread_local inline bytell_hash_set<void *> isClosing;
   static thread_local inline bytell_hash_map<void *, uint64_t> closingSerialByIdentity;
   static thread_local inline uint64_t nextCloseSerial = 1;
@@ -1626,9 +1881,24 @@ private:
       return fd;
     }
 
+    AcceptedPeerAddress peerAddress;
+    peerAddress.length = sizeof(peerAddress.storage);
+    if (getpeername(
+            fd,
+            reinterpret_cast<struct sockaddr *>(&peerAddress.storage),
+            &peerAddress.length) != 0)
+    {
+      peerAddress.length = 0;
+    }
+
     int slot = installFDIntoAcceptedFixedFileSlot(fd);
     if (slot >= 0)
     {
+      acceptedPeerAddressByFixedFileSlot.erase(slot);
+      if (peerAddress.length > 0)
+      {
+        acceptedPeerAddressByFixedFileSlot.insert_or_assign(slot, peerAddress);
+      }
       return slot;
     }
 
@@ -1733,10 +2003,13 @@ public:
     fixedFileReserveLimit = 0;
     vacantFixedFileSlots.clear();
     vacantAcceptedFixedFileSlots.clear();
+    acceptedPeerAddressByFixedFileSlot.clear();
     isClosing.clear();
     closingSerialByIdentity.clear();
     linkTimeoutTrackingByUserData.clear();
     closeTrackingByUserData.clear();
+    socketCloseRetirementByIdentity.clear();
+    socketLifetimeOperationCountByIdentity.clear();
     retiredLinkTimeoutTrackingUserData.clear();
     retiredCloseTrackingUserData.clear();
     recvmsgMultishotTrackingByUserData.clear();
@@ -1771,6 +2044,25 @@ public:
     }
 
     return fixedfiles[slot];
+  }
+
+  static bool takeAcceptedPeerAddress(
+      int slot,
+      struct sockaddr_storage& address,
+      socklen_t& length)
+  {
+    auto position = acceptedPeerAddressByFixedFileSlot.find(slot);
+    if (position == acceptedPeerAddressByFixedFileSlot.end())
+    {
+      address = {};
+      length = 0;
+      return false;
+    }
+
+    address = position->second.storage;
+    length = position->second.length;
+    acceptedPeerAddressByFixedFileSlot.erase(position);
+    return true;
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
@@ -1935,15 +2227,48 @@ public:
     return bufferRing.bgid;
   }
 
-  template <typename T> requires (std::is_base_of_v<RecvmsgMultishoter, T>)
-  static void relinquishBufferToRing(T *shoter, uint8_t *buffer)
+  static void relinquishBufferToRing(uint32_t bgid, uint8_t *buffer)
   {
-    BufferRing& bufferRing = bufferRingsByBgid[shoter->bgid];
+    auto ringIt = bufferRingsByBgid.find(bgid);
+    if (ringIt == bufferRingsByBgid.end() || buffer == nullptr)
+    {
+      std::abort();
+    }
+    BufferRing& bufferRing = ringIt->second;
 
     uint32_t bufferIndex = bufferRing.indexForBuffer(buffer);
     io_uring_buf_ring_add(bufferRing.ring, buffer, bufferRing.bufferSize, bufferIndex, io_uring_buf_ring_mask(bufferRing.count), 0);
 
     io_uring_buf_ring_advance(bufferRing.ring, 1); // 1 buffer
+  }
+
+  template <typename T> requires (std::is_base_of_v<RecvmsgMultishoter, T>)
+  static void relinquishBufferToRing(T *shoter, uint8_t *buffer)
+  {
+    relinquishBufferToRing(shoter->bgid, buffer);
+  }
+
+  static void recycleIgnoredRecvmsgMultishotBuffer(
+      const RecvmsgMultishotTracking& tracking,
+      const struct io_uring_cqe *cqe)
+  {
+    if ((cqe->flags & IORING_CQE_F_BUFFER) == 0)
+    {
+      return;
+    }
+
+    auto ringIt = bufferRingsByBgid.find(tracking.bgid);
+    if (ringIt == bufferRingsByBgid.end())
+    {
+      std::abort();
+    }
+    BufferRing& bufferRing = ringIt->second;
+    const uint32_t bufferIndex = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+    if (bufferIndex >= bufferRing.count)
+    {
+      std::abort();
+    }
+    relinquishBufferToRing(tracking.bgid, bufferRing.bufferAtIndex(bufferIndex));
   }
 
   // max SQE depth is 32,768				(1 << 15)
@@ -2141,8 +2466,6 @@ public:
     // if we created a virtual function that took an object and returned its type index tag
     // then another which took a tag and object pointer and returned the properly casted type via a lambda [] (T *castedObject) {}
     // we could then operate here with full type information
-    uint8_t tag;
-
     do
     {
       count = 0;
@@ -2159,7 +2482,6 @@ public:
         user_data = (uint64_t)io_uring_cqe_get_data(cqe);
         op = getOpFromUserData(user_data);
         object = getObjectFromUserData(user_data);
-        tag = getTagFromUserData(user_data);
         result = cqe->res;
 
         switch (op) // ignore if cancelled or closed
@@ -2169,6 +2491,8 @@ public:
           case Operation::recv:
           case Operation::tcpFastOpen:
           case Operation::connect:
+          case Operation::poll:
+          case Operation::shutdown:
             {
               SocketOperationTracking tracking = {};
               if (resolveSocketOperationTracking(user_data, op, tracking) == false)
@@ -2177,6 +2501,10 @@ public:
               }
 
               object = tracking.socket;
+              if (retireClosingSocketOperation(tracking.socket))
+              {
+                continue;
+              }
 
               if (isClosing.contains(object))
               {
@@ -2186,7 +2514,7 @@ public:
               {
                 continue;
               }
-              if ((op == Operation::connect || op == Operation::send || op == Operation::recv) && result == -ECANCELED)
+              if ((op == Operation::connect || op == Operation::send || op == Operation::recv || op == Operation::poll) && result == -ECANCELED)
               {
                 continue;
               }
@@ -2206,6 +2534,15 @@ public:
           case Operation::accept:
           case Operation::acceptMultishot:
             {
+              const bool terminal =
+                  op == Operation::accept || !(cqe->flags & IORING_CQE_F_MORE);
+              SocketOperationTracking tracking = {};
+              if (resolveSocketOperationTracking(user_data, op, tracking, terminal) == false)
+              {
+                continue;
+              }
+              object = tracking.socket;
+
               // ignore the cqe if we've closed the slot
               // there is no point in checking result == -ECANCELLED because we only cancel when we close
 
@@ -2224,18 +2561,22 @@ public:
 
               if (isClosing.contains(object))
               {
+                if (result >= 0)
+                {
+                  ::close(result);
+                }
+                if (terminal)
+                {
+                  (void)retireClosingSocketOperation(tracking.socket);
+                }
                 continue;
               }
-              if (socketGenerationMatches(object, tag) == false)
+              if (socketGenerationMatches(object, tracking.generation) == false)
               {
-                auto generationIt = socketGenerationByIdentity.find(object);
-                unsigned currentGeneration = (generationIt != socketGenerationByIdentity.end())
-                                                 ? unsigned(generationIt->second)
-                                                 : 0u;
-                continue;
-              }
-              if ((op == Operation::connect || op == Operation::send || op == Operation::recv || op == Operation::poll) && result == -ECANCELED)
-              {
+                if (result >= 0)
+                {
+                  ::close(result);
+                }
                 continue;
               }
               if (result < 0)
@@ -2246,7 +2587,7 @@ public:
                                result,
                                -1,
                                -1,
-                               tag,
+                               tracking.generation,
                                false);
               }
               break;
@@ -2263,14 +2604,17 @@ public:
 
               if (isClosing.contains(object))
               {
+                recycleIgnoredRecvmsgMultishotBuffer(tracking, cqe);
                 if (!(cqe->flags & IORING_CQE_F_MORE))
                 {
                   retireTrackedRecvmsgMultishot(user_data);
+                  (void)retireClosingSocketOperation(tracking.socket);
                 }
                 continue;
               }
               if (socketGenerationMatches(object, tracking.generation) == false || recvmsgMultishotSerialMatches(object, tracking.serial) == false)
               {
+                recycleIgnoredRecvmsgMultishotBuffer(tracking, cqe);
                 if (!(cqe->flags & IORING_CQE_F_MORE))
                 {
                   retireTrackedRecvmsgMultishot(user_data);
@@ -2292,13 +2636,13 @@ public:
                 continue;
               }
 
-              if (isClosing.contains(package->socket) || socketGenerationMatches(package->socket, tag) == false)
+              if (isClosing.contains(package->socket) ||
+                  socketGenerationMatches(package->socket, package->generation) == false)
               {
-                auto generationIt = socketGenerationByIdentity.find(package->socket);
-                unsigned currentGeneration = (generationIt != socketGenerationByIdentity.end())
-                                                 ? unsigned(generationIt->second)
-                                                 : 0u;
+                void *socketKey = package->socket;
                 msghdrPackagePool.relinquish(package);
+                releaseSocketLifetimeOperation(socketKey);
+                (void)retireClosingSocketOperation(socketKey);
                 continue;
               }
               break;
@@ -2316,7 +2660,8 @@ public:
               //
               // IORING_OP_MSG_RING also completes on the sender ring with res=0 (or <0 on error).
               // Only receiver-side CQEs carry a positive source ring fd and should dispatch.
-              // The payload is owned by the receiver path and is deleted there.
+              // The receiver owns a successfully delivered payload; the sender
+              // must reclaim one that the kernel could not deliver.
               if (result < 0)
               {
                 Message *message = nullptr;
@@ -2336,6 +2681,7 @@ public:
                   unsigned(message ? message->topic : 0),
                   unsigned(message ? message->size : 0),
                   object);
+                delete static_cast<String *>(object);
                 break;
               }
 
@@ -2415,7 +2761,7 @@ public:
           case Operation::shutdown:
             {
 
-              interfacer->shutdownHandler(object);
+              interfacer->shutdownHandler(object, result);
               break;
             }
           case Operation::poll:
@@ -2443,6 +2789,11 @@ public:
             {
               LinkTimeoutTracking tracking = {};
               if (resolveTrackedLinkTimeout(user_data, tracking) == false)
+              {
+                break;
+              }
+
+              if (retireClosingSocketOperation(tracking.socket))
               {
                 break;
               }
@@ -2523,14 +2874,21 @@ public:
                   vacantAcceptedFixedFileSlots.insert(slot);
                 }
 
+                acceptedPeerAddressByFixedFileSlot.erase(slot);
                 fixedfiles[slot] = -1;
               }
 
-              bool dispatchCloseHandler = shouldDispatchTrackedCloseCompletion(socketKey, tracking.serial, tracking.generation);
+              bool retirementDispatched = false;
+              const bool retirementTracked = noteSocketCloseCompletion(tracking, &retirementDispatched);
+              bool dispatchCloseHandler = false;
+              if (retirementTracked == false)
+              {
+                dispatchCloseHandler = shouldDispatchTrackedCloseCompletion(socketKey, tracking.serial, tracking.generation);
+              }
               traceFixedFile("complete-close-dispatch",
                              Operation::close,
                              socketKey,
-                             dispatchCloseHandler ? 1 : 0,
+                             (dispatchCloseHandler || retirementDispatched) ? 1 : 0,
                              slot,
                              -1,
                              tracking.generation,
@@ -2567,6 +2925,7 @@ public:
                              -1,
                              0,
                              true);
+              acceptedPeerAddressByFixedFileSlot.erase(slot);
               fixedfiles[slot] = -1;
               break;
             }
@@ -2574,10 +2933,13 @@ public:
             {
 
               MsghdrPackage *package = static_cast<MsghdrPackage *>(object);
+              void *socketKey = package->socket;
 
               interfacer->sendmsgHandler(package->socket, package->msg, result);
 
               msghdrPackagePool.relinquish(package);
+              releaseSocketLifetimeOperation(socketKey);
+              (void)retireClosingSocketOperation(socketKey);
               break;
             }
           case Operation::send:
@@ -2598,10 +2960,13 @@ public:
             {
 
               MsghdrPackage *package = static_cast<MsghdrPackage *>(object);
+              void *socketKey = package->socket;
 
               interfacer->recvmsgHandler(package->socket, package->msg, result);
 
               msghdrPackagePool.relinquish(package);
+              releaseSocketLifetimeOperation(socketKey);
+              (void)retireClosingSocketOperation(socketKey);
               break;
             }
           case Operation::recvmsgMultishot:
@@ -2644,12 +3009,9 @@ public:
             }
           case Operation::timeoutMultishot:
             {
-              if (!(cqe->flags & IORING_CQE_F_MORE))
-              {
-
-                queueTimeoutMultishot((TimeoutPacket *)object);
-              }
-
+              // A terminal multishot CQE means the kernel stopped the timer,
+              // including after cancellation. Timer lifecycle owners decide
+              // whether to arm a new request.
               [[fallthrough]];
             }
           case Operation::timeout:

@@ -8,8 +8,10 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <netinet/in.h>
+#include <new>
 #include <poll.h>
 #include <string>
 #include <string_view>
@@ -274,6 +276,19 @@ struct RingScenarioInterface : RingInterface {
 
     acceptedStream.fslot = fslot;
     acceptedStream.isFixedFile = true;
+    suite->expectTrue(
+        Ring::takeAcceptedPeerAddress(
+            fslot, acceptedStream.daddr_storage, acceptedStream.daddrLen),
+        "accept preserves peer address across fixed-file adoption",
+        __FILE__,
+        __LINE__);
+    suite->expectTrue(
+        acceptedStream.daddrLen == sizeof(sockaddr_in) &&
+            acceptedStream.daddr<sockaddr_in>()->sin_family == AF_INET &&
+            ntohl(acceptedStream.daddr<sockaddr_in>()->sin_addr.s_addr) == INADDR_LOOPBACK,
+        "accept reports its IPv4 loopback peer",
+        __FILE__,
+        __LINE__);
     suite->expectTrue(acceptedStream.rBuffer.reserve(64), "acceptedStream.rBuffer.reserve(64)", __FILE__, __LINE__);
     Ring::queueRecv(&acceptedStream);
   }
@@ -292,6 +307,19 @@ struct RingScenarioInterface : RingInterface {
 
     timedOutStream.fslot = fslot;
     timedOutStream.isFixedFile = true;
+    suite->expectTrue(
+        Ring::takeAcceptedPeerAddress(
+            fslot, timedOutStream.daddr_storage, timedOutStream.daddrLen),
+        "multishot accept preserves peer address across fixed-file adoption",
+        __FILE__,
+        __LINE__);
+    suite->expectTrue(
+        timedOutStream.daddrLen == sizeof(sockaddr_in) &&
+            timedOutStream.daddr<sockaddr_in>()->sin_family == AF_INET &&
+            ntohl(timedOutStream.daddr<sockaddr_in>()->sin_addr.s_addr) == INADDR_LOOPBACK,
+        "multishot accept reports its IPv4 loopback peer",
+        __FILE__,
+        __LINE__);
     suite->expectTrue(timedOutStream.rBuffer.reserve(64), "timedOutStream.rBuffer.reserve(64)", __FILE__, __LINE__);
     Ring::queueRecv(&timedOutStream, 40);
   }
@@ -848,6 +876,68 @@ static void testCompletionBatchCanQuiesceRing(TestSuite& suite)
   EXPECT_TRUE(suite, interfacer.batchHandled);
 }
 
+static void testMultishotTimeoutCancellationIsTerminal(TestSuite& suite)
+{
+  struct MultishotTimeoutInterface final : RingInterface {
+    TimeoutPacket repeating;
+    TimeoutPacket guard;
+    uint32_t repeatingCompletions = 0;
+    bool cancelled = false;
+    bool firedAfterCancellation = false;
+    bool guardFired = false;
+
+    MultishotTimeoutInterface()
+    {
+      repeating.setTimeoutMs(20);
+      guard.setTimeoutMs(100);
+    }
+
+    void timeoutHandler(TimeoutPacket *packet, int result) override
+    {
+      if (packet == &repeating)
+      {
+        ++repeatingCompletions;
+        if (result == -ECANCELED)
+        {
+          cancelled = true;
+        }
+        else if (result == -ETIME)
+        {
+          firedAfterCancellation = true;
+        }
+        return;
+      }
+
+      if (packet == &guard && result == -ETIME)
+      {
+        guardFired = true;
+        Ring::exit = true;
+      }
+    }
+  } interfacer;
+
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(32, 64, 4, 2, -1, -1, 4);
+  Ring::queueTimeoutMultishot(&interfacer.repeating);
+  Ring::submitPending();
+  Ring::queueCancelTimeoutMultishot(&interfacer.repeating);
+  Ring::queueTimeout(&interfacer.guard);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  EXPECT_TRUE(suite, interfacer.cancelled);
+  EXPECT_FALSE(suite, interfacer.firedAfterCancellation);
+  EXPECT_TRUE(suite, interfacer.guardFired);
+  EXPECT_EQ(suite, interfacer.repeatingCompletions, uint32_t(1));
+}
+
 static void testRingStartAdvancesCompletionBeforeExit(TestSuite& suite)
 {
   struct ExitOnTimeoutInterface : RingInterface {
@@ -894,6 +984,381 @@ static void testRingStartAdvancesCompletionBeforeExit(TestSuite& suite)
 
   EXPECT_EQ(suite, interfacer.firstCount, uint32_t(1));
   EXPECT_EQ(suite, interfacer.secondCount, uint32_t(1));
+}
+
+static void testShutdownCompletionReportsKernelResult(TestSuite& suite)
+{
+  struct ShutdownCompletionInterface final : RingInterface {
+    UnixSocket connectedSocket;
+    UnixSocket nonSocket;
+    TimeoutPacket deadline;
+    bool connectedCompleted = false;
+    bool nonSocketCompleted = false;
+    bool deadlineFired = false;
+    uint32_t closeCompletions = 0;
+    int connectedResult = -1;
+    int nonSocketResult = 0;
+
+    ShutdownCompletionInterface()
+    {
+      deadline.setTimeoutMs(1000);
+    }
+
+    void shutdownHandler(void *socket, int result) override
+    {
+      if (socket == &connectedSocket)
+      {
+        connectedCompleted = true;
+        connectedResult = result;
+        Ring::queueClose(&connectedSocket);
+      }
+      else if (socket == &nonSocket)
+      {
+        nonSocketCompleted = true;
+        nonSocketResult = result;
+        Ring::queueClose(&nonSocket);
+      }
+    }
+
+    void closeHandler(void *socket) override
+    {
+      if (socket == &connectedSocket || socket == &nonSocket)
+      {
+        ++closeCompletions;
+      }
+      if (closeCompletions == 2)
+      {
+        Ring::exit = true;
+      }
+    }
+
+    void timeoutHandler(TimeoutPacket *packet, int result) override
+    {
+      (void)result;
+      if (packet == &deadline)
+      {
+        deadlineFired = true;
+        Ring::exit = true;
+      }
+    }
+  } interfacer;
+
+  int connectedDescriptors[2] = {-1, -1};
+  int pipeDescriptors[2] = {-1, -1};
+  const int socketPairResult = socketpair(AF_UNIX, SOCK_STREAM, 0, connectedDescriptors);
+  const int pipeResult = pipe(pipeDescriptors);
+  EXPECT_EQ(suite, socketPairResult, 0);
+  EXPECT_EQ(suite, pipeResult, 0);
+  if (socketPairResult != 0 || pipeResult != 0)
+  {
+    if (connectedDescriptors[0] >= 0)
+    {
+      close(connectedDescriptors[0]);
+    }
+    if (connectedDescriptors[1] >= 0)
+    {
+      close(connectedDescriptors[1]);
+    }
+    if (pipeDescriptors[0] >= 0)
+    {
+      close(pipeDescriptors[0]);
+    }
+    if (pipeDescriptors[1] >= 0)
+    {
+      close(pipeDescriptors[1]);
+    }
+    return;
+  }
+
+  interfacer.connectedSocket.fd = connectedDescriptors[0];
+  interfacer.nonSocket.fd = pipeDescriptors[0];
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(32, 32, 4, 2, -1, -1, 4);
+  Ring::installFDIntoFixedFileSlot(&interfacer.connectedSocket);
+  Ring::installFDIntoFixedFileSlot(&interfacer.nonSocket);
+  Ring::queueShutdown(&interfacer.connectedSocket);
+  Ring::queueShutdown(&interfacer.nonSocket);
+  Ring::queueTimeout(&interfacer.deadline);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  close(connectedDescriptors[1]);
+  close(pipeDescriptors[1]);
+
+  EXPECT_FALSE(suite, interfacer.deadlineFired);
+  EXPECT_TRUE(suite, interfacer.connectedCompleted);
+  EXPECT_TRUE(suite, interfacer.nonSocketCompleted);
+  EXPECT_EQ(suite, interfacer.connectedResult, 0);
+  EXPECT_EQ(suite, interfacer.nonSocketResult, -ENOTSOCK);
+  EXPECT_EQ(suite, interfacer.closeCompletions, uint32_t(2));
+}
+
+static void testShutdownAfterSendReachesTcpPeerEof(TestSuite& suite)
+{
+  struct ShutdownAfterSendInterface final : RingInterface {
+    TestSuite *suite = nullptr;
+    TCPStream stream;
+    TimeoutPacket deadline;
+    std::string payload = "shutdown-after-send";
+    uint64_t sentBytes = 0;
+    int shutdownResult = -1;
+    bool shutdownQueuedFromSend = false;
+    bool shutdownCompleted = false;
+    bool streamClosed = false;
+    bool deadlineFired = false;
+
+    explicit ShutdownAfterSendInterface(TestSuite& testSuite)
+        : suite(&testSuite)
+    {
+      deadline.setTimeoutMs(1000);
+    }
+
+    void sendHandler(void *socket, int result) override
+    {
+      if (socket != &stream)
+      {
+        return;
+      }
+
+      stream.pendingSend = false;
+      stream.pendingSendBytes = 0;
+      stream.wBuffer.noteSendCompleted();
+      suite->expectTrue(result > 0, "shutdown-after-send send completed", __FILE__, __LINE__);
+      if (result <= 0)
+      {
+        Ring::exit = true;
+        return;
+      }
+
+      sentBytes += uint64_t(result);
+      stream.wBuffer.consume(uint64_t(result), true);
+      if (stream.wBuffer.outstandingBytes() > 0)
+      {
+        Ring::queueSend(&stream);
+        return;
+      }
+
+      shutdownQueuedFromSend = stream.isFixedFile;
+      Ring::queueShutdown(&stream);
+    }
+
+    void shutdownHandler(void *socket, int result) override
+    {
+      if (socket != &stream)
+      {
+        return;
+      }
+
+      shutdownCompleted = true;
+      shutdownResult = result;
+      Ring::exit = true;
+    }
+
+    void closeHandler(void *socket) override
+    {
+      if (socket == &stream)
+      {
+        streamClosed = true;
+        Ring::exit = true;
+      }
+    }
+
+    void timeoutHandler(TimeoutPacket *packet, int result) override
+    {
+      if (packet == &deadline && result == -ETIME)
+      {
+        deadlineFired = true;
+        Ring::exit = true;
+      }
+    }
+  } interfacer(suite);
+
+  TCPSocket listener;
+  configureLoopbackListener(listener);
+  const uint16_t listenerPort = boundPortForFD(listener.fd);
+  EXPECT_TRUE(suite, listenerPort != 0);
+
+  int peerFD = socket(AF_INET, SOCK_STREAM, 0);
+  EXPECT_TRUE(suite, peerFD >= 0);
+  if (listenerPort == 0 || peerFD < 0)
+  {
+    if (peerFD >= 0)
+    {
+      ::close(peerFD);
+    }
+    ::close(listener.fd);
+    listener.fd = -1;
+    return;
+  }
+
+  sockaddr_in address = {};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(listenerPort);
+  inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+  const int peerConnectResult =
+      connect(peerFD, reinterpret_cast<sockaddr *>(&address), sizeof(address));
+  EXPECT_EQ(suite, peerConnectResult, 0);
+  int acceptedFD = peerConnectResult == 0 ? listener.accept() : -1;
+  EXPECT_TRUE(suite, acceptedFD >= 0);
+  ::close(listener.fd);
+  listener.fd = -1;
+  if (peerConnectResult != 0 || acceptedFD < 0)
+  {
+    ::close(peerFD);
+    if (acceptedFD >= 0)
+    {
+      ::close(acceptedFD);
+    }
+    return;
+  }
+
+  interfacer.stream.fd = acceptedFD;
+  interfacer.stream.wBuffer.append(
+      interfacer.payload.data(), interfacer.payload.size());
+
+  int peerEofResult = -1;
+  int peerEofErrno = 0;
+  std::string peerPayload;
+  std::thread peer([&]() {
+    timeval timeout = {.tv_sec = 2, .tv_usec = 0};
+    setsockopt(peerFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    while (peerPayload.size() < interfacer.payload.size())
+    {
+      char buffer[64] = {};
+      ssize_t received = recv(peerFD, buffer, sizeof(buffer), 0);
+      if (received <= 0)
+      {
+        peerEofResult = int(received);
+        peerEofErrno = received < 0 ? errno : 0;
+        break;
+      }
+      peerPayload.append(buffer, size_t(received));
+    }
+
+    if (peerPayload.size() == interfacer.payload.size())
+    {
+      char byte = 0;
+      errno = 0;
+      peerEofResult = int(recv(peerFD, &byte, sizeof(byte), 0));
+      peerEofErrno = peerEofResult < 0 ? errno : 0;
+    }
+    ::close(peerFD);
+  });
+
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(32, 32, 4, 2, -1, -1, 4);
+  Ring::installFDIntoFixedFileSlot(&interfacer.stream);
+  Ring::queueSend(&interfacer.stream);
+  Ring::queueTimeout(&interfacer.deadline);
+  Ring::start();
+  peer.join();
+
+  Ring::exit = false;
+  Ring::queueClose(&interfacer.stream);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  EXPECT_FALSE(suite, interfacer.deadlineFired);
+  EXPECT_TRUE(suite, interfacer.shutdownQueuedFromSend);
+  EXPECT_TRUE(suite, interfacer.shutdownCompleted);
+  EXPECT_EQ(suite, interfacer.sentBytes, uint64_t(interfacer.payload.size()));
+  EXPECT_EQ(suite, interfacer.shutdownResult, 0);
+  EXPECT_EQ(suite, peerConnectResult, 0);
+  EXPECT_EQ(suite, peerPayload, interfacer.payload);
+  EXPECT_EQ(suite, peerEofResult, 0);
+  EXPECT_EQ(suite, peerEofErrno, 0);
+  EXPECT_TRUE(suite, interfacer.streamClosed);
+}
+
+static void testCloseRetiresPendingShutdownWithoutStaleCallback(TestSuite& suite)
+{
+  struct PendingShutdownCloseInterface final : RingInterface {
+    UnixSocket socket;
+    TimeoutPacket settle;
+    uint32_t shutdownCompletions = 0;
+    uint32_t closeCompletions = 0;
+    bool shutdownTrackingGoneAtClose = false;
+    bool settled = false;
+
+    PendingShutdownCloseInterface()
+    {
+      settle.setTimeoutMs(25);
+    }
+
+    void shutdownHandler(void *socket_, int result) override
+    {
+      (void)result;
+      if (socket_ == &socket)
+      {
+        ++shutdownCompletions;
+      }
+    }
+
+    void closeHandler(void *socket_) override
+    {
+      if (socket_ == &socket)
+      {
+        ++closeCompletions;
+        shutdownTrackingGoneAtClose =
+            Ring::socketHasLifetimeOperations(&socket) == false;
+      }
+    }
+
+    void timeoutHandler(TimeoutPacket *packet, int result) override
+    {
+      if (packet == &settle && result == -ETIME)
+      {
+        settled = true;
+        Ring::exit = true;
+      }
+    }
+  } interfacer;
+
+  int descriptors[2] = {-1, -1};
+  const int socketPairResult =
+      socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, descriptors);
+  EXPECT_EQ(suite, socketPairResult, 0);
+  if (socketPairResult != 0)
+  {
+    return;
+  }
+
+  interfacer.socket.fd = descriptors[0];
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(32, 32, 4, 2, -1, -1, 4);
+  Ring::installFDIntoFixedFileSlot(&interfacer.socket);
+  Ring::queueShutdown(&interfacer.socket);
+  Ring::queueClose(&interfacer.socket);
+  Ring::queueTimeout(&interfacer.settle);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  close(descriptors[1]);
+
+  EXPECT_TRUE(suite, interfacer.settled);
+  EXPECT_EQ(suite, interfacer.shutdownCompletions, uint32_t(0));
+  EXPECT_EQ(suite, interfacer.closeCompletions, uint32_t(1));
+  EXPECT_TRUE(suite, interfacer.shutdownTrackingGoneAtClose);
 }
 
 static void runRingScenario(TestSuite& suite)
@@ -1218,6 +1683,174 @@ static void testDuplicateQueueCloseIsIdempotent(TestSuite& suite)
   EXPECT_EQ(suite, interfacer.closeCalls, 1);
 }
 
+static void testCloseWaitsForPriorGenerationTimedRecvBeforeAddressReuse(TestSuite& suite)
+{
+  int fds[2] = {-1, -1};
+  EXPECT_EQ(suite, socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds), 0);
+  if (fds[0] < 0 || fds[1] < 0)
+  {
+    return;
+  }
+
+  struct PendingRecvCloseInterface final : RingInterface
+  {
+    UnixStream stream;
+    TimeoutPacket deadline;
+    uint8_t *recvStorage = nullptr;
+    int recvCalls = 0;
+    int closeCalls = 0;
+    bool storageAliveAtClose = false;
+    bool lifetimeRetiredAtClose = false;
+    bool replacementReusedAddress = false;
+    bool replacementHasDefaultGeneration = false;
+    bool deadlineFired = false;
+
+    PendingRecvCloseInterface()
+    {
+      deadline.setTimeoutSeconds(2);
+    }
+
+    void recvHandler(void *socket, int result) override
+    {
+      (void)result;
+      if (socket == &stream)
+      {
+        ++recvCalls;
+      }
+    }
+
+    void closeHandler(void *socket) override
+    {
+      if (socket == &stream)
+      {
+        ++closeCalls;
+        storageAliveAtClose = (stream.rBuffer.pTail() == recvStorage);
+        lifetimeRetiredAtClose = Ring::socketHasLifetimeOperations(socket) == false;
+        void *oldAddress = &stream;
+        stream.UnixStream::~UnixStream();
+        UnixStream *replacement = ::new (&stream) UnixStream();
+        replacementReusedAddress = (static_cast<void *>(replacement) == oldAddress);
+        replacementHasDefaultGeneration = (replacement->ioGeneration == 1);
+        Ring::exit = true;
+      }
+    }
+
+    void timeoutHandler(TimeoutPacket *packet, int result) override
+    {
+      if (packet == &deadline && result == -ETIME)
+      {
+        deadlineFired = true;
+        Ring::exit = true;
+      }
+    }
+  } interfacer;
+
+  interfacer.stream.setUnixPairHalf(fds[0]);
+  EXPECT_TRUE(suite, interfacer.stream.rBuffer.reserve(4096));
+
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(2, 64, 8, 4, -1, -1, 8);
+  Ring::installFDIntoFixedFileSlot(&interfacer.stream);
+  Ring::queueRecv(&interfacer.stream, 60'000);
+  interfacer.recvStorage = interfacer.stream.rBuffer.pTail();
+  Ring::queueTimeout(&interfacer.deadline);
+  interfacer.stream.setDisconnected();
+  Ring::queueCancelAll(&interfacer.stream);
+  Ring::queueClose(&interfacer.stream);
+  EXPECT_FALSE(suite, interfacer.stream.isFixedFile);
+  EXPECT_EQ(suite, interfacer.stream.fd, -1);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  ::close(fds[1]);
+
+  EXPECT_FALSE(suite, interfacer.deadlineFired);
+  EXPECT_EQ(suite, interfacer.recvCalls, 0);
+  EXPECT_EQ(suite, interfacer.closeCalls, 1);
+  EXPECT_TRUE(suite, interfacer.storageAliveAtClose);
+  EXPECT_TRUE(suite, interfacer.lifetimeRetiredAtClose);
+  EXPECT_TRUE(suite, interfacer.replacementReusedAddress);
+  EXPECT_TRUE(suite, interfacer.replacementHasDefaultGeneration);
+}
+
+static void testCloseRetiresPendingAcceptWithoutConnection(TestSuite& suite)
+{
+  struct PendingAcceptCloseInterface final : RingInterface
+  {
+    TCPSocket listener;
+    TimeoutPacket closeTrigger;
+    TimeoutPacket deadline;
+    int acceptCalls = 0;
+    int closeCalls = 0;
+    bool deadlineFired = false;
+
+    PendingAcceptCloseInterface()
+    {
+      configureLoopbackListener(listener);
+      closeTrigger.setTimeoutMs(10);
+      deadline.setTimeoutSeconds(2);
+    }
+
+    void acceptHandler(void *socket, int result) override
+    {
+      (void)result;
+      if (socket == &listener)
+      {
+        ++acceptCalls;
+      }
+    }
+
+    void closeHandler(void *socket) override
+    {
+      if (socket == &listener)
+      {
+        ++closeCalls;
+        Ring::exit = true;
+      }
+    }
+
+    void timeoutHandler(TimeoutPacket *packet, int result) override
+    {
+      if (packet == &closeTrigger && result == -ETIME)
+      {
+        Ring::queueClose(&listener);
+      }
+      else if (packet == &deadline && result == -ETIME)
+      {
+        deadlineFired = true;
+        Ring::exit = true;
+      }
+    }
+  } interfacer;
+
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(32, 32, 8, 4, -1, -1, 8);
+  Ring::installFDIntoFixedFileSlot(&interfacer.listener);
+  Ring::queueAccept(&interfacer.listener);
+  Ring::queueTimeout(&interfacer.closeTrigger);
+  Ring::queueTimeout(&interfacer.deadline);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  EXPECT_FALSE(suite, interfacer.deadlineFired);
+  EXPECT_EQ(suite, interfacer.acceptCalls, 0);
+  EXPECT_EQ(suite, interfacer.closeCalls, 1);
+}
+
 static void testAcceptedCloseRawReturnsDynamicSlot(TestSuite& suite)
 {
   AcceptCloseRawInterface interfacer(suite);
@@ -1473,6 +2106,20 @@ static void testRingMessageSenderErrorReportsInvalidTarget(TestSuite& suite)
     dup2(stderrPipe[1], STDERR_FILENO);
     close(stderrPipe[1]);
 
+    bool messageDestroyed = false;
+    struct TrackedString final : String {
+      bool *destroyed;
+
+      explicit TrackedString(bool *destroyed_) : destroyed(destroyed_)
+      {
+      }
+
+      ~TrackedString() override
+      {
+        *destroyed = true;
+      }
+    };
+
     struct MsgRingSenderErrorInterface : RingInterface {
       TimeoutPacket deadline;
       bool timeoutFired = false;
@@ -1503,7 +2150,7 @@ static void testRingMessageSenderErrorReportsInvalidTarget(TestSuite& suite)
 
     Ring::createRing(32, 32, 8, 2, -1, -1, 8);
 
-    String *message = new String();
+    String *message = new TrackedString(&messageDestroyed);
     Message::construct(*message, uint16_t(7), uint64_t(11));
 
     Ring::queueTimeout(&interfacer.deadline);
@@ -1511,7 +2158,7 @@ static void testRingMessageSenderErrorReportsInvalidTarget(TestSuite& suite)
     Ring::start();
     Ring::shutdownForExec();
 
-    _exit(interfacer.timeoutFired ? 0 : 2);
+    _exit(interfacer.timeoutFired && messageDestroyed ? 0 : 2);
   }
 
   close(stderrPipe[1]);
@@ -1549,15 +2196,51 @@ int main()
     std::cout << "ring integration tests skipped: required io_uring features unavailable on this host.\n";
     return suite.finish("ring integration tests");
   }
+  if (std::getenv("BASICS_TEST_CLOSE_RETIREMENT") != nullptr)
+  {
+    testCloseWaitsForPriorGenerationTimedRecvBeforeAddressReuse(suite);
+    return suite.finish("ring integration tests");
+  }
+  if (std::getenv("BASICS_TEST_MSG_RING_SENDER_ERROR") != nullptr)
+  {
+    testRingMessageSenderErrorReportsInvalidTarget(suite);
+    return suite.finish("ring integration tests");
+  }
+  if (std::getenv("BASICS_TEST_MULTISHOT_TIMEOUT_CANCEL") != nullptr)
+  {
+    testMultishotTimeoutCancellationIsTerminal(suite);
+    return suite.finish("ring integration tests");
+  }
+  if (std::getenv("BASICS_TEST_SHUTDOWN_RESULT") != nullptr)
+  {
+    testShutdownCompletionReportsKernelResult(suite);
+    return suite.finish("ring integration tests");
+  }
+  if (std::getenv("BASICS_TEST_SHUTDOWN_AFTER_SEND") != nullptr)
+  {
+    testShutdownAfterSendReachesTcpPeerEof(suite);
+    return suite.finish("ring integration tests");
+  }
+  if (std::getenv("BASICS_TEST_SHUTDOWN_CLOSE_RACE") != nullptr)
+  {
+    testCloseRetiresPendingShutdownWithoutStaleCallback(suite);
+    return suite.finish("ring integration tests");
+  }
 
   testIsolatedWorkerRingPreservesProcessIntegration(suite);
   runRingScenario(suite);
   testCompletionBatchCanQuiesceRing(suite);
+  testMultishotTimeoutCancellationIsTerminal(suite);
   testRingStartAdvancesCompletionBeforeExit(suite);
+  testShutdownCompletionReportsKernelResult(suite);
+  testShutdownAfterSendReachesTcpPeerEof(suite);
+  testCloseRetiresPendingShutdownWithoutStaleCallback(suite);
   testRawFDPollReadinessCancellationAndRace(suite);
   testRingletSendRecvAndTimeout(suite);
   testCanceledWaitidReachesOwner(suite);
   testDuplicateQueueCloseIsIdempotent(suite);
+  testCloseWaitsForPriorGenerationTimedRecvBeforeAddressReuse(suite);
+  testCloseRetiresPendingAcceptWithoutConnection(suite);
   testAcceptedCloseRawReturnsDynamicSlot(suite);
   testQueuedSendDrainsFramesBehindCompletedHandshake(suite);
   testTimedRecvCloseReuseStress(suite);

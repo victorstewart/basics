@@ -202,10 +202,10 @@ public:
     });
   }
 
-  void shutdownHandler(void *socket)
+  void shutdownHandler(void *socket, int result) override
   {
     distributeContains(socket, [&](RingInterface *interface) {
-      interface->shutdownHandler(socket);
+      interface->shutdownHandler(socket, result);
     });
   }
 

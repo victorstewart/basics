@@ -4,6 +4,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <new>
+#include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
@@ -200,13 +204,19 @@ static void clearRingCloseTrackingState(void)
   Ring::linkTimeoutTrackingByUserData.clear();
   Ring::retiredLinkTimeoutTrackingUserData.clear();
   Ring::closeTrackingByUserData.clear();
+  Ring::socketCloseRetirementByIdentity.clear();
   Ring::retiredCloseTrackingUserData.clear();
   Ring::isClosing.clear();
   Ring::closingSerialByIdentity.clear();
   Ring::socketGenerationByIdentity.clear();
+  Ring::socketLifetimeOperationCountByIdentity.clear();
+  Ring::socketOperationTrackingByUserData.clear();
+  Ring::recvmsgMultishotTrackingByUserData.clear();
+  Ring::retiredRecvmsgMultishotTrackingUserData.clear();
   Ring::nextLinkTimeoutTicket = 1;
   Ring::nextCloseSerial = 1;
   Ring::nextCloseTicket = 1;
+  Ring::nextSocketOperationTicket = 1;
   Ring::rawPollTrackingByUserData.clear();
   Ring::nextRawPollTicket = 1;
   Ring::retiredLinkTimeoutTrackingHistory.fill(0);
@@ -215,6 +225,9 @@ static void clearRingCloseTrackingState(void)
   Ring::retiredCloseTrackingHistory.fill(0);
   Ring::retiredCloseTrackingHead = 0;
   Ring::retiredCloseTrackingUserDataCount = 0;
+  Ring::retiredRecvmsgMultishotTrackingHistory.fill(0);
+  Ring::retiredRecvmsgMultishotTrackingHead = 0;
+  Ring::retiredRecvmsgMultishotTrackingUserDataCount = 0;
 }
 
 static void singleSuspend(CoroutineStack& stack, std::vector<int>& steps, int id)
@@ -705,6 +718,28 @@ static void testResolveTrackedCloseCompletionReturnsTracking(TestSuite& suite)
   clearRingCloseTrackingState();
 }
 
+static void testShutdownResultDefaultPreservesLegacyCallback(TestSuite& suite)
+{
+  struct LegacyShutdownInterface final : RingInterface
+  {
+    void *lastSocket = nullptr;
+    uint32_t calls = 0;
+
+    void shutdownHandler(void *socket) override
+    {
+      lastSocket = socket;
+      ++calls;
+    }
+  } recorder;
+
+  void *socket = reinterpret_cast<void *>(UINT64_C(0x1234));
+  RingInterface *interface = &recorder;
+  interface->shutdownHandler(socket, -ECANCELED);
+
+  EXPECT_EQ(suite, recorder.calls, uint32_t(1));
+  EXPECT_TRUE(suite, recorder.lastSocket == socket);
+}
+
 static void testRawFDPollTrackingUsesStableTickets(TestSuite& suite)
 {
   clearRingCloseTrackingState();
@@ -735,6 +770,251 @@ static void testRawFDPollTrackingUsesStableTickets(TestSuite& suite)
   clearRingCloseTrackingState();
 }
 
+static void testAcceptAndPollTrackingPreserveGenerationsAboveEightBits(TestSuite& suite)
+{
+  clearRingCloseTrackingState();
+
+  UnixStream stream;
+  stream.ioGeneration = 300;
+  void *socketKey = Ring::socketIdentity(&stream);
+  Ring::noteSocketGeneration(&stream);
+  EXPECT_EQ(suite, stream.ioGeneration, uint64_t(300));
+  EXPECT_FALSE(suite, Ring::socketGenerationMatches(
+      socketKey, uint8_t(stream.ioGeneration)));
+
+  const uint64_t acceptUserData = Ring::issueSocketOperationTracking(
+      Ring::Operation::accept, socketKey, stream.ioGeneration);
+  Ring::SocketOperationTracking accept = {};
+  EXPECT_TRUE(suite, Ring::resolveSocketOperationTracking(
+      acceptUserData, Ring::Operation::accept, accept));
+  EXPECT_EQ(suite, accept.generation, uint64_t(300));
+  EXPECT_TRUE(suite, Ring::socketGenerationMatches(
+      accept.socket, accept.generation));
+
+  const uint64_t pollUserData = Ring::issueSocketOperationTracking(
+      Ring::Operation::poll, socketKey, stream.ioGeneration);
+  EXPECT_EQ(suite, Ring::trackedSocketOperationUserData(
+      socketKey, Ring::Operation::poll, stream.ioGeneration), pollUserData);
+  Ring::SocketOperationTracking poll = {};
+  EXPECT_TRUE(suite, Ring::resolveSocketOperationTracking(
+      pollUserData, Ring::Operation::poll, poll));
+  EXPECT_EQ(suite, poll.generation, uint64_t(300));
+  EXPECT_TRUE(suite, Ring::socketGenerationMatches(
+      poll.socket, poll.generation));
+
+  const uint64_t multishotUserData = Ring::issueSocketOperationTracking(
+      Ring::Operation::acceptMultishot, socketKey, stream.ioGeneration);
+  Ring::SocketOperationTracking multishot = {};
+  EXPECT_TRUE(suite, Ring::resolveSocketOperationTracking(
+      multishotUserData, Ring::Operation::acceptMultishot, multishot, false));
+  EXPECT_TRUE(suite, Ring::socketOperationTrackingByUserData.contains(multishotUserData));
+  EXPECT_EQ(suite, multishot.generation, uint64_t(300));
+  EXPECT_TRUE(suite, Ring::resolveSocketOperationTracking(
+      multishotUserData, Ring::Operation::acceptMultishot, multishot));
+  EXPECT_FALSE(suite, Ring::socketOperationTrackingByUserData.contains(multishotUserData));
+
+  clearRingCloseTrackingState();
+}
+
+static void testQueueCancelTargetsRequestedTrackedOperationWithCompetitor(TestSuite& suite)
+{
+  clearRingCloseTrackingState();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(8, 8, 8, 2, -1, -1, 0);
+
+  int competitorFD = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  int targetFD = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  EXPECT_TRUE(suite, competitorFD >= 0 && targetFD >= 0);
+  if (competitorFD < 0 || targetFD < 0)
+  {
+    if (competitorFD >= 0)
+    {
+      ::close(competitorFD);
+    }
+    if (targetFD >= 0)
+    {
+      ::close(targetFD);
+    }
+    Ring::shutdownForExec();
+    clearRingCloseTrackingState();
+    return;
+  }
+
+  UnixStream competitor;
+  UnixStream target;
+  competitor.setUnixPairHalf(competitorFD);
+  target.setUnixPairHalf(targetFD);
+  competitor.ioGeneration = 300;
+  target.ioGeneration = 300;
+  void *competitorKey = Ring::socketIdentity(&competitor);
+  void *targetKey = Ring::socketIdentity(&target);
+  Ring::noteSocketGeneration(&competitor);
+  Ring::noteSocketGeneration(&target);
+  Ring::installFDIntoFixedFileSlot(&competitor);
+  Ring::installFDIntoFixedFileSlot(&target);
+
+  Ring::queuePoll(&competitor, POLLIN);
+  Ring::queuePoll(&target, POLLIN);
+  const uint64_t competitorUserData = Ring::trackedSocketOperationUserData(
+      competitorKey, Ring::Operation::poll, competitor.ioGeneration);
+  const uint64_t targetUserData = Ring::trackedSocketOperationUserData(
+      targetKey, Ring::Operation::poll, target.ioGeneration);
+  EXPECT_TRUE(suite, competitorUserData != 0);
+  EXPECT_TRUE(suite, targetUserData != 0);
+  EXPECT_TRUE(suite, competitorUserData != targetUserData);
+  const uint32_t cancelSQEIndex =
+      Ring::ring.sq.sqe_tail & *Ring::ring.sq.kring_mask;
+
+  Ring::queueCancel(&target, Ring::Operation::poll);
+
+  const struct io_uring_sqe& cancelSQE = Ring::ring.sq.sqes[cancelSQEIndex];
+  EXPECT_EQ(suite, cancelSQE.opcode, uint8_t(IORING_OP_ASYNC_CANCEL));
+  EXPECT_EQ(suite, cancelSQE.addr, targetUserData);
+  EXPECT_EQ(suite, cancelSQE.cancel_flags, uint32_t(0));
+  EXPECT_TRUE(suite, Ring::socketOperationTrackingByUserData.contains(competitorUserData));
+  EXPECT_TRUE(suite, Ring::socketOperationTrackingByUserData.contains(targetUserData));
+
+  Ring::shutdownForExec();
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  clearRingCloseTrackingState();
+}
+
+static void testCloseRetirementWaitsForTrackedStreamTerminalCompletions(TestSuite& suite)
+{
+  clearRingCloseTrackingState();
+  Ring::msghdrPackagePool.initialize(8);
+
+  RecordingRingInterface recorder;
+  RingInterface *previousInterfacer = Ring::interfacer;
+  Ring::interfacer = &recorder;
+
+  UnixStream stream;
+  stream.ioGeneration = 44;
+  void *socketKey = Ring::socketIdentity(&stream);
+  Ring::noteSocketGeneration(&stream);
+  const uint64_t operationGeneration = stream.ioGeneration;
+  const uint64_t sendUserData = Ring::issueSocketOperationTracking(
+      Ring::Operation::send, socketKey, operationGeneration);
+  const uint64_t recvUserData = Ring::issueSocketOperationTracking(
+      Ring::Operation::recv, socketKey, operationGeneration);
+  const uint64_t connectUserData = Ring::issueSocketOperationTracking(
+      Ring::Operation::connect, socketKey, operationGeneration);
+  const uint64_t acceptUserData = Ring::issueSocketOperationTracking(
+      Ring::Operation::accept, socketKey, operationGeneration);
+  const uint64_t pollUserData = Ring::issueSocketOperationTracking(
+      Ring::Operation::poll, socketKey, operationGeneration);
+
+  Ring::MsghdrPackage *message = Ring::msghdrPackagePool.get();
+  message->socket = socketKey;
+  message->msg = nullptr;
+  message->generation = operationGeneration;
+  Ring::retainSocketLifetimeOperation(socketKey);
+  const uint64_t multishotUserData = Ring::issueRecvmsgMultishotTracking(
+      socketKey, operationGeneration, 9, 0);
+  const uint64_t linkTimeoutUserData = Ring::issueLinkTimeoutTracking(
+      socketKey, operationGeneration, Ring::Operation::recv);
+
+  // A consumer may invalidate its transport before asking Ring to close it.
+  // The provider must still retain every earlier generation for this identity.
+  stream.bumpIoGeneration();
+  stream.bumpIoGeneration();
+  Ring::noteSocketGeneration(&stream);
+  Ring::isClosing.insert(socketKey);
+  Ring::closingSerialByIdentity.insert_or_assign(socketKey, uint64_t(17));
+  Ring::CloseCompletionTracking close = {
+      .socket = socketKey,
+      .slot = 31,
+      .serial = 17,
+      .generation = stream.ioGeneration
+  };
+  struct RetiringSendOwner
+  {
+    String bytes = "retiring-send"_ctv;
+    uint32_t finalizations = 0;
+  } retiringSend;
+  Ring::beginSocketCloseRetirement(
+      close,
+      &retiringSend,
+      [](void *owner) {
+        RetiringSendOwner *send = static_cast<RetiringSendOwner *>(owner);
+        send->bytes.clear();
+        ++send->finalizations;
+      });
+
+  EXPECT_TRUE(suite, Ring::socketHasLifetimeOperations(socketKey));
+  EXPECT_EQ(suite, Ring::socketLifetimeOperationCountByIdentity.find(socketKey)->second, uint64_t(8));
+  EXPECT_TRUE(suite, Ring::noteSocketCloseCompletion(close));
+  EXPECT_EQ(suite, recorder.closeCalls, 0);
+  EXPECT_EQ(suite, retiringSend.finalizations, uint32_t(0));
+  EXPECT_TRUE(suite, retiringSend.bytes.size() > 0);
+  EXPECT_TRUE(suite, Ring::isClosing.contains(socketKey));
+
+  Ring::SocketOperationTracking recv = {};
+  EXPECT_TRUE(suite, Ring::resolveSocketOperationTracking(recvUserData, Ring::Operation::recv, recv));
+  EXPECT_TRUE(suite, Ring::retireClosingSocketOperation(recv.socket));
+  EXPECT_EQ(suite, recorder.closeCalls, 0);
+  EXPECT_EQ(suite, retiringSend.finalizations, uint32_t(0));
+
+  Ring::SocketOperationTracking send = {};
+  EXPECT_TRUE(suite, Ring::resolveSocketOperationTracking(sendUserData, Ring::Operation::send, send));
+  EXPECT_TRUE(suite, Ring::retireClosingSocketOperation(send.socket));
+  EXPECT_EQ(suite, recorder.closeCalls, 0);
+  EXPECT_EQ(suite, retiringSend.finalizations, uint32_t(0));
+
+  Ring::SocketOperationTracking connect = {};
+  EXPECT_TRUE(suite, Ring::resolveSocketOperationTracking(
+      connectUserData, Ring::Operation::connect, connect));
+  EXPECT_TRUE(suite, Ring::retireClosingSocketOperation(connect.socket));
+  EXPECT_EQ(suite, recorder.closeCalls, 0);
+  EXPECT_EQ(suite, retiringSend.finalizations, uint32_t(0));
+
+  Ring::SocketOperationTracking accept = {};
+  EXPECT_TRUE(suite, Ring::resolveSocketOperationTracking(
+      acceptUserData, Ring::Operation::accept, accept));
+  EXPECT_TRUE(suite, Ring::retireClosingSocketOperation(accept.socket));
+  EXPECT_EQ(suite, recorder.closeCalls, 0);
+  EXPECT_EQ(suite, retiringSend.finalizations, uint32_t(0));
+
+  Ring::SocketOperationTracking poll = {};
+  EXPECT_TRUE(suite, Ring::resolveSocketOperationTracking(
+      pollUserData, Ring::Operation::poll, poll));
+  EXPECT_TRUE(suite, Ring::retireClosingSocketOperation(poll.socket));
+  EXPECT_EQ(suite, recorder.closeCalls, 0);
+  EXPECT_EQ(suite, retiringSend.finalizations, uint32_t(0));
+
+  Ring::msghdrPackagePool.relinquish(message);
+  Ring::releaseSocketLifetimeOperation(socketKey);
+  EXPECT_TRUE(suite, Ring::retireClosingSocketOperation(socketKey));
+  EXPECT_EQ(suite, recorder.closeCalls, 0);
+  EXPECT_EQ(suite, retiringSend.finalizations, uint32_t(0));
+
+  Ring::retireTrackedRecvmsgMultishot(multishotUserData);
+  EXPECT_TRUE(suite, Ring::retireClosingSocketOperation(socketKey));
+  EXPECT_EQ(suite, recorder.closeCalls, 0);
+  EXPECT_EQ(suite, retiringSend.finalizations, uint32_t(0));
+
+  Ring::LinkTimeoutTracking linkTimeout = {};
+  EXPECT_TRUE(suite, Ring::resolveTrackedLinkTimeout(linkTimeoutUserData, linkTimeout));
+  EXPECT_TRUE(suite, Ring::retireClosingSocketOperation(socketKey));
+  EXPECT_EQ(suite, recorder.closeCalls, 1);
+  EXPECT_EQ(suite, retiringSend.finalizations, uint32_t(1));
+  EXPECT_EQ(suite, retiringSend.bytes.size(), uint64_t(0));
+  EXPECT_TRUE(suite, recorder.lastSocket == socketKey);
+  EXPECT_FALSE(suite, Ring::socketHasLifetimeOperations(socketKey));
+  EXPECT_FALSE(suite, Ring::isClosing.contains(socketKey));
+  EXPECT_FALSE(suite, Ring::socketCloseRetirementByIdentity.contains(socketKey));
+  EXPECT_FALSE(suite, Ring::retireClosingSocketOperation(socketKey));
+  EXPECT_EQ(suite, recorder.closeCalls, 1);
+  EXPECT_EQ(suite, retiringSend.finalizations, uint32_t(1));
+
+  Ring::interfacer = previousInterfacer;
+  clearRingCloseTrackingState();
+}
+
 static void testTrackedCloseCompletionSkipsReusedGeneration(TestSuite& suite)
 {
   clearRingCloseTrackingState();
@@ -750,36 +1030,6 @@ static void testTrackedCloseCompletionSkipsReusedGeneration(TestSuite& suite)
   Ring::noteSocketGeneration(&stream);
 
   EXPECT_FALSE(suite, Ring::shouldDispatchTrackedCloseCompletion(socketKey, uint64_t(5), uint8_t(41)));
-  EXPECT_TRUE(suite, Ring::isClosing.contains(socketKey) == false);
-  EXPECT_TRUE(suite, Ring::closingSerialByIdentity.find(socketKey) == Ring::closingSerialByIdentity.end());
-
-  clearRingCloseTrackingState();
-}
-
-static void testTrackedCloseCompletionSkipsRecycledPointerAfterGenerationRepublish(TestSuite& suite)
-{
-  clearRingCloseTrackingState();
-
-  UnixStream stream;
-  void *socketKey = Ring::socketIdentity(&stream);
-  stream.ioGeneration = 9;
-  Ring::publishSocketGeneration(&stream);
-  Ring::isClosing.insert(socketKey);
-  Ring::closingSerialByIdentity.insert_or_assign(socketKey, uint64_t(6));
-
-  const uint64_t userData = Ring::issueCloseTracking(socketKey, 23, 6, stream.ioGeneration);
-
-  // A recycled allocation can restart from a lower/default generation while
-  // retaining the same identity address. Republish that fresh generation before
-  // the first recv/send arm so stale close CQEs cannot match the old transport.
-  stream.ioGeneration = 1;
-  Ring::publishSocketGeneration(&stream);
-
-  Ring::CloseCompletionTracking tracking = {};
-  EXPECT_TRUE(suite, Ring::resolveTrackedCloseCompletion(userData, tracking));
-  EXPECT_EQ(suite, tracking.serial, uint64_t(6));
-  EXPECT_EQ(suite, tracking.generation, uint8_t(9));
-  EXPECT_FALSE(suite, Ring::shouldDispatchTrackedCloseCompletion(socketKey, tracking.serial, tracking.generation));
   EXPECT_TRUE(suite, Ring::isClosing.contains(socketKey) == false);
   EXPECT_TRUE(suite, Ring::closingSerialByIdentity.find(socketKey) == Ring::closingSerialByIdentity.end());
 
@@ -873,28 +1123,6 @@ static void testTrackedLinkTimeoutIgnoresRetiredDuplicate(TestSuite& suite)
   EXPECT_TRUE(suite, tracking.linkedOp == Ring::Operation::recv);
   EXPECT_TRUE(suite, Ring::retiredLinkTimeoutTrackingUserData.contains(userData));
   EXPECT_FALSE(suite, Ring::resolveTrackedLinkTimeout(userData, tracking));
-
-  clearRingCloseTrackingState();
-}
-
-static void testTrackedLinkTimeoutSkipsRecycledPointerAfterGenerationRepublish(TestSuite& suite)
-{
-  clearRingCloseTrackingState();
-
-  UnixStream stream;
-  void *socketKey = Ring::socketIdentity(&stream);
-  stream.ioGeneration = 9;
-  Ring::publishSocketGeneration(&stream);
-
-  const uint64_t userData = Ring::issueLinkTimeoutTracking(socketKey, stream.ioGeneration, Ring::Operation::recv);
-
-  stream.ioGeneration = 1;
-  Ring::publishSocketGeneration(&stream);
-
-  Ring::LinkTimeoutTracking tracking = {};
-  EXPECT_TRUE(suite, Ring::resolveTrackedLinkTimeout(userData, tracking));
-  EXPECT_EQ(suite, tracking.generation, uint8_t(9));
-  EXPECT_FALSE(suite, Ring::socketGenerationMatches(socketKey, tracking.generation));
 
   clearRingCloseTrackingState();
 }
@@ -1054,6 +1282,17 @@ static void testQueueRecvGrowsFullBufferBeforeArming(TestSuite& suite)
 int main()
 {
   TestSuite suite;
+  if (std::getenv("BASICS_TEST_SOCKET_GENERATION_ABA") != nullptr)
+  {
+    testAcceptAndPollTrackingPreserveGenerationsAboveEightBits(suite);
+    testQueueCancelTargetsRequestedTrackedOperationWithCompetitor(suite);
+    return suite.finish("networking_support_structures_tests");
+  }
+  if (std::getenv("BASICS_TEST_CLOSE_RETIREMENT") != nullptr)
+  {
+    testCloseRetirementWaitsForTrackedStreamTerminalCompletions(suite);
+    return suite.finish("networking_support_structures_tests");
+  }
   testPoolReuseAndOutstandingTracking(suite);
   testMemoryPoolsReuseBuffers(suite);
   testTimerWheelSchedulingAndCancellation(suite);
@@ -1061,15 +1300,17 @@ int main()
   testRingDispatcherIsThreadLocal(suite);
   testFallbackDispatcherInitDoesNotClobberLiveDispatcher(suite);
   testCoroutineStackScheduling(suite);
-  testRawFDPollTrackingUsesStableTickets(suite);
+   testRawFDPollTrackingUsesStableTickets(suite);
+   testAcceptAndPollTrackingPreserveGenerationsAboveEightBits(suite);
+  testQueueCancelTargetsRequestedTrackedOperationWithCompetitor(suite);
+  testCloseRetirementWaitsForTrackedStreamTerminalCompletions(suite);
   testResolveTrackedCloseCompletionReturnsTracking(suite);
+  testShutdownResultDefaultPreservesLegacyCallback(suite);
   testTrackedCloseCompletionSkipsReusedGeneration(suite);
-  testTrackedCloseCompletionSkipsRecycledPointerAfterGenerationRepublish(suite);
   testTrackedCloseCompletionSkipsSupersededSerialAfterGenerationWrap(suite);
   testTrackedCloseCompletionDispatchesCurrentGeneration(suite);
   testTrackedCloseCompletionIgnoresRetiredDuplicate(suite);
   testTrackedLinkTimeoutIgnoresRetiredDuplicate(suite);
-  testTrackedLinkTimeoutSkipsRecycledPointerAfterGenerationRepublish(suite);
   testMissingMsghdrCompletionIsIgnored(suite);
   testKeepaliveTimeoutClampsTcpUserTimeoutFloor(suite);
   testFreshProcessFdAliasDoesNotUninstallOccupiedReservedSlot(suite);

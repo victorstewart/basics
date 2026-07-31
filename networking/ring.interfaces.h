@@ -43,6 +43,15 @@ public:
 
   virtual void shutdownHandler(void *socket) {}
 
+  // result is the raw shutdown CQE result: zero on success, otherwise -errno.
+  // Consumers that keep the original callback contract receive it through this
+  // forwarding default; result-aware consumers can override this overload.
+  virtual void shutdownHandler(void *socket, int result)
+  {
+    (void)result;
+    shutdownHandler(socket);
+  }
+
   virtual void pollHandler(void *socket, int result) {}
   // This is the terminal lifetime acknowledgement for a raw-fd poll. The
   // owner may release the watcher before returning from this callback.
