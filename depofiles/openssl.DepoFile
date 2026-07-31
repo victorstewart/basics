@@ -23,4 +23,5 @@ AUTOCONF_INSTALL make install_dev DESTDIR=
 TARGET openssl INTERFACE include
 TARGET openssl::crypto STATIC lib/libcrypto.a
 TARGET openssl::ssl STATIC lib/libssl.a
+LINK openssl::ssl openssl::crypto
 LINK openssl openssl::ssl openssl::crypto

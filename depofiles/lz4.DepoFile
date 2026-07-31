@@ -7,6 +7,15 @@ SOURCE URL https://github.com/lz4/lz4/archive/refs/tags/v1.10.0.tar.gz
 SHA256 537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
 BUILD_SYSTEM CMAKE
 CMAKE_CONFIGURE cmake -S ${DEPO_SOURCE_DIR}/build/cmake -B ${DEPO_BUILD_DIR} -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${DEPO_PREFIX} -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DLZ4_BUILD_CLI=OFF -DLZ4_BUILD_LEGACY_LZ4C=OFF
-CMAKE_BUILD cmake --build ${DEPO_BUILD_DIR} --parallel $(nproc)
-CMAKE_INSTALL cmake --install ${DEPO_BUILD_DIR}
+CMAKE_BUILD cmake --build ${DEPO_BUILD_DIR} --parallel
+CMAKE_INSTALL_SH <<'EOF'
+cmake --install "${DEPO_BUILD_DIR}"
+python3 - <<'PY'
+import os
+from pathlib import Path
+for path in Path(os.environ["DEPO_PREFIX"], "lib/pkgconfig").glob("*.pc"):
+    path.write_text(path.read_text().replace(os.environ["DEPO_PREFIX"], "$" + "{pcfiledir}/../.."))
+PY
+EOF
 TARGET lz4::lz4 STATIC lib/liblz4.a INTERFACE include
+ARTIFACT lib/pkgconfig/liblz4.pc
