@@ -35,38 +35,52 @@ if (NOT DEFINED OUTPUT OR "${OUTPUT}" STREQUAL "")
   set(OUTPUT "${_basics_repo_root}/.run/release-assets/basics.DepoFile")
 endif()
 
-if (NOT DEFINED BASICS_RELEASE_SOURCE_URL OR "${BASICS_RELEASE_SOURCE_URL}" STREQUAL "")
+set(_basics_release_source_url_was_provided FALSE)
+if (DEFINED BASICS_RELEASE_SOURCE_URL AND NOT "${BASICS_RELEASE_SOURCE_URL}" STREQUAL "")
+  set(_basics_release_source_url_was_provided TRUE)
+else()
   set(BASICS_RELEASE_SOURCE_URL "https://github.com/victorstewart/basics/archive/refs/tags/${BASICS_RELEASE_TAG}.tar.gz")
 endif()
 
 get_filename_component(_basics_output_dir "${OUTPUT}" DIRECTORY)
 file(MAKE_DIRECTORY "${_basics_output_dir}")
 
-if (NOT DEFINED BASICS_RELEASE_DOWNLOAD_PATH OR "${BASICS_RELEASE_DOWNLOAD_PATH}" STREQUAL "")
-  set(BASICS_RELEASE_DOWNLOAD_PATH "${_basics_output_dir}/basics-${BASICS_RELEASE_VERSION}.tar.gz")
-endif()
+if (DEFINED BASICS_RELEASE_SOURCE_ARCHIVE AND NOT "${BASICS_RELEASE_SOURCE_ARCHIVE}" STREQUAL "")
+  if (NOT _basics_release_source_url_was_provided)
+    message(FATAL_ERROR "BASICS_RELEASE_SOURCE_ARCHIVE requires the final immutable BASICS_RELEASE_SOURCE_URL.")
+  endif()
+  if (NOT EXISTS "${BASICS_RELEASE_SOURCE_ARCHIVE}" OR IS_DIRECTORY "${BASICS_RELEASE_SOURCE_ARCHIVE}")
+    message(FATAL_ERROR "BASICS_RELEASE_SOURCE_ARCHIVE is not a file: ${BASICS_RELEASE_SOURCE_ARCHIVE}")
+  endif()
+  set(_basics_release_checksum_path "${BASICS_RELEASE_SOURCE_ARCHIVE}")
+else()
+  if (NOT DEFINED BASICS_RELEASE_DOWNLOAD_PATH OR "${BASICS_RELEASE_DOWNLOAD_PATH}" STREQUAL "")
+    set(BASICS_RELEASE_DOWNLOAD_PATH "${_basics_output_dir}/basics-${BASICS_RELEASE_VERSION}.tar.gz")
+  endif()
 
-file(
-  DOWNLOAD
-  "${BASICS_RELEASE_SOURCE_URL}"
-  "${BASICS_RELEASE_DOWNLOAD_PATH}"
-  STATUS _basics_download_status
-  TLS_VERIFY ON
-)
-list(LENGTH _basics_download_status _basics_download_status_length)
-if (_basics_download_status_length LESS 1)
-  message(FATAL_ERROR "Download status for ${BASICS_RELEASE_SOURCE_URL} was empty.")
-endif()
-list(GET _basics_download_status 0 _basics_download_code)
-if (NOT _basics_download_code EQUAL 0)
-  list(GET _basics_download_status 1 _basics_download_message)
-  message(
-    FATAL_ERROR
-    "Failed to download ${BASICS_RELEASE_SOURCE_URL} to ${BASICS_RELEASE_DOWNLOAD_PATH}: ${_basics_download_message}"
+  file(
+    DOWNLOAD
+    "${BASICS_RELEASE_SOURCE_URL}"
+    "${BASICS_RELEASE_DOWNLOAD_PATH}"
+    STATUS _basics_download_status
+    TLS_VERIFY ON
   )
+  list(LENGTH _basics_download_status _basics_download_status_length)
+  if (_basics_download_status_length LESS 1)
+    message(FATAL_ERROR "Download status for ${BASICS_RELEASE_SOURCE_URL} was empty.")
+  endif()
+  list(GET _basics_download_status 0 _basics_download_code)
+  if (NOT _basics_download_code EQUAL 0)
+    list(GET _basics_download_status 1 _basics_download_message)
+    message(
+      FATAL_ERROR
+      "Failed to download ${BASICS_RELEASE_SOURCE_URL} to ${BASICS_RELEASE_DOWNLOAD_PATH}: ${_basics_download_message}"
+    )
+  endif()
+  set(_basics_release_checksum_path "${BASICS_RELEASE_DOWNLOAD_PATH}")
 endif()
 
-file(SHA256 "${BASICS_RELEASE_DOWNLOAD_PATH}" BASICS_RELEASE_SOURCE_SHA256)
+file(SHA256 "${_basics_release_checksum_path}" BASICS_RELEASE_SOURCE_SHA256)
 
 set(BASICS_PACKAGE_NAME "basics")
 set(BASICS_PACKAGE_VERSION "${BASICS_RELEASE_VERSION}")

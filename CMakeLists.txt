@@ -379,6 +379,15 @@ add_test(
 )
 
 add_test(
+  NAME basics_release_depofile_generator_contract
+  COMMAND
+    "${CMAKE_COMMAND}"
+      "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+      "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/release-depofile-generator-contract"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_release_depofile_generator.cmake"
+)
+
+add_test(
   NAME basics_dependency_materialization_contract
   COMMAND
     "${CMAKE_COMMAND}"
