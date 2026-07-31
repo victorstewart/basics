@@ -281,6 +281,7 @@ _basics_add_test_executable(basics_ebpf_program_tests tests/ebpf_program_tests.c
 depos_link(basics_ebpf_program_tests__objects PRIVATE libbpf::libbpf)
 depos_link(basics_ebpf_program_tests PRIVATE libbpf::libbpf)
 _basics_add_test_executable(basics_filesystem_tests tests/filesystem_tests.cpp)
+_basics_add_test_executable(basics_guardian_tests tests/guardian_tests.cpp)
 _basics_add_test_executable(basics_linux_integration_tests tests/linux_integration_tests.cpp)
 _basics_add_test_executable(basics_memfd_reflection_tests tests/memfd_reflection_tests.cpp)
 _basics_add_test_executable(basics_netlink_tests tests/netlink_tests.cpp)

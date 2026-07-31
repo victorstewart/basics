@@ -18,12 +18,13 @@ private:
     sigset_t signal_set;
     sigfillset(&signal_set);
     // Keep synchronous fault signals unmasked so process/global crash handlers
-    // can produce diagnostics (for example /crashreport.txt backtraces).
+    // can produce bounded diagnostics (for example /crashreport.txt records).
     sigdelset(&signal_set, SIGSEGV);
     sigdelset(&signal_set, SIGBUS);
     sigdelset(&signal_set, SIGABRT);
     sigdelset(&signal_set, SIGILL);
     sigdelset(&signal_set, SIGFPE);
+    sigdelset(&signal_set, SIGTRAP);
     pthread_sigmask(SIG_BLOCK, &signal_set, nullptr);
 
     ThreadData *data = static_cast<ThreadData *>(arg);

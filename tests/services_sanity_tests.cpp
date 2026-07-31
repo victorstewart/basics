@@ -259,7 +259,11 @@ static void testThreadHelpers(TestSuite& suite)
   EXPECT_TRUE(suite, CPU_ISSET(core, &cpuSet));
 
   std::atomic<bool> ran = false;
+  std::atomic<int> trapBlocked = -1;
   EXPECT_TRUE(suite, Thread::startDetachedOnCore(core, [&]() -> void {
+    sigset_t signalMask;
+    pthread_sigmask(SIG_SETMASK, nullptr, &signalMask);
+    trapBlocked.store(sigismember(&signalMask, SIGTRAP), std::memory_order_release);
     ran.store(true, std::memory_order_release);
   }));
 
@@ -269,6 +273,7 @@ static void testThreadHelpers(TestSuite& suite)
   }
 
   EXPECT_TRUE(suite, ran.load(std::memory_order_acquire));
+  EXPECT_EQ(suite, trapBlocked.load(std::memory_order_acquire), 0);
 
   int disallowedCore = firstDisallowedCore();
   if (disallowedCore >= 0)
