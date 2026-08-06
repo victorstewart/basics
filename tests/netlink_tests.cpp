@@ -295,7 +295,14 @@ static void testLinkCreationBuilders(TestSuite& suite)
   }
 
   NetlinkMessage netkitRequest;
-  socket.createNetkitPair(&netkitRequest, 21, NETKIT_L3, "kit0"_ctv, "kit1"_ctv, 5678);
+  socket.createNetkitPair(&netkitRequest,
+                          21,
+                          NETKIT_L3,
+                          "kit0"_ctv,
+                          "kit1"_ctv,
+                          5678,
+                          NETKIT_SCRUB_NONE,
+                          NETKIT_SCRUB_NONE);
 
   struct nlmsghdr *netkitHeader = headerOf(netkitRequest);
   EXPECT_EQ(suite, netkitHeader->nlmsg_type, uint16_t(RTM_NEWLINK));
@@ -322,12 +329,24 @@ static void testLinkCreationBuilders(TestSuite& suite)
       const void *infoDataPayload = socket.nla_data(infoDataAttr);
       int infoDataPayloadLen = int(infoDataAttr->nla_len - NLA_HDRLEN);
       const struct nlattr *modeAttr = findNlAttr(socket, infoDataPayload, infoDataPayloadLen, IFLA_NETKIT_MODE);
+      const struct nlattr *scrubAttr = findNlAttr(socket, infoDataPayload, infoDataPayloadLen, IFLA_NETKIT_SCRUB);
+      const struct nlattr *peerScrubAttr = findNlAttr(socket, infoDataPayload, infoDataPayloadLen, IFLA_NETKIT_PEER_SCRUB);
       const struct nlattr *peerInfoAttr = findNlAttr(socket, infoDataPayload, infoDataPayloadLen, IFLA_NETKIT_PEER_INFO);
       EXPECT_TRUE(suite, modeAttr != nullptr);
+      EXPECT_TRUE(suite, scrubAttr != nullptr);
+      EXPECT_TRUE(suite, peerScrubAttr != nullptr);
       EXPECT_TRUE(suite, peerInfoAttr != nullptr);
       if (modeAttr != nullptr)
       {
         EXPECT_EQ(suite, *reinterpret_cast<const uint32_t *>(socket.nla_data(modeAttr)), uint32_t(NETKIT_L3));
+      }
+      if (scrubAttr != nullptr)
+      {
+        EXPECT_EQ(suite, *reinterpret_cast<const uint32_t *>(socket.nla_data(scrubAttr)), uint32_t(NETKIT_SCRUB_NONE));
+      }
+      if (peerScrubAttr != nullptr)
+      {
+        EXPECT_EQ(suite, *reinterpret_cast<const uint32_t *>(socket.nla_data(peerScrubAttr)), uint32_t(NETKIT_SCRUB_NONE));
       }
       if (peerInfoAttr != nullptr)
       {

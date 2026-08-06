@@ -13,8 +13,13 @@ public:
 
   void createPair(int peerpid)
   {
+    createPair(peerpid, NETKIT_SCRUB_DEFAULT, NETKIT_SCRUB_DEFAULT);
+  }
+
+  void createPair(int peerpid, uint32_t scrub, uint32_t peerScrub)
+  {
     generateRequest([&](NetlinkMessage *request) -> void {
-      socket.createNetkitPair(request, 0, NETKIT_L3, host.name, peer.name, peerpid);
+      socket.createNetkitPair(request, 0, NETKIT_L3, host.name, peer.name, peerpid, scrub, peerScrub);
     });
 
     flushDiscard();

@@ -470,7 +470,14 @@ public:
   }
 
   // mode == NETKIT_L2 or NETKIT_L3
-  void createNetkitPair(NetlinkMessage *request, uint32_t seq, uint32_t mode, StringType auto&& hostname, StringType auto&& peername, int peerpid)
+  void createNetkitPair(NetlinkMessage *request,
+                        uint32_t seq,
+                        uint32_t mode,
+                        StringType auto&& hostname,
+                        StringType auto&& peername,
+                        int peerpid,
+                        uint32_t scrub = NETKIT_SCRUB_DEFAULT,
+                        uint32_t peerScrub = NETKIT_SCRUB_DEFAULT)
   {
     struct nl_req *nlreq = new (request->data) nl_req();
     nlreq->h->nlmsg_type = RTM_NEWLINK;
@@ -493,6 +500,8 @@ public:
 
         nlreq->appendAttribute(IFLA_NETKIT_PEER_POLICY, &policypass, sizeof(policypass));
         nlreq->appendAttribute(IFLA_NETKIT_POLICY, &policypass, sizeof(policypass));
+        nlreq->appendAttribute(IFLA_NETKIT_SCRUB, &scrub, sizeof(scrub));
+        nlreq->appendAttribute(IFLA_NETKIT_PEER_SCRUB, &peerScrub, sizeof(peerScrub));
 
         nlreq->appendAttributeTree(IFLA_NETKIT_PEER_INFO, [&](void) -> void {
           struct ifinfomsg *peer_ifm = nlreq->appendStruct<struct ifinfomsg>();
