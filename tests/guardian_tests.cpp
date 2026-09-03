@@ -60,17 +60,33 @@ static void testFatalSignalExitsWithoutForkOrUnsafeShutdown(TestSuite& suite, in
   }
   close(reportFD);
 
+  int stderrPipe[2] = {-1, -1};
+  EXPECT_EQ(suite, pipe(stderrPipe), 0);
+  if (stderrPipe[0] < 0 || stderrPipe[1] < 0)
+  {
+    unlink(reportPath);
+    return;
+  }
+
   Guardian::crashReportPath.assign(reportPath);
   pid_t child = fork();
   EXPECT_TRUE(suite, child >= 0);
   if (child == 0)
   {
+    close(stderrPipe[0]);
+    if (dup2(stderrPipe[1], STDERR_FILENO) < 0)
+    {
+      _exit(98);
+    }
+    close(stderrPipe[1]);
     pthread_atfork(hangIfCalled, nullptr, nullptr);
     Guardian::shutdownSequence = hangIfCalled;
     Guardian::boot();
     raise(signalNumber);
     _exit(99);
   }
+
+  close(stderrPipe[1]);
 
   int status = 0;
   bool exited = child > 0 && waitForChild(child, status);
@@ -97,7 +113,17 @@ static void testFatalSignalExitsWithoutForkOrUnsafeShutdown(TestSuite& suite, in
   EXPECT_TRUE(suite, reportSize > 0);
   EXPECT_TRUE(suite, reportView.starts_with(expectedPrefix));
   EXPECT_TRUE(suite, reportView.find(" address 0x") != std::string_view::npos);
+  EXPECT_TRUE(suite, reportView.find(" pc 0x") != std::string_view::npos);
   EXPECT_TRUE(suite, reportView.ends_with("\n"));
+
+  char stderrReport[128] = {};
+  ssize_t stderrReportSize = read(stderrPipe[0], stderrReport, sizeof(stderrReport));
+  close(stderrPipe[0]);
+  EXPECT_EQ(suite, stderrReportSize, reportSize);
+  EXPECT_TRUE(
+      suite,
+      stderrReportSize == reportSize &&
+          std::string_view(stderrReport, size_t(stderrReportSize)) == reportView);
 
   Guardian::crashReportPath.assign("/crashreport.txt");
   unlink(reportPath);

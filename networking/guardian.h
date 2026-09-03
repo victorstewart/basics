@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <functional>
 #include <mutex>
+#include <ucontext.h>
 
 #pragma once
 
@@ -109,7 +110,23 @@ private:
     }
   }
 
-  [[gnu::always_inline]] static inline size_t generateCrashReport(char *report, int sig, siginfo_t *info)
+  [[gnu::always_inline]] static inline uintptr_t instructionPointer(void *ucontext)
+  {
+    if (ucontext == nullptr)
+    {
+      return 0;
+    }
+
+#if defined(__linux__) && defined(__aarch64__)
+    return static_cast<uintptr_t>(static_cast<ucontext_t *>(ucontext)->uc_mcontext.pc);
+#elif defined(__linux__) && defined(__x86_64__)
+    return static_cast<uintptr_t>(static_cast<ucontext_t *>(ucontext)->uc_mcontext.gregs[REG_RIP]);
+#else
+    return 0;
+#endif
+  }
+
+  [[gnu::always_inline]] static inline size_t generateCrashReport(char *report, int sig, siginfo_t *info, void *ucontext)
   {
     size_t size = 0;
     appendLiteral(report, size, "Caught fatal signal ");
@@ -118,6 +135,8 @@ private:
     appendSigned(report, size, info ? info->si_code : 0);
     appendLiteral(report, size, " address 0x");
     appendHex(report, size, reinterpret_cast<uintptr_t>(info ? info->si_addr : nullptr));
+    appendLiteral(report, size, " pc 0x");
+    appendHex(report, size, instructionPointer(ucontext));
     report[size++] = '\n';
     return size;
   }
@@ -156,14 +175,16 @@ private:
     // https://man7.org/linux/man-pages/man2/sigaction.2.html
 
     char report[128];
-    size_t reportSize = generateCrashReport(report, signo, info);
-    (void)ucontext;
+    size_t reportSize = generateCrashReport(report, signo, info, ucontext);
 
     int fd = crashReportFD;
-    ssize_t written = fd >= 0 ? write(fd, report, reportSize) : -1;
-    if (written != ssize_t(reportSize))
+    // The prepared file is useful inside a surviving rootfs, while stderr is
+    // the lifecycle owner's durable per-attempt channel. Always write both so
+    // a fast restart cannot truncate the only crash identity we have.
+    (void)write(STDERR_FILENO, report, reportSize);
+    if (fd >= 0 && fd != STDERR_FILENO)
     {
-      (void)write(STDERR_FILENO, report, reportSize);
+      (void)write(fd, report, reportSize);
     }
 
     _exit(EXIT_FAILURE);

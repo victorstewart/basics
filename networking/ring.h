@@ -2363,6 +2363,7 @@ public:
     writeCreateRingStage("worker:ring-after-signalfd");
     if (fixedfiles[0] < 0)
     {
+      dprintf(STDERR_FILENO, "Ring::createRing signalfd failed errno=%d\n", errno);
       std::abort();
     }
 
@@ -2405,6 +2406,15 @@ public:
 
     if (initResult < 0)
     {
+      dprintf(
+          STDERR_FILENO,
+          "Ring::createRing io_uring_queue_init_params failed result=%d flags=0x%x sqe=%u cqe=%u fixed=%u reserve=%u\n",
+          initResult,
+          params.flags,
+          sqeCount,
+          cqeCount,
+          nFixedFiles,
+          nReserveFixedFiles);
       std::abort();
     }
     writeCreateRingStage("worker:ring-after-io_uring-init");
@@ -2412,6 +2422,7 @@ public:
     int registerRingFDResult = io_uring_register_ring_fd(&ring);
     if (registerRingFDResult < 0)
     {
+      dprintf(STDERR_FILENO, "Ring::createRing io_uring_register_ring_fd failed result=%d\n", registerRingFDResult);
       std::abort();
     }
     writeCreateRingStage("worker:ring-after-register-ringfd");
@@ -2419,6 +2430,12 @@ public:
     int registerFilesResult = io_uring_register_files(&ring, fixedfiles, nFixedFiles);
     if (registerFilesResult < 0)
     {
+      dprintf(
+          STDERR_FILENO,
+          "Ring::createRing io_uring_register_files failed result=%d fixed=%u reserve=%u\n",
+          registerFilesResult,
+          nFixedFiles,
+          nReserveFixedFiles);
       std::abort();
     }
     writeCreateRingStage("worker:ring-after-register-files");
