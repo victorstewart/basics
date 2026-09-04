@@ -5,6 +5,9 @@
 #include <networking/message.h>
 #include <services/filesystem.h>
 
+#include <cstdlib>
+#include <iostream>
+
 #if defined(BASICS_DOWNSTREAM_ENABLE_TIDESDB) && BASICS_DOWNSTREAM_ENABLE_TIDESDB
 #include <databases/embedded/tidesdb.h>
 #endif
@@ -17,6 +20,10 @@ static void instantiateAsyncTransport(void)
 
 int main()
 {
+  // OBJECT-mode allocator interposition must be safe during libstdc++ static
+  // initialization and must retain the C free(nullptr) contract.
+  std::free(nullptr);
+  std::cout.flush();
   (void)&instantiateAsyncTransport;
   static_assert(MultiCurlClient::maximumConcurrentStreams == 32);
   String text("downstream package smoke");

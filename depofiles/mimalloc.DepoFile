@@ -1,10 +1,10 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
 NAME mimalloc
-VERSION 3.3.2
+VERSION 3.5.1
 PRIMARY_TARGET mimalloc::mimalloc
-SOURCE URL https://github.com/microsoft/mimalloc/archive/refs/tags/v3.3.2.tar.gz
-SHA256 ca02384e007f46950598500dfaebde5ff9948c1d231f5a81b058799afa64bbbb
+SOURCE URL https://github.com/microsoft/mimalloc/archive/refs/tags/v3.5.1.tar.gz
+SHA256 2602daad9b64b213a8835dee6fadda96d2081c0171bfcd3fb2db39bdc669d6b3
 BUILD_SYSTEM CMAKE
 CMAKE_DEFINE MI_BUILD_SHARED=ON
 CMAKE_DEFINE MI_BUILD_STATIC=ON
@@ -14,6 +14,6 @@ CMAKE_DEFINE MI_OPT_ARCH=OFF
 CMAKE_DEFINE MI_OPT_SIMD=OFF
 CMAKE_DEFINE MI_INSTALL_TOPLEVEL=ON
 TARGET mimalloc::mimalloc INTERFACE include
-TARGET mimalloc::runtime STATIC lib/libmimalloc.a SHARED lib/libmimalloc.so.3.3 OBJECT lib/mimalloc.o
+TARGET mimalloc::runtime STATIC lib/libmimalloc.a SHARED lib/libmimalloc.so.3.5 OBJECT lib/mimalloc.o
 ARTIFACT lib/libmimalloc.so.3
 ARTIFACT lib/libmimalloc.so
