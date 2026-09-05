@@ -83,7 +83,7 @@ if (NOT _test_result EQUAL 0)
   message(FATAL_ERROR "Failed to run downstream basics package smoke project.")
 endif()
 
-if (DEFINED EXPECT_MIMALLOC_OBJECT_INTERPOSITION AND EXPECT_MIMALLOC_OBJECT_INTERPOSITION)
+if (DEFINED EXPECT_MIMALLOC_OBJECT_RUNTIME AND EXPECT_MIMALLOC_OBJECT_RUNTIME)
   set(_downstream_link_txt "${BUILD_DIR}/CMakeFiles/basics_downstream_package_smoke.dir/link.txt")
   set(_downstream_executable "${BUILD_DIR}/basics_downstream_package_smoke")
 
@@ -155,12 +155,21 @@ if (DEFINED EXPECT_MIMALLOC_OBJECT_INTERPOSITION AND EXPECT_MIMALLOC_OBJECT_INTE
     )
   endif()
 
+  string(FIND "${_downstream_nm_stdout}" " T mi_malloc" _downstream_mi_malloc_index)
+  if (_downstream_mi_malloc_index EQUAL -1)
+    message(
+      FATAL_ERROR
+      "Downstream OBJECT-mode executable did not export the expected mimalloc runtime symbol 'mi_malloc'.\n"
+      "nm output:\n${_downstream_nm_stdout}"
+    )
+  endif()
+
   foreach(_downstream_symbol IN ITEMS " T malloc" " T free" " T calloc" " T realloc")
     string(FIND "${_downstream_nm_stdout}" "${_downstream_symbol}" _downstream_symbol_index)
-    if (_downstream_symbol_index EQUAL -1)
+    if (NOT _downstream_symbol_index EQUAL -1)
       message(
         FATAL_ERROR
-        "Downstream OBJECT-mode executable did not export expected allocator override symbol '${_downstream_symbol}'.\n"
+        "Downstream OBJECT-mode executable unexpectedly exports allocator override symbol '${_downstream_symbol}'.\n"
         "nm output:\n${_downstream_nm_stdout}"
       )
     endif()
