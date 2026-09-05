@@ -9,6 +9,10 @@ BUILD_SYSTEM CMAKE
 CMAKE_DEFINE MI_BUILD_SHARED=ON
 CMAKE_DEFINE MI_BUILD_STATIC=ON
 CMAKE_DEFINE MI_BUILD_OBJECT=ON
+# OBJECT consumers link mimalloc into an executable.  Do not interpose libc
+# allocation symbols there: shared-library constructors can call free() before
+# the executable's mimalloc constructor has initialized its page map.
+CMAKE_DEFINE MI_OVERRIDE=OFF
 CMAKE_DEFINE MI_BUILD_TESTS=OFF
 CMAKE_DEFINE MI_OPT_ARCH=OFF
 CMAKE_DEFINE MI_OPT_SIMD=OFF

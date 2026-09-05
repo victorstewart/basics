@@ -42,7 +42,7 @@ function(_basics_prepare_self_depofile out_var)
   string(TOUPPER "${BASICS_MIMALLOC_MODE}" _basics_mimalloc_mode)
   string(TOUPPER "${BASICS_DEPENDENCY_LINK_MODE}" _basics_dependency_link_mode)
   if (_basics_mimalloc_mode STREQUAL "")
-    message(FATAL_ERROR "BASICS_MIMALLOC_MODE must be explicitly set to NONE, OBJECT, STATIC, or SHARED. OBJECT is the recommended choice because it hijacks the libc allocation interface.")
+    message(FATAL_ERROR "BASICS_MIMALLOC_MODE must be explicitly set to NONE, OBJECT, STATIC, or SHARED. OBJECT links a non-interposing mimalloc runtime.")
   endif()
   if (_basics_dependency_link_mode STREQUAL "")
     message(FATAL_ERROR "BASICS_DEPENDENCY_LINK_MODE must be explicitly set to STATIC or SHARED.")
@@ -287,6 +287,7 @@ if (BASICS_ENABLE_TIDESDB)
 endif()
 _basics_add_test_executable(basics_linux_integration_tests tests/linux_integration_tests.cpp)
 _basics_add_test_executable(basics_memfd_reflection_tests tests/memfd_reflection_tests.cpp)
+_basics_add_test_executable(basics_mimalloc_object_startup_tests tests/mimalloc_object_startup_tests.cpp)
 _basics_add_test_executable(basics_netlink_tests tests/netlink_tests.cpp)
 _basics_add_test_executable(basics_networking_primitives_tests tests/networking_primitives_tests.cpp)
 _basics_add_test_executable(basics_networking_support_structures_tests tests/networking_support_structures_tests.cpp)
@@ -362,7 +363,7 @@ add_test(
       "-DBASICS_PACKAGE_DEPOFILE=${_basics_self_depofile}"
       "-DBASICS_DOWNSTREAM_ENABLE_TIDESDB=$<IF:$<BOOL:${BASICS_ENABLE_TIDESDB}>,ON,OFF>"
       "-DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/downstream-package-consumer"
-      "-DEXPECT_MIMALLOC_OBJECT_INTERPOSITION=$<IF:$<STREQUAL:${_basics_selected_mimalloc_mode},OBJECT>,ON,OFF>"
+      "-DEXPECT_MIMALLOC_OBJECT_RUNTIME=$<IF:$<STREQUAL:${_basics_selected_mimalloc_mode},OBJECT>,ON,OFF>"
       "-DGENERATOR=${CMAKE_GENERATOR}"
       "-DCXX_COMPILER=${CMAKE_CXX_COMPILER}"
       "-DCMAKE_BUILD_TYPE_VALUE=${CMAKE_BUILD_TYPE}"
