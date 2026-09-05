@@ -938,6 +938,57 @@ static void testMultishotTimeoutCancellationIsTerminal(TestSuite& suite)
   EXPECT_EQ(suite, interfacer.repeatingCompletions, uint32_t(1));
 }
 
+static void testTimeoutPacketCancelAndImmediateReuseIgnoresStaleCompletion(TestSuite& suite)
+{
+  struct ReusedTimeoutInterface final : RingInterface {
+    TimeoutPacket reused;
+    TimeoutPacket guard;
+    uint32_t reusedCompletions = 0;
+    bool reusedFired = false;
+    bool guardFired = false;
+
+    void timeoutHandler(TimeoutPacket *packet, int result) override
+    {
+      if (packet == &reused)
+      {
+        ++reusedCompletions;
+        reusedFired |= result == -ETIME;
+        return;
+      }
+      if (packet == &guard && result == -ETIME)
+      {
+        guardFired = true;
+        Ring::exit = true;
+      }
+    }
+  } interfacer;
+
+  Ring::interfacer = &interfacer;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(32, 64, 4, 2, -1, -1, 4);
+  interfacer.reused.setTimeoutMs(1000);
+  Ring::queueTimeout(&interfacer.reused);
+  Ring::submitPending();
+  Ring::queueCancelTimeout(&interfacer.reused);
+  interfacer.reused.clear();
+  interfacer.reused.setTimeoutMs(1);
+  Ring::queueTimeout(&interfacer.reused);
+  interfacer.guard.setTimeoutMs(50);
+  Ring::queueTimeout(&interfacer.guard);
+  Ring::start();
+  Ring::shutdownForExec();
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+
+  EXPECT_TRUE(suite, interfacer.reusedFired);
+  EXPECT_TRUE(suite, interfacer.guardFired);
+  EXPECT_EQ(suite, interfacer.reusedCompletions, uint32_t(1));
+}
+
 static void testRingStartAdvancesCompletionBeforeExit(TestSuite& suite)
 {
   struct ExitOnTimeoutInterface : RingInterface {
@@ -2231,6 +2282,7 @@ int main()
   runRingScenario(suite);
   testCompletionBatchCanQuiesceRing(suite);
   testMultishotTimeoutCancellationIsTerminal(suite);
+  testTimeoutPacketCancelAndImmediateReuseIgnoresStaleCompletion(suite);
   testRingStartAdvancesCompletionBeforeExit(suite);
   testShutdownCompletionReportsKernelResult(suite);
   testShutdownAfterSendReachesTcpPeerEof(suite);

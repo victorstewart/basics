@@ -158,6 +158,12 @@ private:
     Operation operation = Operation::signal;
   };
 
+  struct TimeoutTracking {
+
+    TimeoutPacket *packet = nullptr;
+    Operation operation = Operation::timeout;
+  };
+
   struct RawPollTracking {
 
     void *owner = nullptr;
@@ -198,6 +204,9 @@ private:
   static thread_local inline bytell_hash_set<uint64_t> retiredRecvmsgMultishotTrackingUserData;
   static thread_local inline uint64_t nextSocketOperationTicket = 1;
   static thread_local inline bytell_hash_map<uint64_t, SocketOperationTracking> socketOperationTrackingByUserData;
+  static thread_local inline bytell_hash_map<uint64_t, TimeoutTracking> timeoutTrackingByUserData;
+  static thread_local inline bytell_hash_map<TimeoutPacket *, uint64_t> activeTimeoutUserDataByPacket;
+  static thread_local inline uint64_t nextTimeoutTicket = 1;
   static thread_local inline uint64_t nextRawPollTicket = 1;
   static thread_local inline bytell_hash_map<RawPollTicket, RawPollTracking> rawPollTrackingByUserData;
 
@@ -322,6 +331,50 @@ private:
   static void setUserData(struct io_uring_sqe *sqe, Operation op, uint64_t object, uint8_t tag = 0) // can't be more than 48 bits though
   {
     sqe->user_data = getUserDataFor(op, object, tag);
+  }
+
+  static uint64_t issueTimeoutTracking(TimeoutPacket *packet, Operation operation)
+  {
+    uint64_t userData = 0;
+    do
+    {
+      uint64_t ticket = nextTimeoutTicket++ & 0x0000FFFFFFFFFFFFULL;
+      if (ticket == 0)
+      {
+        ticket = 1;
+        nextTimeoutTicket = 2;
+      }
+      userData = getUserDataFor(operation, ticket);
+    }
+    while (timeoutTrackingByUserData.contains(userData));
+
+    timeoutTrackingByUserData.emplace(userData, TimeoutTracking {packet, operation});
+    activeTimeoutUserDataByPacket.insert_or_assign(packet, userData);
+    return userData;
+  }
+
+  static uint64_t activeTimeoutUserData(TimeoutPacket *packet, Operation operation)
+  {
+    auto active = activeTimeoutUserDataByPacket.find(packet);
+    if (active == activeTimeoutUserDataByPacket.end()) return 0;
+    auto tracking = timeoutTrackingByUserData.find(active->second);
+    if (tracking == timeoutTrackingByUserData.end() || tracking->second.operation != operation) return 0;
+    return active->second;
+  }
+
+  static bool resolveTimeoutCompletion(uint64_t userData, bool terminal, TimeoutPacket *&packet)
+  {
+    auto tracking = timeoutTrackingByUserData.find(userData);
+    if (tracking == timeoutTrackingByUserData.end()) return false;
+    packet = tracking->second.packet;
+    auto active = activeTimeoutUserDataByPacket.find(packet);
+    const bool current = active != activeTimeoutUserDataByPacket.end() && active->second == userData;
+    if (terminal)
+    {
+      if (current) activeTimeoutUserDataByPacket.erase(active);
+      timeoutTrackingByUserData.erase(tracking);
+    }
+    return current;
   }
 
   static bool socketGenerationMatches(void *socket, uint64_t generation)
@@ -937,20 +990,22 @@ public:
   {
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_timeout(sqe, (struct __kernel_timespec *)payload, 0, IORING_TIMEOUT_BOOTTIME);
-    setUserData(sqe, Operation::timeout, payload);
+    sqe->user_data = issueTimeoutTracking(payload, Operation::timeout);
   }
 
   static void queueTimeoutMultishot(TimeoutPacket *payload)
   {
     struct io_uring_sqe *sqe = getSQESafe();
     io_uring_prep_timeout(sqe, (struct __kernel_timespec *)payload, 0, IORING_TIMEOUT_BOOTTIME | IORING_TIMEOUT_MULTISHOT);
-    setUserData(sqe, Operation::timeoutMultishot, payload);
+    sqe->user_data = issueTimeoutTracking(payload, Operation::timeoutMultishot);
   }
 
   static void queueUpdateTimeout(TimeoutPacket *payload)
   {
     struct io_uring_sqe *sqe = getSQESafe();
-    io_uring_prep_timeout_update(sqe, (struct __kernel_timespec *)payload, getUserDataFor(Operation::timeout, payload), 0);
+    const uint64_t target = activeTimeoutUserData(payload, Operation::timeout);
+    if (target != 0) io_uring_prep_timeout_update(sqe, (struct __kernel_timespec *)payload, target, 0);
+    else io_uring_prep_nop(sqe);
     setUserData(sqe, Operation::cancel, payload);
   }
 
@@ -958,14 +1013,18 @@ public:
   static void queueCancelTimeout(TimeoutPacket *payload)
   {
     struct io_uring_sqe *sqe = getSQESafe();
-    io_uring_prep_timeout_remove(sqe, getUserDataFor(Operation::timeout, payload), 0);
+    const uint64_t target = activeTimeoutUserData(payload, Operation::timeout);
+    if (target != 0) io_uring_prep_timeout_remove(sqe, target, 0);
+    else io_uring_prep_nop(sqe);
     setUserData(sqe, Operation::cancel, payload);
   }
 
   static void queueCancelTimeoutMultishot(TimeoutPacket *payload)
   {
     struct io_uring_sqe *sqe = getSQESafe();
-    io_uring_prep_timeout_remove(sqe, getUserDataFor(Operation::timeoutMultishot, payload), 0);
+    const uint64_t target = activeTimeoutUserData(payload, Operation::timeoutMultishot);
+    if (target != 0) io_uring_prep_timeout_remove(sqe, target, 0);
+    else io_uring_prep_nop(sqe);
     setUserData(sqe, Operation::cancel, payload);
   }
 
@@ -2015,6 +2074,8 @@ public:
     recvmsgMultishotTrackingByUserData.clear();
     retiredRecvmsgMultishotTrackingUserData.clear();
     socketOperationTrackingByUserData.clear();
+    timeoutTrackingByUserData.clear();
+    activeTimeoutUserDataByPacket.clear();
     rawPollTrackingByUserData.clear();
     socketGenerationByIdentity.clear();
     recvmsgMultishoterByIdentity.clear();
@@ -2029,6 +2090,7 @@ public:
     retiredLinkTimeoutTrackingUserDataCount = 0;
     nextRecvmsgMultishotTicket = 1;
     nextSocketOperationTicket = 1;
+    nextTimeoutTicket = 1;
     nextRawPollTicket = 1;
     retiredRecvmsgMultishotTrackingHistory.fill(0);
     retiredRecvmsgMultishotTrackingHead = 0;
@@ -2500,6 +2562,17 @@ public:
         op = getOpFromUserData(user_data);
         object = getObjectFromUserData(user_data);
         result = cqe->res;
+
+        if (op == Operation::timeout || op == Operation::timeoutMultishot)
+        {
+          TimeoutPacket *packet = nullptr;
+          const bool terminal = op == Operation::timeout || !(cqe->flags & IORING_CQE_F_MORE);
+          if (resolveTimeoutCompletion(user_data, terminal, packet) == false)
+          {
+            continue;
+          }
+          object = packet;
+        }
 
         switch (op) // ignore if cancelled or closed
         {
