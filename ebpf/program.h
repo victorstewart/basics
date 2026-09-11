@@ -206,14 +206,7 @@ private:
 
 		size_t requestedLen = strnlen(requestedName, BPF_OBJ_NAME_LEN);
 		size_t candidateLen = strnlen(candidateName, BPF_OBJ_NAME_LEN);
-		bool exactMatch = (requestedLen == candidateLen && memcmp(requestedName, candidateName, requestedLen) == 0);
-		bool requestedIsPrefix = (requestedLen >= candidateLen && memcmp(requestedName, candidateName, candidateLen) == 0);
-		bool candidateIsPrefix = (candidateLen >= requestedLen && memcmp(candidateName, requestedName, requestedLen) == 0);
-
-		// Kernel-side BPF object names are capped to BPF_OBJ_NAME_LEN, so accept
-		// both exact and truncated-prefix matches when reopening a preattached
-		// program or map from its persisted kernel identity.
-		return exactMatch || requestedIsPrefix || candidateIsPrefix;
+		return requestedLen == candidateLen && memcmp(requestedName, candidateName, requestedLen) == 0;
 	}
 
 	static struct bpf_program *findProgramByKernelName(struct bpf_object *object, const char *requestedName)

@@ -33,8 +33,8 @@ namespace {
 constexpr const char *kProgramName = "xdp_pass";
 constexpr const char *kTCXProgramName = "tcx_pass";
 constexpr const char *kMapName = "counters";
-constexpr const char *kOverlapMap4Name = "owned_routable_prefixes4";
-constexpr const char *kOverlapMap6Name = "owned_routable_prefixes6";
+constexpr const char *kOverlapMap4Name = "wh_egress4";
+constexpr const char *kOverlapMap6Name = "wh_egress";
 
 class ScopedTempDirectory {
 private:
@@ -208,16 +208,15 @@ static bool compileFixtureProgram(CompiledProgramFixture& fixture)
   return exitCode == 0;
 }
 
-static bool compileTruncatedMapFixtureProgram(CompiledProgramFixture& fixture)
+static bool compilePreattachedPrefixMapFixtureProgram(CompiledProgramFixture& fixture)
 {
   if (fixture.tempDirectory.valid() == false)
   {
     return false;
   }
 
-  fixture.sourcePath = fixture.tempDirectory.child("xdp_truncated_maps.c");
-  fixture.objectPath = fixture.tempDirectory.child("xdp_truncated_maps.o");
-
+  fixture.sourcePath = fixture.tempDirectory.child("xdp_prefix_maps.c");
+  fixture.objectPath = fixture.tempDirectory.child("xdp_prefix_maps.o");
   std::ofstream source(fixture.sourcePath);
   if (source.is_open() == false)
   {
@@ -227,58 +226,24 @@ static bool compileTruncatedMapFixtureProgram(CompiledProgramFixture& fixture)
   source
     << "#include <linux/bpf.h>\n"
     << "#include <bpf/bpf_helpers.h>\n"
-    << "\n"
-    << "struct key4 {\n"
-    << "  __u32 prefixlen;\n"
-    << "  __u32 addr;\n"
-    << "};\n"
-    << "\n"
-    << "struct key6 {\n"
-    << "  __u32 prefixlen;\n"
-    << "  __u32 addr[4];\n"
-    << "};\n"
-    << "\n"
-    << "struct {\n"
-    << "  __uint(type, BPF_MAP_TYPE_HASH);\n"
-    << "  __uint(max_entries, 4);\n"
-    << "  __type(key, struct key4);\n"
-    << "  __type(value, __u8);\n"
-    << "} " << kOverlapMap4Name << " SEC(\".maps\");\n"
-    << "\n"
-    << "struct {\n"
-    << "  __uint(type, BPF_MAP_TYPE_HASH);\n"
-    << "  __uint(max_entries, 4);\n"
-    << "  __type(key, struct key6);\n"
-    << "  __type(value, __u8);\n"
-    << "} " << kOverlapMap6Name << " SEC(\".maps\");\n"
-    << "\n"
-    << "SEC(\"xdp\")\n"
-    << "int " << kProgramName << "(struct xdp_md *ctx)\n"
-    << "{\n"
-    << "  return XDP_PASS;\n"
+    << "struct key4 { __u32 prefixlen; __u32 addr; };\n"
+    << "struct key10 { __u8 bytes[10]; };\n"
+    << "struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 4); __type(key, struct key10); __type(value, __u8[32]); } " << kOverlapMap6Name << " SEC(\".maps\");\n"
+    << "struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 4); __type(key, struct key4); __type(value, __u8[32]); } " << kOverlapMap4Name << " SEC(\".maps\");\n"
+    << "SEC(\"xdp\") int " << kProgramName << "(struct xdp_md *ctx) {\n"
+    << "  struct key10 key10 = {};\n"
+    << "  struct key4 key4 = {};\n"
+    << "  __u8 *value10 = bpf_map_lookup_elem(&" << kOverlapMap6Name << ", &key10);\n"
+    << "  __u8 *value4 = bpf_map_lookup_elem(&" << kOverlapMap4Name << ", &key4);\n"
+    << "  return (value10 || value4) ? XDP_PASS : XDP_PASS;\n"
     << "}\n"
-    << "\n"
     << "char LICENSE[] SEC(\"license\") = \"GPL\";\n";
-
   source.close();
   if (source.good() == false)
   {
     return false;
   }
-
-  int exitCode = runCommand({
-    "clang",
-    "-O2",
-    "-g",
-    "-target",
-    "bpf",
-    "-c",
-    fixture.sourcePath,
-    "-o",
-    fixture.objectPath,
-  });
-
-  return exitCode == 0;
+  return runCommand({"clang", "-O2", "-g", "-target", "bpf", "-c", fixture.sourcePath, "-o", fixture.objectPath}) == 0;
 }
 
 static bool compileTCXFixtureProgram(CompiledProgramFixture& fixture)
@@ -371,10 +336,7 @@ static bool objectNameMatches(std::string_view requestedName, const char *candid
   }
 
   size_t candidateLength = strnlen(candidateName, BPF_OBJ_NAME_LEN);
-  bool exactMatch = (requestedName.size() == candidateLength && memcmp(requestedName.data(), candidateName, requestedName.size()) == 0);
-  bool requestedIsPrefix = (requestedName.size() >= candidateLength && memcmp(requestedName.data(), candidateName, candidateLength) == 0);
-  bool candidateIsPrefix = (candidateLength >= requestedName.size() && memcmp(candidateName, requestedName.data(), requestedName.size()) == 0);
-  return exactMatch || requestedIsPrefix || candidateIsPrefix;
+  return requestedName.size() == candidateLength && memcmp(requestedName.data(), candidateName, requestedName.size()) == 0;
 }
 
 static __u32 findAttachedMapIDByNameAndKeySize(int progFD, std::string_view name, __u32 expectedKeySize)
@@ -611,7 +573,7 @@ static void testTCXLinkAttach(EBPFTestContext& context, const CompiledProgramFix
   removeVeth();
 }
 
-static void testPreattachedMapReopenDisambiguatesTruncatedNames(EBPFTestContext& context, const CompiledProgramFixture& fixture)
+static void testPreattachedMapReopenKeepsPrefixNamesDistinct(EBPFTestContext& context, const CompiledProgramFixture& fixture)
 {
   if (haveRuntimeLoadSupport() == false)
   {
@@ -632,7 +594,7 @@ static void testPreattachedMapReopenDisambiguatesTruncatedNames(EBPFTestContext&
   __u32 existingProgramID = 0;
   if (bpf_xdp_query_id(loopback.ifidx, XDP_FLAGS_SKB_MODE, &existingProgramID) != 0)
   {
-    context.skip("loopback XDP query is unavailable on this host");
+    context.skip("loopback XDP query is unavailable");
     return;
   }
 
@@ -661,7 +623,10 @@ static void testPreattachedMapReopenDisambiguatesTruncatedNames(EBPFTestContext&
     return;
   }
 
-  auto expectKeySizeForMap = [&] (const char *name, __u32 expectedKeySize) -> void {
+  // Force the public retained-FD name fallback; restore the owned object before cleanup.
+  struct bpf_object *savedObject = reopened->obj;
+  reopened->obj = nullptr;
+  auto expectMapShape = [&] (const char *name, __u32 keySize, __u32 valueSize) -> void {
     bool sawMap = false;
     reopened->openMap(String(name), [&] (int mapFD) -> void {
       sawMap = true;
@@ -670,52 +635,39 @@ static void testPreattachedMapReopenDisambiguatesTruncatedNames(EBPFTestContext&
       {
         return;
       }
-
       struct bpf_map_info info = {};
       __u32 infoLength = sizeof(info);
       EXPECT_EQ(context.suite(), bpf_map_get_info_by_fd(mapFD, &info, &infoLength), 0);
-      EXPECT_EQ(context.suite(), info.key_size, expectedKeySize);
-      EXPECT_EQ(context.suite(), info.id, findAttachedMapIDByNameAndKeySize(attached->prog_fd, name, expectedKeySize));
-
-      if (expectedKeySize == 8)
+      EXPECT_EQ(context.suite(), info.key_size, keySize);
+      EXPECT_EQ(context.suite(), info.value_size, valueSize);
+      EXPECT_EQ(context.suite(), info.id, findAttachedMapIDByNameAndKeySize(attached->prog_fd, name, keySize));
+      if (info.key_size != keySize || info.value_size != valueSize)
       {
-        struct
-        {
-          __u32 prefixlen;
-          __u32 addr;
-        } key4 = {
-          .prefixlen = 32,
-          .addr = 0x01020304,
-        };
-        __u8 expectedValue = 1;
-        EXPECT_EQ(context.suite(), bpf_map_update_elem(mapFD, &key4, &expectedValue, BPF_ANY), 0);
-        __u8 actualValue = 0;
-        EXPECT_EQ(context.suite(), bpf_map_lookup_elem(mapFD, &key4, &actualValue), 0);
-        EXPECT_EQ(context.suite(), actualValue, expectedValue);
+        return;
       }
-      else if (expectedKeySize == 20)
+      __u8 expected[32] = {};
+      __u8 actual[32] = {};
+      expected[0] = static_cast<__u8>(keySize);
+      expected[31] = 0xa5;
+      if (keySize == 8)
       {
-        struct
-        {
-          __u32 prefixlen;
-          __u32 addr[4];
-        } key6 = {
-          .prefixlen = 128,
-          .addr = {0x01020304, 0x05060708, 0x11121314, 0x15161718},
-        };
-        __u8 expectedValue = 1;
-        EXPECT_EQ(context.suite(), bpf_map_update_elem(mapFD, &key6, &expectedValue, BPF_ANY), 0);
-        __u8 actualValue = 0;
-        EXPECT_EQ(context.suite(), bpf_map_lookup_elem(mapFD, &key6, &actualValue), 0);
-        EXPECT_EQ(context.suite(), actualValue, expectedValue);
+        struct { __u32 prefixlen; __u32 addr; } key = {.prefixlen = 32, .addr = 0x01020304};
+        EXPECT_EQ(context.suite(), bpf_map_update_elem(mapFD, &key, expected, BPF_ANY), 0);
+        EXPECT_EQ(context.suite(), bpf_map_lookup_elem(mapFD, &key, actual), 0);
       }
+      else
+      {
+        struct { __u8 bytes[10]; } key = {.bytes = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}};
+        EXPECT_EQ(context.suite(), bpf_map_update_elem(mapFD, &key, expected, BPF_ANY), 0);
+        EXPECT_EQ(context.suite(), bpf_map_lookup_elem(mapFD, &key, actual), 0);
+      }
+      EXPECT_EQ(context.suite(), memcmp(actual, expected, sizeof(expected)), 0);
     });
     EXPECT_TRUE(context.suite(), sawMap);
   };
-
-  expectKeySizeForMap(kOverlapMap4Name, 8);
-  expectKeySizeForMap(kOverlapMap6Name, 20);
-
+  expectMapShape(kOverlapMap4Name, 8, 32);
+  expectMapShape(kOverlapMap6Name, 10, 32);
+  reopened->obj = savedObject;
   reopenedDevice.detachXDP();
   loopback.detachXDP();
 }
@@ -744,13 +696,13 @@ int main()
   }
   testTCXLinkAttach(context, tcxFixture);
 
-  CompiledProgramFixture truncatedMapFixture;
-  if (compileTruncatedMapFixtureProgram(truncatedMapFixture) == false)
+  CompiledProgramFixture prefixMapFixture;
+  if (compilePreattachedPrefixMapFixtureProgram(prefixMapFixture) == false)
   {
-    context.skip("clang with the BPF backend is unavailable for truncated-map reopen coverage");
+    context.skip("clang with the BPF backend is unavailable for prefix-map reopen coverage");
     return context.finish();
   }
 
-  testPreattachedMapReopenDisambiguatesTruncatedNames(context, truncatedMapFixture);
+  testPreattachedMapReopenKeepsPrefixNamesDistinct(context, prefixMapFixture);
   return context.finish();
 }
