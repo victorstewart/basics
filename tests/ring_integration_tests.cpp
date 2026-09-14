@@ -190,6 +190,106 @@ static void testIsolatedWorkerRingPreservesProcessIntegration(TestSuite& suite)
   EXPECT_EQ(suite, WEXITSTATUS(status), 0);
 }
 
+static void testEarlyManagedSignalMaskReachesWorkersAndRing(TestSuite& suite)
+{
+  WaitableSigChldScope waitableSigChld;
+  pid_t child = fork();
+  if (child == 0)
+  {
+    sigset_t managedSignals = {};
+    sigemptyset(&managedSignals);
+    sigaddset(&managedSignals, SIGINT);
+    sigaddset(&managedSignals, SIGUSR1);
+    sigaddset(&managedSignals, SIGTERM);
+    if (sigprocmask(SIG_UNBLOCK, &managedSignals, nullptr) != 0)
+    {
+      _exit(2);
+    }
+    Ring::blockSignalSet(managedSignals);
+
+    int workerGate[2] = {};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, workerGate) != 0)
+    {
+      _exit(3);
+    }
+    std::thread worker([&] {
+      sigset_t workerMask = {};
+      const bool inheritedMask = pthread_sigmask(SIG_SETMASK, nullptr, &workerMask) == 0 &&
+                                 sigismember(&workerMask, SIGINT) == 1 &&
+                                 sigismember(&workerMask, SIGUSR1) == 1 &&
+                                 sigismember(&workerMask, SIGTERM) == 1;
+      const char ready = inheritedMask ? '1' : '0';
+      (void)write(workerGate[1], &ready, sizeof(ready));
+      char release = {};
+      (void)read(workerGate[1], &release, sizeof(release));
+    });
+
+    char ready = {};
+    if (read(workerGate[0], &ready, sizeof(ready)) != sizeof(ready) || ready != '1')
+    {
+      const char release = 'x';
+      (void)write(workerGate[0], &release, sizeof(release));
+      worker.join();
+      _exit(4);
+    }
+
+    struct Lifecycle final : RingLifecycle
+    {
+      bool receivedTerm = false;
+
+      void beforeRing(void) override
+      {
+        Ring::signals[0] = SIGINT;
+        Ring::signals[1] = SIGUSR1;
+        Ring::signals[2] = SIGTERM;
+      }
+
+      bool signalHandler(const struct signalfd_siginfo& info) override
+      {
+        if (info.ssi_signo != SIGTERM)
+        {
+          return true;
+        }
+        receivedTerm = true;
+        Ring::exit = true;
+        return false;
+      }
+    } lifecycle;
+
+    Ring::interfacer = nullptr;
+    Ring::lifecycler = &lifecycle;
+    Ring::exit = false;
+    Ring::shuttingDown = false;
+    Ring::createRing(32, 32, 8, 2, -1, -1, 8);
+    if (kill(getpid(), SIGTERM) != 0)
+    {
+      const char release = 'x';
+      (void)write(workerGate[0], &release, sizeof(release));
+      worker.join();
+      _exit(5);
+    }
+    Ring::start();
+    const bool dispatched = lifecycle.receivedTerm;
+    Ring::shutdownForExec();
+    const char release = 'x';
+    (void)write(workerGate[0], &release, sizeof(release));
+    worker.join();
+    close(workerGate[0]);
+    close(workerGate[1]);
+    _exit(dispatched ? 0 : 6);
+  }
+
+  EXPECT_TRUE(suite, child >= 0);
+  if (child < 0)
+  {
+    return;
+  }
+  int status = 0;
+  EXPECT_EQ(suite, waitpid(child, &status, 0), child);
+  EXPECT_TRUE(suite, WIFEXITED(status));
+  EXPECT_EQ(suite, WEXITSTATUS(status), 0);
+}
+
 static void testRingControlStateIsThreadLocal(TestSuite& suite)
 {
   Ring::exit = false;
@@ -2279,6 +2379,7 @@ int main()
   }
 
   testIsolatedWorkerRingPreservesProcessIntegration(suite);
+  testEarlyManagedSignalMaskReachesWorkersAndRing(suite);
   runRingScenario(suite);
   testCompletionBatchCanQuiesceRing(suite);
   testMultishotTimeoutCancellationIsTerminal(suite);
