@@ -221,6 +221,53 @@ static void testInvalidPathFallsBackToStandardError(TestSuite& suite)
   Guardian::crashReportPath.assign("/crashreport.txt");
 }
 
+static void testBootRestoresWaitableSigchld(TestSuite& suite)
+{
+  pid_t child = fork();
+  EXPECT_TRUE(suite, child >= 0);
+  if (child == 0)
+  {
+    struct sigaction ignored = {};
+    sigemptyset(&ignored.sa_mask);
+    ignored.sa_handler = SIG_IGN;
+    if (sigaction(SIGCHLD, &ignored, nullptr) != 0)
+    {
+      _exit(98);
+    }
+
+    Guardian::boot();
+
+    struct sigaction installed = {};
+    if (sigaction(SIGCHLD, nullptr, &installed) != 0 || installed.sa_handler != SIG_DFL)
+    {
+      _exit(97);
+    }
+
+    pid_t grandchild = fork();
+    if (grandchild < 0)
+    {
+      _exit(96);
+    }
+    if (grandchild == 0)
+    {
+      _exit(23);
+    }
+
+    int status = 0;
+    if (waitpid(grandchild, &status, 0) != grandchild || !WIFEXITED(status) || WEXITSTATUS(status) != 23)
+    {
+      _exit(95);
+    }
+    _exit(0);
+  }
+
+  int status = 0;
+  bool exited = child > 0 && waitForChild(child, status);
+  EXPECT_TRUE(suite, exited);
+  EXPECT_TRUE(suite, exited && WIFEXITED(status));
+  EXPECT_TRUE(suite, exited && WEXITSTATUS(status) == 0);
+}
+
 static void testConcurrentBootPreparesOneCrashReport(TestSuite& suite)
 {
   char reportPath[] = "/tmp/basics-guardian-concurrent-XXXXXX";
@@ -291,6 +338,7 @@ int main()
   testFatalSignalExitsWithoutForkOrUnsafeShutdown(suite, SIGABRT);
   testRepeatedBootPreservesPreparedCrashReport(suite);
   testInvalidPathFallsBackToStandardError(suite);
+  testBootRestoresWaitableSigchld(suite);
   testConcurrentBootPreparesOneCrashReport(suite);
   return suite.finish("guardian tests");
 }
