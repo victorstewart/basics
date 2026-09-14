@@ -491,6 +491,12 @@ private:
     }
 
     libssh2_session_set_blocking(session, 0);
+    if (libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY, "ssh-ed25519") != 0)
+    {
+      failed = true;
+      lastFailure.assign("failed to prefer ed25519 ssh host key"_ctv);
+      releaseSession();
+    }
   }
 
   void initializeConnectWait(void)
