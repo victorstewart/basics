@@ -1000,6 +1000,7 @@ public:
 
   bool finished = false;
   bool commandFailureObserved = false;
+  int negotiatedHostKeyType = LIBSSH2_HOSTKEY_TYPE_UNKNOWN;
   String commandResponse = {};
   SSHCommandResult failingCommand = {};
   String failingCommandMessage = {};
@@ -1035,6 +1036,9 @@ public:
       finishScenario();
       co_return;
     }
+
+    size_t hostKeyLength = 0;
+    (void)libssh2_session_hostkey(session, &hostKeyLength, &negotiatedHostKeyType);
 
     suspendIndex = nextSuspendIndex();
     uploadString("ssh payload"_ctv, remotePathText, 0600, 15'000);
@@ -1094,6 +1098,7 @@ private:
   uint16_t port_ = 0;
   pid_t pid_ = -1;
   std::string hostKeyPath_;
+  std::string ecdsaHostKeyPath_;
   std::string hostPublicKey_;
   std::string clientKeyPath_;
   std::string authorizedKeysPath_;
@@ -1165,6 +1170,7 @@ public:
     }
 
     hostKeyPath_ = joinPath(temp_.path(), "host_ed25519_key");
+    ecdsaHostKeyPath_ = joinPath(temp_.path(), "host_ecdsa_key");
     clientKeyPath_ = joinPath(temp_.path(), "client_ed25519_key");
     authorizedKeysPath_ = joinPath(temp_.path(), "authorized_keys");
     configPath_ = joinPath(temp_.path(), "sshd_config");
@@ -1195,6 +1201,12 @@ public:
       return;
     }
 
+    if (runCommand({"ssh-keygen", "-q", "-t", "ecdsa", "-b", "256", "-N", "", "-f", ecdsaHostKeyPath_}) != 0)
+    {
+      failure_ = "failed to generate ssh ecdsa host key";
+      return;
+    }
+
     hostPublicKey_.assign(reinterpret_cast<const char *>(hostKeys.publicKeyOpenSSH.data()), size_t(hostKeys.publicKeyOpenSSH.size()));
 
     if (!writeFile(std::string_view(authorizedKeysPath_),
@@ -1214,6 +1226,7 @@ public:
     std::string config =
         "Port " + std::to_string(port_) + "\n"
         "ListenAddress 127.0.0.1\n"
+        "HostKey " + ecdsaHostKeyPath_ + "\n"
         "HostKey " + hostKeyPath_ + "\n"
         "PidFile " + joinPath(temp_.path(), "sshd.pid") + "\n"
         "PermitRootLogin yes\n"
@@ -1797,6 +1810,7 @@ static void testSSHClientLoopback(TestSuite& suite, bool& skipped)
 
   EXPECT_TRUE(suite, client.finished);
   EXPECT_FALSE(suite, client.failed);
+  EXPECT_EQ(suite, client.negotiatedHostKeyType, LIBSSH2_HOSTKEY_TYPE_ED25519);
   EXPECT_STRING_EQ(suite, client.commandResponse, "ssh payload"_ctv);
   EXPECT_TRUE(suite, client.commandFailureObserved);
   EXPECT_EQ(suite, client.failingCommand.exitStatus, 7);
