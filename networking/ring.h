@@ -1968,6 +1968,12 @@ private:
 public:
 
   static thread_local inline int signals[16];
+
+  static void blockSignalSet(const sigset_t& signalSet)
+  {
+    (void)sigprocmask(SIG_BLOCK, &signalSet, nullptr);
+  }
+
   static thread_local inline RingInterface *& interfacer = ringInterfacer;
   static thread_local inline RingLifecycle *& lifecycler = ringLifecycler;
 
@@ -2417,7 +2423,7 @@ public:
 
       if (integrateProcess)
       {
-        sigprocmask(SIG_BLOCK, &listenForSignals, nullptr);
+        blockSignalSet(listenForSignals);
       }
     }
 
