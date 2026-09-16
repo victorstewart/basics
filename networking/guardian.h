@@ -24,7 +24,6 @@ private:
       SIGALRM,
       SIGTERM,
       SIGSTKFLT,
-      SIGCHLD,
       SIGCONT,
       SIGTSTP,
       SIGTTIN,
@@ -234,5 +233,10 @@ public:
     {
       sigaction(signal, &act, NULL);
     }
+
+    // SIGCHLD must remain waitable for Ring-owned subprocesses, including after
+    // inheriting SIG_IGN from an earlier Guardian boot.
+    act.sa_handler = SIG_DFL;
+    sigaction(SIGCHLD, &act, NULL);
   }
 };
