@@ -152,39 +152,6 @@ private:
     columnFamilies.clear();
   }
 
-  static bool loadColumnFamilyConfig(
-      tidesdb_column_family_t *columnFamily,
-      tidesdb_column_family_config_t& config,
-      String *failure)
-  {
-    tidesdb_stats_t *stats = nullptr;
-    int rc = tidesdb_get_stats(columnFamily, &stats);
-    if (rc != TDB_SUCCESS)
-    {
-      if (stats != nullptr)
-      {
-        tidesdb_free_stats(stats);
-      }
-      String message;
-      message.snprintf<"tidesdb column family durability inspection failed: {} ({itoa})"_ctv>(String(describeError(rc)), rc);
-      setFailure(failure, message);
-      return false;
-    }
-    if (stats == nullptr || stats->config == nullptr)
-    {
-      if (stats != nullptr)
-      {
-        tidesdb_free_stats(stats);
-      }
-      setFailure(failure, "tidesdb column family durability inspection returned malformed stats");
-      return false;
-    }
-
-    config = *stats->config;
-    tidesdb_free_stats(stats);
-    return true;
-  }
-
   bool ensureOpen(String *failure = nullptr)
   {
     if (db != nullptr)
@@ -211,7 +178,8 @@ private:
     config.num_compaction_threads = 1;
     if (durability == Durability::full)
     {
-      config.unified_memtable_sync_mode = TDB_SYNC_FULL;
+      // TidesDB 10 shares one WAL across all column families.
+      config.memtable_sync_mode = TDB_SYNC_FULL;
     }
 
     int rc = tidesdb_open(&config, &db);
@@ -221,59 +189,6 @@ private:
       message.snprintf<"tidesdb_open failed: {} ({itoa})"_ctv>(String(describeError(rc)), rc);
       setFailure(failure, message);
       db = nullptr;
-      return false;
-    }
-
-    return true;
-  }
-
-  bool requireFullDurability(
-      const String& columnFamilyName,
-      tidesdb_column_family_t **columnFamily,
-      String *failure)
-  {
-    tidesdb_column_family_config_t config = {};
-    if (loadColumnFamilyConfig(*columnFamily, config, failure) == false)
-    {
-      return false;
-    }
-    if (config.sync_mode == TDB_SYNC_FULL)
-    {
-      return true;
-    }
-
-    config.sync_mode = TDB_SYNC_FULL;
-    int rc = tidesdb_cf_update_runtime_config(*columnFamily, &config, 1);
-    if (rc != TDB_SUCCESS)
-    {
-      closeDatabase();
-      String message;
-      message.snprintf<"tidesdb column family durability update failed: {} ({itoa})"_ctv>(String(describeError(rc)), rc);
-      setFailure(failure, message);
-      return false;
-    }
-
-    closeDatabase();
-    if (ensureOpen(failure) == false)
-    {
-      return false;
-    }
-
-    String mutableColumnFamilyName(columnFamilyName.data(), columnFamilyName.size(), Copy::yes);
-    *columnFamily = tidesdb_get_column_family(db, mutableColumnFamilyName.c_str());
-    if (*columnFamily == nullptr)
-    {
-      setFailure(failure, "tidesdb column family missing after durability reopen");
-      return false;
-    }
-    if (loadColumnFamilyConfig(*columnFamily, config, failure) == false)
-    {
-      return false;
-    }
-    if (config.sync_mode != TDB_SYNC_FULL)
-    {
-      closeDatabase();
-      setFailure(failure, "tidesdb column family durability promotion was not persisted");
       return false;
     }
 
@@ -304,10 +219,6 @@ private:
     if (resolved == nullptr)
     {
       tidesdb_column_family_config_t config = tidesdb_default_column_family_config();
-      if (durability == Durability::full)
-      {
-        config.sync_mode = TDB_SYNC_FULL;
-      }
       int rc = tidesdb_create_column_family(db, mutableColumnFamilyName.c_str(), &config);
       if (rc != TDB_SUCCESS && rc != TDB_ERR_EXISTS)
       {
@@ -323,12 +234,6 @@ private:
     if (resolved == nullptr)
     {
       setFailure(failure, "tidesdb column family init failed");
-      return false;
-    }
-
-    if (durability == Durability::full &&
-        requireFullDurability(columnFamilyName, &resolved, failure) == false)
-    {
       return false;
     }
 

@@ -54,11 +54,11 @@ public:
 #if defined(__linux__)
 static bool liveWalFlags(
     const char *dbPath,
-    std::string_view columnFamily,
     unsigned long long& flags)
 {
   std::string walPrefix(dbPath);
-  walPrefix.append("/").append(columnFamily).append("/wal_");
+  // TidesDB 10 stores the shared, numerically named WAL at the database root.
+  walPrefix.append("/");
 
   DIR *fds = opendir("/proc/self/fd");
   if (fds == nullptr)
@@ -85,7 +85,8 @@ static bool liveWalFlags(
       continue;
     }
     std::string_view targetPath(target.data(), size_t(targetLength));
-    if (targetPath.starts_with(walPrefix) == false || targetPath.ends_with(".log") == false)
+    if (targetPath.starts_with(walPrefix) == false || targetPath.ends_with(".log") == false ||
+        targetPath.substr(walPrefix.size()).find('/') != std::string_view::npos)
     {
       continue;
     }
@@ -139,23 +140,51 @@ int main()
     TidesDB db(String(tempDirectory.path()), TidesDB::Durability::inherit);
     EXPECT_TRUE(suite, db.write("existing"_ctv, "key"_ctv, "seed"_ctv, &failure));
     unsigned long long flags = 0;
-    EXPECT_TRUE(suite, liveWalFlags(tempDirectory.path(), "existing", flags));
+    EXPECT_TRUE(suite, liveWalFlags(tempDirectory.path(), flags));
     EXPECT_FALSE(suite, (flags & O_DSYNC) != 0);
   }
 
   {
     TidesDB db(String(tempDirectory.path()), TidesDB::Durability::full);
+    String value;
+    EXPECT_TRUE(suite, db.read("existing"_ctv, "key"_ctv, value, &failure));
+    EXPECT_TRUE(suite, value == "seed"_ctv);
     failure.clear();
     EXPECT_TRUE(suite, db.write("existing"_ctv, "key"_ctv, "promoted"_ctv, &failure));
     unsigned long long promotedFlags = 0;
-    EXPECT_TRUE(suite, liveWalFlags(tempDirectory.path(), "existing", promotedFlags));
+    EXPECT_TRUE(suite, liveWalFlags(tempDirectory.path(), promotedFlags));
     EXPECT_TRUE(suite, (promotedFlags & O_DSYNC) != 0);
 
     failure.clear();
     EXPECT_TRUE(suite, db.write("new-full"_ctv, "key"_ctv, "created"_ctv, &failure));
     unsigned long long createdFlags = 0;
-    EXPECT_TRUE(suite, liveWalFlags(tempDirectory.path(), "new-full", createdFlags));
+    EXPECT_TRUE(suite, liveWalFlags(tempDirectory.path(), createdFlags));
     EXPECT_TRUE(suite, (createdFlags & O_DSYNC) != 0);
+  }
+
+  {
+    TidesDB db(String(tempDirectory.path()), TidesDB::Durability::full);
+    String value;
+    EXPECT_TRUE(suite, db.read("existing"_ctv, "key"_ctv, value, &failure));
+    EXPECT_TRUE(suite, value == "promoted"_ctv);
+    EXPECT_TRUE(suite, db.read("new-full"_ctv, "key"_ctv, value, &failure));
+    EXPECT_TRUE(suite, value == "created"_ctv);
+    Vector<String> values;
+    EXPECT_TRUE(suite, db.listValues("new-full"_ctv, values, &failure));
+    EXPECT_TRUE(suite, values.size() == 1);
+    if (values.size() == 1)
+    {
+      EXPECT_TRUE(suite, values[0] == "created"_ctv);
+    }
+    EXPECT_TRUE(suite, db.remove("new-full"_ctv, "key"_ctv, &failure));
+  }
+  {
+    TidesDB db(String(tempDirectory.path()), TidesDB::Durability::full);
+    String value;
+    EXPECT_FALSE(suite, db.read("new-full"_ctv, "key"_ctv, value, &failure));
+    EXPECT_TRUE(suite, failure == "record not found"_ctv);
+    EXPECT_TRUE(suite, db.read("existing"_ctv, "key"_ctv, value, &failure));
+    EXPECT_TRUE(suite, value == "promoted"_ctv);
   }
 
   return suite.finish("tidesdb durability tests");

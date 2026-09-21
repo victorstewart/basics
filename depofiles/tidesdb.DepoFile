@@ -1,22 +1,22 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
 NAME tidesdb
-VERSION 9.3.5
+VERSION 10.0.1.20260919.210236
 SYSTEM_LIBS ALLOW
-# Best-effort source-only replacement. The old schema carried local compatibility rewrites.
+# Upstream master pinned by immutable commit and archive checksum.
 DEPENDS zstd VERSION 1.5.7
 DEPENDS snappy VERSION 1.2.2
 DEPENDS lz4 VERSION 1.10.0
-SOURCE URL https://github.com/tidesdb/tidesdb/archive/refs/tags/v9.3.5.tar.gz
-SHA256 1cf1cbb677662c62fcf719c801e9be130b94843fab47c9a33a0acb8b407261cd
+SOURCE URL https://github.com/tidesdb/tidesdb/archive/2e029f971e664319edec26e0a19f2dd02344bcff.tar.gz
+SHA256 72eaa5c91ec62aec43e0481bc612475e99099c67e4c2f3b4141dce93de9d87a7
 BUILD_SYSTEM CMAKE
 CMAKE_ARG "-DCMAKE_PREFIX_PATH=${dep:zstd};${dep:snappy};${dep:lz4}"
 CMAKE_ARG "-DCMAKE_C_FLAGS=-I${dep:zstd}/include -I${dep:snappy}/include -I${dep:lz4}/include"
+CMAKE_DEFINE CMAKE_C_COMPILER=clang
 CMAKE_DEFINE BUILD_SHARED_LIBS=OFF
 CMAKE_DEFINE TIDESDB_BUILD_TESTS=OFF
 CMAKE_DEFINE TIDESDB_WITH_SANITIZER=OFF
 CMAKE_DEFINE TIDESDB_WITH_MIMALLOC=OFF
 CMAKE_DEFINE TIDESDB_WITH_TCMALLOC=OFF
-CMAKE_INSTALL bash -lc "cmake --install '${DEPO_BUILD_DIR}' && sed -i 's/char \\*full_path = malloc(len);/char *full_path = (char *)malloc(len);/' '${DEPO_PREFIX}/include/tidesdb/compat.h'"
 TARGET tidesdb::tidesdb STATIC lib/libtidesdb.a INTERFACE include
 LINK tidesdb::tidesdb zstd::zstd snappy::snappy lz4::lz4 pthread m stdc++ atomic

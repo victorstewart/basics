@@ -10,7 +10,7 @@ endif()
 
 file(READ "${BASICS_PACKAGE_DEPOFILE}" _basics_package_depofile)
 
-string(FIND "${_basics_package_depofile}" "DEPENDS tidesdb VERSION 9.3.5" _basics_tidesdb_depends_index)
+string(FIND "${_basics_package_depofile}" "DEPENDS tidesdb VERSION 10.0.1.20260919.210236" _basics_tidesdb_depends_index)
 string(FIND "${_basics_package_depofile}" "tidesdb::tidesdb" _basics_tidesdb_link_index)
 string(FIND "${_basics_package_depofile}" "# tidesdb support: ON" _basics_tidesdb_comment_on_index)
 string(FIND "${_basics_package_depofile}" "# tidesdb support: OFF" _basics_tidesdb_comment_off_index)
