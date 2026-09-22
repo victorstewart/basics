@@ -30,7 +30,16 @@ private:
   tidesdb_t *db = nullptr;
   String dbPath;
   Durability durability = Durability::inherit;
+  uint64_t logicalWriteFlushByteBudget = 0;
+  uint64_t committedLogicalWriteBytes = 0;
+  bool flushBeforeNextMutation = false;
   bytell_hash_map<String, tidesdb_column_family_t *> columnFamilies;
+
+  static uint64_t saturatingAdd(uint64_t left, uint64_t right)
+  {
+    constexpr uint64_t maximum = ~uint64_t{0};
+    return maximum - left < right ? maximum : left + right;
+  }
 
   static void setFailure(String *failure, const char *message)
   {
@@ -150,6 +159,7 @@ private:
     }
 
     columnFamilies.clear();
+    flushBeforeNextMutation = logicalWriteFlushByteBudget != 0;
   }
 
   bool ensureOpen(String *failure = nullptr)
@@ -192,7 +202,37 @@ private:
       return false;
     }
 
+    flushBeforeNextMutation = logicalWriteFlushByteBudget != 0;
     return true;
+  }
+
+  bool flushBeforeMutation(uint64_t logicalBytes, String *failure)
+  {
+    if (logicalWriteFlushByteBudget == 0)
+    {
+      return true;
+    }
+
+    if (ensureOpen(failure) == false)
+    {
+      return false;
+    }
+
+    if (flushBeforeNextMutation == false &&
+        saturatingAdd(committedLogicalWriteBytes, logicalBytes) <= logicalWriteFlushByteBudget)
+    {
+      return true;
+    }
+
+    return flushMemtable(failure);
+  }
+
+  void noteCommittedMutation(uint64_t logicalBytes)
+  {
+    if (logicalWriteFlushByteBudget != 0)
+    {
+      committedLogicalWriteBytes = saturatingAdd(committedLogicalWriteBytes, logicalBytes);
+    }
   }
 
   bool ensureColumnFamily(const String& columnFamilyName, tidesdb_column_family_t **columnFamily, String *failure = nullptr)
@@ -246,8 +286,10 @@ public:
 
   explicit TidesDB(
       const String& path = ""_ctv,
-      Durability requestedDurability = Durability::inherit)
-      : dbPath(path), durability(requestedDurability)
+      Durability requestedDurability = Durability::inherit,
+      uint64_t requestedLogicalWriteFlushByteBudget = 0)
+      : dbPath(path), durability(requestedDurability),
+        logicalWriteFlushByteBudget(requestedLogicalWriteFlushByteBudget)
   {
   }
 
@@ -285,8 +327,35 @@ public:
     closeDatabase();
   }
 
+  bool flushMemtable(String *failure = nullptr)
+  {
+    if (ensureOpen(failure) == false)
+    {
+      return false;
+    }
+
+    int rc = tidesdb_flush_memtable(db);
+    if (rc != TDB_SUCCESS)
+    {
+      String message;
+      message.snprintf<"tidesdb_flush_memtable failed: {} ({itoa})"_ctv>(String(describeError(rc)), rc);
+      setFailure(failure, message);
+      return false;
+    }
+
+    committedLogicalWriteBytes = 0;
+    flushBeforeNextMutation = false;
+    return true;
+  }
+
   bool write(const String& columnFamilyName, const String& key, const String& value, String *failure = nullptr)
   {
+    const uint64_t logicalBytes = saturatingAdd(key.size(), value.size());
+    if (flushBeforeMutation(logicalBytes, failure) == false)
+    {
+      return false;
+    }
+
     tidesdb_column_family_t *columnFamily = nullptr;
     if (ensureColumnFamily(columnFamilyName, &columnFamily, failure) == false)
     {
@@ -329,6 +398,7 @@ public:
       return false;
     }
 
+    noteCommittedMutation(logicalBytes);
     return true;
   }
 
@@ -387,6 +457,11 @@ public:
 
   bool remove(const String& columnFamilyName, const String& key, String *failure = nullptr)
   {
+    if (flushBeforeMutation(key.size(), failure) == false)
+    {
+      return false;
+    }
+
     tidesdb_column_family_t *columnFamily = nullptr;
     if (ensureColumnFamily(columnFamilyName, &columnFamily, failure) == false)
     {
@@ -434,6 +509,7 @@ public:
       return false;
     }
 
+    noteCommittedMutation(key.size());
     return true;
   }
 

@@ -11,6 +11,8 @@
 #include <fcntl.h>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "databases/embedded/tidesdb.h"
@@ -117,6 +119,45 @@ static bool liveWalFlags(
   closedir(fds);
   return found;
 }
+
+static size_t directoryEntryCountWithSuffix(
+    const char *path,
+    std::string_view suffix)
+{
+  DIR *directory = opendir(path);
+  if (directory == nullptr)
+  {
+    return 0;
+  }
+
+  size_t count = 0;
+  while (dirent *entry = readdir(directory))
+  {
+    std::string_view name(entry->d_name);
+    if (name == "." || name == "..")
+    {
+      continue;
+    }
+
+    std::string entryPath(path);
+    entryPath.append("/");
+    entryPath.append(name);
+    struct stat status {};
+    if (lstat(entryPath.c_str(), &status) == 0 && S_ISDIR(status.st_mode))
+    {
+      count += directoryEntryCountWithSuffix(entryPath.c_str(), suffix);
+      continue;
+    }
+
+    if (name.ends_with(suffix))
+    {
+      ++count;
+    }
+  }
+
+  closedir(directory);
+  return count;
+}
 #endif
 
 } // namespace
@@ -185,6 +226,42 @@ int main()
     EXPECT_TRUE(suite, failure == "record not found"_ctv);
     EXPECT_TRUE(suite, db.read("existing"_ctv, "key"_ctv, value, &failure));
     EXPECT_TRUE(suite, value == "promoted"_ctv);
+  }
+
+  TempDirectory recoveredFlushDirectory;
+  EXPECT_TRUE(suite, recoveredFlushDirectory.valid());
+  if (recoveredFlushDirectory.valid())
+  {
+    pid_t child = fork();
+    EXPECT_TRUE(suite, child >= 0);
+    if (child == 0)
+    {
+      TidesDB db(
+          String(recoveredFlushDirectory.path()),
+          TidesDB::Durability::full);
+      String childFailure;
+      _exit(db.write("recovered"_ctv, "prior"_ctv, "before-reopen"_ctv, &childFailure) ? 0 : 1);
+    }
+    if (child > 0)
+    {
+      int status = 0;
+      EXPECT_TRUE(suite, waitpid(child, &status, 0) == child);
+      EXPECT_TRUE(suite, WIFEXITED(status));
+      EXPECT_TRUE(suite, WEXITSTATUS(status) == 0);
+      EXPECT_TRUE(suite, directoryEntryCountWithSuffix(recoveredFlushDirectory.path(), ".klog") == 0);
+
+      TidesDB db(
+          String(recoveredFlushDirectory.path()),
+          TidesDB::Durability::full,
+          64 * 1024);
+      EXPECT_TRUE(suite, db.write("recovered"_ctv, "next"_ctv, "after-reopen"_ctv, &failure));
+      EXPECT_TRUE(suite, directoryEntryCountWithSuffix(recoveredFlushDirectory.path(), ".klog") > 0);
+      String readback;
+      EXPECT_TRUE(suite, db.read("recovered"_ctv, "prior"_ctv, readback, &failure));
+      EXPECT_TRUE(suite, readback == "before-reopen"_ctv);
+      EXPECT_TRUE(suite, db.read("recovered"_ctv, "next"_ctv, readback, &failure));
+      EXPECT_TRUE(suite, readback == "after-reopen"_ctv);
+    }
   }
 
   return suite.finish("tidesdb durability tests");
