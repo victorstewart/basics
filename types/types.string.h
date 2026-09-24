@@ -1342,6 +1342,14 @@ public:
     return t;
   }
 
+  // Heap and mmap storage remains valid for this String's lifetime. Views,
+  // including read-only literal and external views, retain their source's
+  // lifetime and must be detached before asynchronous retention.
+  bool ownsMemory(void) const
+  {
+    return memory == MemoryType::heap || memory == MemoryType::mmap;
+  }
+
   bool empty(void) const
   {
     return (length == 0);

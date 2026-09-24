@@ -1,6 +1,7 @@
 // Copyright 2026 Victor Stewart
 // SPDX-License-Identifier: Apache-2.0
 #include <limits>
+#include <utility>
 
 #include "tests/test_support.h"
 #include "types/types.containers.h"
@@ -260,6 +261,40 @@ static void testReserveFailurePreservesMmapState(TestSuite& suite)
   EXPECT_EQ(suite, mapped.tentativeCapacity(), originalCapacity);
 }
 
+static void testOwnsMemoryTracksStorageProvenance(TestSuite& suite)
+{
+  String heap = {};
+  heap.assign("heap"_ctv);
+  EXPECT_TRUE(suite, heap.ownsMemory());
+
+  String heapCopy = heap;
+  EXPECT_TRUE(suite, heapCopy.ownsMemory());
+  String heapMoved = std::move(heapCopy);
+  EXPECT_TRUE(suite, heapMoved.ownsMemory());
+
+  String mapped(64, MemoryType::mmap);
+  EXPECT_TRUE(suite, mapped.ownsMemory());
+  String mappedCopy = mapped;
+  EXPECT_TRUE(suite, mappedCopy.ownsMemory());
+  String mappedMoved = std::move(mappedCopy);
+  EXPECT_TRUE(suite, mappedMoved.ownsMemory());
+
+  uint8_t mutableBytes[] = {'v', 'i', 'e', 'w'};
+  String mutableView(mutableBytes, sizeof(mutableBytes), Copy::no, sizeof(mutableBytes));
+  EXPECT_FALSE(suite, mutableView.ownsMemory());
+  String mutableViewCopy = mutableView;
+  EXPECT_FALSE(suite, mutableViewCopy.ownsMemory());
+  String mutableViewMoved = std::move(mutableViewCopy);
+  EXPECT_FALSE(suite, mutableViewMoved.ownsMemory());
+
+  String readOnly("read-only"_ctv);
+  EXPECT_FALSE(suite, readOnly.ownsMemory());
+  String readOnlyCopy = readOnly;
+  EXPECT_FALSE(suite, readOnlyCopy.ownsMemory());
+  String readOnlyMoved = std::move(readOnlyCopy);
+  EXPECT_FALSE(suite, readOnlyMoved.ownsMemory());
+}
+
 static void testReadOnlyProvenanceAndMutableViews(TestSuite& suite)
 {
   String readOnly("read-only"_ctv);
@@ -338,6 +373,7 @@ int main()
   testCStringAndSecureReset(suite);
   testReserveFailurePreservesHeapState(suite);
   testReserveFailurePreservesMmapState(suite);
+  testOwnsMemoryTracksStorageProvenance(suite);
   testReadOnlyProvenanceAndMutableViews(suite);
 
   return suite.finish("string tests");
