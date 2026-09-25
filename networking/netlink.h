@@ -1,6 +1,9 @@
 // Copyright 2026 Victor Stewart
 // SPDX-License-Identifier: Apache-2.0
 #include <climits>
+#include <cerrno>
+#include <functional>
+#include <memory>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/veth.h>
@@ -18,6 +21,8 @@
 #include <networking/msg.h>
 #include <networking/pool.h>
 #include <networking/socket.h>
+#include <networking/ring.h>
+#include <networking/multiplexer.h>
 #include <ebpf/program.h>
 
 #pragma once
@@ -136,6 +141,18 @@ public:
     setsockopt(fd, SOL_NETLINK, NETLINK_EXT_ACK, &one, sizeof(one));
 
     bind();
+  }
+
+  // NetlinkStream keeps this raw descriptor outside SocketBase's fixed-file
+  // lifecycle.  Make explicit manual close idempotent so ResourceState can
+  // safely perform its no-Ring fallback retirement.
+  void close(void)
+  {
+    if (isFixedFile == false && fd >= 0)
+    {
+      ::close(fd);
+      fd = -1;
+    }
   }
 
   template <typename Consumer>
@@ -552,6 +569,43 @@ public:
   void detachXDPProgFromInterface(NetlinkMessage *request, uint32_t seq, int ifidx, uint32_t xdpflags)
   {
     modifyXDPProgOnInterface(request, seq, ifidx, -1, xdpflags & XDP_FLAGS_MODES);
+  }
+
+  template <typename Handler>
+  static bool visitCheckedMessages(struct msghdr *msg, uint32_t bytes, Handler&& handler)
+  {
+    if (msg == nullptr || msg->msg_iov == nullptr || msg->msg_iovlen == 0 ||
+        bytes > msg->msg_iov[0].iov_len)
+    {
+      return false;
+    }
+
+    uint32_t offset = 0;
+    while (offset < bytes)
+    {
+      if (bytes - offset < sizeof(struct nlmsghdr))
+      {
+        return false;
+      }
+
+      struct nlmsghdr *header = reinterpret_cast<struct nlmsghdr *>(
+          static_cast<uint8_t *>(msg->msg_iov[0].iov_base) + offset);
+      if (header->nlmsg_len < sizeof(struct nlmsghdr) || header->nlmsg_len > bytes - offset)
+      {
+        return false;
+      }
+
+      const uint32_t aligned = NLMSG_ALIGN(header->nlmsg_len);
+      if (aligned > bytes - offset)
+      {
+        return false;
+      }
+
+      handler(header);
+      offset += aligned;
+    }
+
+    return true;
   }
 
   template <typename Handler>
@@ -1481,28 +1535,116 @@ public:
 class NetlinkStream {
 public:
 
-  Pool<NetlinkMessage> messagePool {16};
-  Vector<NetlinkMessage *> pendingRequests;
+  struct AsyncFlushOptions {
+    uint32_t maxRequests = 16;
+    uint64_t timeoutMs = 10'000;
+    bool forceAsync = true;
+  };
 
-  NetlinkSocket socket;
+  using AsyncCompletion = std::function<void(int)>;
+  using AsyncResponseHandler = std::function<void(uint16_t, uint32_t, void *, uint32_t)>;
+
+private:
+  struct ResourceState {
+    // One stream response plus a bounded async batch and its receive buffer.
+    // Sixteen bounded requests, the synchronous response buffer, and one
+    // transaction receive buffer.
+    Pool<NetlinkMessage> messagePool {18};
+    NetlinkSocket socket;
+
+    ~ResourceState()
+    {
+      socket.close();
+    }
+  };
+
+  class AsyncResourceClose : public RingInterface {
+  private:
+    std::shared_ptr<ResourceState> resource;
+
+    explicit AsyncResourceClose(std::shared_ptr<ResourceState> value)
+        : resource(std::move(value))
+    {}
+
+  public:
+    static void begin(std::shared_ptr<ResourceState> resource)
+    {
+      AsyncResourceClose *owner = new AsyncResourceClose(std::move(resource));
+      RingDispatcher::installMultiplexee(&owner->resource->socket, owner);
+      Ring::queueClose(&owner->resource->socket, true);
+    }
+
+    void closeHandler(void *) override
+    {
+      RingDispatcher::eraseMultiplexee(&resource->socket);
+      delete this;
+    }
+  };
+
+  class AsyncFlush;
+  struct AsyncFlushControl {
+    AsyncFlush *flush = nullptr;
+    bool completed = false;
+    void cancel();
+  };
+  std::shared_ptr<ResourceState> resources;
+
+public:
+  class AsyncFlushHandle {
+  private:
+    std::shared_ptr<AsyncFlushControl> control;
+    explicit AsyncFlushHandle(std::shared_ptr<AsyncFlushControl> value) : control(std::move(value)) {}
+    friend class NetlinkStream;
+
+  public:
+    AsyncFlushHandle() = default;
+    bool valid() const { return control != nullptr && control->completed == false; }
+    void cancel() const { if (control) control->cancel(); }
+  };
+
+  Pool<NetlinkMessage>& messagePool;
+  Vector<NetlinkMessage *> pendingRequests;
+  bool requestAdmissionFailed = false;
+
+  NetlinkSocket& socket;
 
   NetlinkMessage *response = nullptr;
   uint32_t responseCursor = 0;
   uint32_t nPendingResponses = 0;
 
+private:
+  AsyncFlush *activeFlush = nullptr;
+  uint32_t nextAsyncSequence = 0;
+
+public:
+
   template <typename Requester>
-  void generateRequest(Requester&& requester)
+  bool generateRequest(Requester&& requester)
   {
+    if (activeFlush != nullptr)
+    {
+      return false;
+    }
     NetlinkMessage *request = messagePool.get();
+    if (request == nullptr)
+    {
+      requestAdmissionFailed = true;
+      return false;
+    }
 
     requester(request);
 
     pendingRequests.push_back(request);
+    return true;
   }
 
   template <typename Handler>
   void readResponse(Handler&& handler) // read one response
   {
+    if (activeFlush != nullptr)
+    {
+      return;
+    }
     if (responseCursor == 0)
     {
       response->setPayloadMax();
@@ -1533,6 +1675,10 @@ public:
 
   void flush(void)
   {
+    if (activeFlush != nullptr)
+    {
+      return;
+    }
     for (NetlinkMessage *request : pendingRequests)
     {
       if (socket.sendmsg(reinterpret_cast<struct msghdr *>(request)) < 0)
@@ -1552,6 +1698,10 @@ public:
 
   bool flushChecked(void)
   {
+    if (activeFlush != nullptr)
+    {
+      return false;
+    }
     bool ok = true;
 
     for (NetlinkMessage *request : pendingRequests)
@@ -1585,6 +1735,10 @@ public:
   template <typename Handler>
   bool readResponseChecked(Handler&& handler) // read one response and surface netlink errors
   {
+    if (activeFlush != nullptr)
+    {
+      return false;
+    }
     if (responseCursor == 0)
     {
       response->setPayloadMax();
@@ -1643,11 +1797,519 @@ public:
     return sent && received;
   }
 
+  AsyncFlushHandle flushAsync(AsyncCompletion completion,
+                              AsyncResponseHandler responseHandler,
+                              AsyncFlushOptions options);
+
+  AsyncFlushHandle flushAsync(AsyncCompletion completion,
+                              AsyncResponseHandler responseHandler = {})
+  {
+    return flushAsync(std::move(completion), std::move(responseHandler), AsyncFlushOptions{});
+  }
+
   NetlinkStream()
+      : resources(std::make_shared<ResourceState>()),
+        messagePool(resources->messagePool),
+        socket(resources->socket)
   {
     response = messagePool.get();
   }
+
+  ~NetlinkStream();
 };
+
+class NetlinkStream::AsyncFlush : public RingInterface {
+private:
+  static bool isDumpRequest(const struct nlmsghdr *header)
+  {
+    if ((header->nlmsg_flags & NLM_F_DUMP) != NLM_F_DUMP)
+    {
+      return false;
+    }
+
+    // NLM_F_ROOT/MATCH reuse the NEW-operation REPLACE/EXCL bit positions.
+    // Only RTNL GET requests therefore use them as a multipart dump request.
+    switch (header->nlmsg_type)
+    {
+      case RTM_GETLINK:
+      case RTM_GETADDR:
+      case RTM_GETROUTE:
+      case RTM_GETNEIGH:
+      case RTM_GETRULE:
+      case RTM_GETQDISC:
+      case RTM_GETTCLASS:
+      case RTM_GETTFILTER:
+      case RTM_GETACTION:
+      case RTM_GETNEIGHTBL:
+      case RTM_GETNSID:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  NetlinkStream *origin;
+  std::shared_ptr<ResourceState> resources;
+  std::shared_ptr<AsyncFlushControl> control;
+  AsyncCompletion completion;
+  AsyncResponseHandler responseHandler;
+  AsyncFlushOptions options;
+  Vector<NetlinkMessage *> requests;
+  NetlinkMessage *receiveBuffer = nullptr;
+  struct ResponseExpectation {
+    bool requiresDone = false;
+    bool requiresAck = false;
+  };
+  bytell_hash_map<uint32_t, ResponseExpectation> waitingForDone;
+  bytell_hash_set<uint32_t> settledSequences;
+  Vector<uint64_t> tickets;
+  TimeoutPacket timer;
+  bool timerArmed = false;
+  bool timerCancellationRequested = false;
+  bool resourceCloseQueued = false;
+  bool resourceCloseComplete = false;
+  uint32_t sendsOutstanding = 0;
+  uint64_t receiveTicket = 0;
+  int status = 0;
+  bool delivering = false;
+  bool dispatchingResponse = false;
+
+  void fail(int result)
+  {
+    if (status != 0)
+    {
+      return;
+    }
+    status = result < 0 ? result : -EPROTO;
+
+    for (uint64_t ticket : tickets)
+    {
+      Ring::queueCancelMsghdr(ticket);
+    }
+    if (receiveTicket != 0)
+    {
+      Ring::queueCancelMsghdr(receiveTicket);
+    }
+    cancelTimer();
+  }
+
+  void cancelTimer()
+  {
+    if (timerArmed && timerCancellationRequested == false)
+    {
+      timerCancellationRequested = true;
+      Ring::queueCancelTimeout(&timer);
+    }
+  }
+
+  void maybeDeliver()
+  {
+    if (delivering || dispatchingResponse || sendsOutstanding != 0 || receiveTicket != 0 || timerArmed)
+    {
+      return;
+    }
+    if (origin == nullptr && resourceCloseQueued == false && resources->socket.fd >= 0)
+    {
+      resourceCloseQueued = true;
+      RingDispatcher::installMultiplexee(&resources->socket, this);
+      Ring::queueClose(&resources->socket, true);
+      return;
+    }
+    if (resourceCloseQueued && resourceCloseComplete == false)
+    {
+      return;
+    }
+    if (status == 0 && waitingForDone.empty() == false)
+    {
+      return;
+    }
+
+    delivering = true;
+    control->flush = nullptr;
+    control->completed = true;
+    RingDispatcher::eraseMultiplexee(this);
+    RingDispatcher::eraseMultiplexee(&resources->socket);
+    for (NetlinkMessage *request : requests)
+    {
+      request->reset();
+      resources->messagePool.relinquish(request);
+    }
+    if (receiveBuffer)
+    {
+      receiveBuffer->reset();
+      resources->messagePool.relinquish(receiveBuffer);
+      receiveBuffer = nullptr;
+    }
+    if (origin && origin->activeFlush == this)
+    {
+      origin->activeFlush = nullptr;
+    }
+    AsyncCompletion delivered = std::move(completion);
+    const int result = status;
+    delete this;
+    if (delivered)
+    {
+      delivered(result);
+    }
+  }
+
+  void queueReceive()
+  {
+    if (status != 0 || receiveTicket != 0 || waitingForDone.empty())
+    {
+      maybeDeliver();
+      return;
+    }
+
+    receiveBuffer->setPayloadMax();
+    receiveTicket = Ring::queueRecvmsg(&resources->socket,
+                                        reinterpret_cast<struct msghdr *>(receiveBuffer),
+                                        this,
+                                        options.forceAsync);
+    if (receiveTicket == 0)
+    {
+      fail(-EBADF);
+      maybeDeliver();
+    }
+  }
+
+  void onResponse(struct msghdr *msg, int result)
+  {
+    receiveTicket = 0;
+    if (result <= 0)
+    {
+      fail(result == 0 ? -ECONNRESET : result);
+      maybeDeliver();
+      return;
+    }
+
+    bool protocolError = false;
+    dispatchingResponse = true;
+    const bool wellFormed = NetlinkSocket::visitCheckedMessages(
+        msg,
+        uint32_t(result),
+        [&](struct nlmsghdr *header) {
+          if (protocolError || status != 0)
+          {
+            return;
+          }
+          auto waiting = waitingForDone.find(header->nlmsg_seq);
+          if (waiting == waitingForDone.end())
+          {
+            if (header->nlmsg_type == NLMSG_ERROR &&
+                settledSequences.contains(header->nlmsg_seq) &&
+                header->nlmsg_len >= NLMSG_LENGTH(sizeof(struct nlmsgerr)) &&
+                static_cast<const struct nlmsgerr *>(NLMSG_DATA(header))->error == 0)
+            {
+              return;
+            }
+            protocolError = true;
+            return;
+          }
+
+          if (header->nlmsg_type == NLMSG_ERROR)
+          {
+            if (header->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr)))
+            {
+              protocolError = true;
+              return;
+            }
+            const auto *error = static_cast<const struct nlmsgerr *>(NLMSG_DATA(header));
+            if (error->error != 0)
+            {
+              fail(error->error);
+              return;
+            }
+            if (waiting->second.requiresDone == false)
+            {
+              settledSequences.insert(header->nlmsg_seq);
+              waitingForDone.erase(waiting);
+            }
+            return;
+          }
+
+          if (header->nlmsg_type == NLMSG_DONE)
+          {
+            if (header->nlmsg_flags & NLM_F_DUMP_INTR)
+            {
+              fail(-EINTR);
+              return;
+            }
+            if (waiting->second.requiresDone == false)
+            {
+              protocolError = true;
+              return;
+            }
+            if (header->nlmsg_len >= NLMSG_LENGTH(sizeof(int)))
+            {
+              const int doneError = *static_cast<const int *>(NLMSG_DATA(header));
+              if (doneError < 0)
+              {
+                fail(doneError);
+                return;
+              }
+            }
+            settledSequences.insert(header->nlmsg_seq);
+            waitingForDone.erase(waiting);
+            return;
+          }
+
+          if (header->nlmsg_flags & NLM_F_DUMP_INTR)
+          {
+            fail(-EINTR);
+            return;
+          }
+
+          if (responseHandler)
+          {
+            responseHandler(header->nlmsg_type,
+                            header->nlmsg_seq,
+                            NLMSG_DATA(header),
+                            header->nlmsg_len);
+          }
+          if (waiting->second.requiresDone == false && waiting->second.requiresAck == false)
+          {
+            settledSequences.insert(header->nlmsg_seq);
+            waitingForDone.erase(waiting);
+          }
+        });
+    dispatchingResponse = false;
+
+    if (wellFormed == false || protocolError)
+    {
+      fail(-EPROTO);
+    }
+    if (status != 0 || waitingForDone.empty())
+    {
+      cancelTimer();
+      maybeDeliver();
+      return;
+    }
+    queueReceive();
+  }
+
+  void armTimer()
+  {
+    if (options.timeoutMs == 0)
+    {
+      return;
+    }
+    timer.clear();
+    timer.setTimeoutMs(options.timeoutMs);
+    timer.originator = this;
+    Ring::queueTimeout(&timer);
+    timerArmed = true;
+  }
+
+public:
+  AsyncFlush(NetlinkStream *owner,
+             std::shared_ptr<ResourceState> resourceValues,
+             Vector<NetlinkMessage *> requestValues,
+             std::shared_ptr<AsyncFlushControl> state,
+             AsyncCompletion completionValue,
+             AsyncResponseHandler responseValue,
+             AsyncFlushOptions optionsValue)
+      : origin(owner),
+        resources(std::move(resourceValues)),
+        control(std::move(state)),
+        completion(std::move(completionValue)),
+        responseHandler(std::move(responseValue)),
+        options(optionsValue),
+        requests(std::move(requestValues))
+  {}
+
+  void begin()
+  {
+    receiveBuffer = resources->messagePool.get();
+    if (receiveBuffer == nullptr)
+    {
+      status = -ENOBUFS;
+      maybeDeliver();
+      return;
+    }
+    RingDispatcher::installMultiplexee(this, this);
+    armTimer();
+
+    for (NetlinkMessage *request : requests)
+    {
+      if (request->payloadLen() < sizeof(struct nlmsghdr))
+      {
+        fail(-EINVAL);
+        break;
+      }
+      struct nlmsghdr *header = reinterpret_cast<struct nlmsghdr *>(request->data);
+      if (header->nlmsg_len < sizeof(struct nlmsghdr) || header->nlmsg_len > request->payloadLen())
+      {
+        fail(-EINVAL);
+        break;
+      }
+      ++origin->nextAsyncSequence;
+      if (origin->nextAsyncSequence == 0)
+      {
+        ++origin->nextAsyncSequence;
+      }
+      header->nlmsg_seq = origin->nextAsyncSequence;
+      waitingForDone.insert_or_assign(header->nlmsg_seq, ResponseExpectation {
+          .requiresDone = isDumpRequest(header),
+          .requiresAck = (header->nlmsg_flags & NLM_F_ACK) != 0
+      });
+      ++sendsOutstanding;
+      uint64_t ticket = Ring::queueSendmsg(&resources->socket,
+                                            reinterpret_cast<struct msghdr *>(request),
+                                            this,
+                                            options.forceAsync);
+      if (ticket == 0)
+      {
+        --sendsOutstanding;
+        fail(-EBADF);
+        break;
+      }
+      tickets.push_back(ticket);
+    }
+    if (status != 0)
+    {
+      maybeDeliver();
+    }
+  }
+
+  void cancel()
+  {
+    fail(-ECANCELED);
+    maybeDeliver();
+  }
+
+  void detach()
+  {
+    completion = {};
+    responseHandler = {};
+    if (origin && origin->activeFlush == this)
+    {
+      origin->activeFlush = nullptr;
+    }
+    origin = nullptr;
+    fail(-ECANCELED);
+    maybeDeliver();
+  }
+
+  void sendmsgHandler(void *, struct msghdr *msg, int result) override
+  {
+    if (sendsOutstanding > 0)
+    {
+      --sendsOutstanding;
+    }
+    if (result < 0)
+    {
+      fail(result);
+    }
+    else if (msg == nullptr || msg->msg_iov == nullptr || msg->msg_iovlen == 0 ||
+             uint64_t(result) != msg->msg_iov[0].iov_len)
+    {
+      fail(-EIO);
+    }
+    if (sendsOutstanding == 0)
+    {
+      if (status == 0)
+      {
+        queueReceive();
+      }
+      else
+      {
+        maybeDeliver();
+      }
+    }
+  }
+
+  void recvmsgHandler(void *, struct msghdr *msg, int result) override
+  {
+    onResponse(msg, result);
+  }
+
+  void timeoutHandler(TimeoutPacket *, int result) override
+  {
+    timerArmed = false;
+    timerCancellationRequested = false;
+    if (result == -ETIME && status == 0)
+    {
+      fail(-ETIMEDOUT);
+    }
+    maybeDeliver();
+  }
+
+  void closeHandler(void *) override
+  {
+    resourceCloseComplete = true;
+    maybeDeliver();
+  }
+};
+
+inline void NetlinkStream::AsyncFlushControl::cancel()
+{
+  if (flush && completed == false)
+  {
+    flush->cancel();
+  }
+}
+
+inline NetlinkStream::AsyncFlushHandle NetlinkStream::flushAsync(
+    AsyncCompletion completion,
+    AsyncResponseHandler responseHandler,
+    AsyncFlushOptions options)
+{
+  if (activeFlush != nullptr)
+  {
+    if (completion) completion(-EBUSY);
+    return {};
+  }
+  if (nPendingResponses != 0 || responseCursor != 0)
+  {
+    if (completion) completion(-EBUSY);
+    return {};
+  }
+  if (requestAdmissionFailed)
+  {
+    if (completion) completion(-ENOBUFS);
+    return {};
+  }
+  if (options.maxRequests == 0 || options.maxRequests > 16 || pendingRequests.size() > options.maxRequests)
+  {
+    if (completion) completion(-E2BIG);
+    return {};
+  }
+  if (pendingRequests.empty())
+  {
+    if (completion) completion(0);
+    return {};
+  }
+
+  if (socket.fd < 0)
+  {
+    if (completion) completion(-EBADF);
+    return {};
+  }
+
+  Vector<NetlinkMessage *> requests = std::move(pendingRequests);
+  pendingRequests.clear();
+
+  auto control = std::make_shared<AsyncFlushControl>();
+  AsyncFlush *flush = new AsyncFlush(this, resources, std::move(requests), control, std::move(completion), std::move(responseHandler), options);
+  control->flush = flush;
+  activeFlush = flush;
+  flush->begin();
+  return AsyncFlushHandle(std::move(control));
+}
+
+inline NetlinkStream::~NetlinkStream()
+{
+  if (activeFlush)
+  {
+    activeFlush->detach();
+  }
+  else if (resources && resources->socket.fd >= 0 &&
+           Ring::getRingFD() > 0 && Ring::shuttingDown == false)
+  {
+    AsyncResourceClose::begin(std::move(resources));
+  }
+}
 
 class NetDevice : public NetlinkStream {
 private:
@@ -1833,6 +2495,15 @@ public:
     flushDiscard();
   }
 
+  NetlinkStream::AsyncFlushHandle bringUpAsync(NetlinkStream::AsyncCompletion completion,
+                                               NetlinkStream::AsyncFlushOptions options = {})
+  {
+    generateRequest([&](NetlinkMessage *request) -> void {
+      socket.bringUpInterface(request, 0, ifidx);
+    });
+    return flushAsync(std::move(completion), {}, options);
+  }
+
   bool setMTU(uint32_t value)
   {
     if (ifidx == 0 || value == 0)
@@ -1871,6 +2542,42 @@ public:
 
     mtu = mtuValue;
     return true;
+  }
+
+  NetlinkStream::AsyncFlushHandle setPacketBudgetAsync(
+      uint32_t mtuValue,
+      uint32_t gsoMaxSegs,
+      NetlinkStream::AsyncCompletion completion,
+      NetlinkStream::AsyncFlushOptions options = {})
+  {
+    if (ifidx == 0 || mtuValue == 0)
+    {
+      if (completion) completion(-EINVAL);
+      return {};
+    }
+
+    generateRequest([&](NetlinkMessage *request) -> void {
+      socket.setInterfacePacketBudget(request, 0, ifidx, mtuValue, gsoMaxSegs);
+    });
+    return flushAsync(
+        [this, mtuValue, completion = std::move(completion)](int result) mutable {
+          if (result == 0)
+          {
+            mtu = mtuValue;
+          }
+          if (completion) completion(result);
+        },
+        {},
+        options);
+  }
+
+  NetlinkStream::AsyncFlushHandle setPacketBudgetAsync(
+      uint32_t mtuValue,
+      NetlinkStream::AsyncCompletion completion,
+      uint32_t gsoMaxSegs = 0,
+      NetlinkStream::AsyncFlushOptions options = {})
+  {
+    return setPacketBudgetAsync(mtuValue, gsoMaxSegs, std::move(completion), options);
   }
 
   void addIP(StringType auto&& address, uint8_t cidr, int ip_version)
@@ -1993,16 +2700,66 @@ public:
     }
   }
 
-  void moveSocketToNamespace(int netnsfd, int hostnetnsfd)
+  NetlinkStream::AsyncFlushHandle getInfoAsync(NetlinkStream::AsyncCompletion completion,
+                                               NetlinkStream::AsyncFlushOptions options = {})
+  {
+    ifidx = 0;
+    mtu = 0;
+    memset(mac, 0, sizeof(mac));
+    if (name.size() == 0)
+    {
+      if (completion) completion(-EINVAL);
+      return {};
+    }
+
+    generateRequest([&](NetlinkMessage *request) -> void {
+      socket.getInterface(request, 0, name);
+    });
+    return flushAsync(
+        std::move(completion),
+        [this](uint16_t, uint32_t, void *data, uint32_t length) {
+          if (data == nullptr || length < NLMSG_LENGTH(sizeof(struct ifinfomsg)))
+          {
+            return;
+          }
+          struct ifinfomsg *ifm = static_cast<struct ifinfomsg *>(data);
+          ifidx = ifm->ifi_index;
+          NetlinkSocket::parseAttributes(IFLA_RTA(ifm),
+              int(length - NLMSG_LENGTH(sizeof(struct ifinfomsg))),
+              [this](int type, void *attribute) {
+                if (type == IFLA_ADDRESS)
+                {
+                  memcpy(mac, attribute, sizeof(mac));
+                }
+                else if (type == IFLA_MTU)
+                {
+                  mtu = *static_cast<uint32_t *>(attribute);
+                }
+              });
+        },
+        options);
+  }
+
+  bool moveSocketToNamespace(int netnsfd, int hostnetnsfd)
   {
     if (setns(netnsfd, CLONE_NEWNET) != 0)
     {
-      return;
+      return false;
     }
 
     socket.recreateSocket();
-    socket.configure();
-    setns(hostnetnsfd, CLONE_NEWNET);
+    const bool recreated = socket.fd >= 0;
+    if (recreated)
+    {
+      socket.configure();
+    }
+    if (setns(hostnetnsfd, CLONE_NEWNET) != 0)
+    {
+      // Continuing on the peer namespace would make subsequent Ring work run
+      // against the wrong network namespace.
+      std::abort();
+    }
+    return recreated;
   }
 
   void thisNamespace(void)
@@ -2061,6 +2818,35 @@ public:
         });
       }
     });
+  }
+
+  NetlinkStream::AsyncFlushHandle getInfoAsync(NetlinkStream::AsyncCompletion completion,
+                                               NetlinkStream::AsyncFlushOptions options = {})
+  {
+    host.ifidx = 0;
+    peer.ifidx = 0;
+    generateRequest([&](NetlinkMessage *request) -> void {
+      socket.getInterface(request, 0, host.name);
+    });
+    return flushAsync(
+        std::move(completion),
+        [this](uint16_t, uint32_t, void *data, uint32_t length) {
+          if (data == nullptr || length < NLMSG_LENGTH(sizeof(struct ifinfomsg)))
+          {
+            return;
+          }
+          struct ifinfomsg *ifm = static_cast<struct ifinfomsg *>(data);
+          host.ifidx = ifm->ifi_index;
+          NetlinkSocket::parseAttributes(IFLA_RTA(ifm),
+              int(length - NLMSG_LENGTH(sizeof(struct ifinfomsg))),
+              [this](int type, void *attribute) {
+                if (type == IFLA_LINK)
+                {
+                  peer.ifidx = *static_cast<uint32_t *>(attribute);
+                }
+              });
+        },
+        options);
   }
 
   void destroyPair(void)

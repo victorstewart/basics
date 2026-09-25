@@ -5,6 +5,9 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
+#include <chrono>
+#include <iostream>
+#include <thread>
 #include <linux/if_link.h>
 #include <linux/net_namespace.h>
 #include <linux/rtnetlink.h>
@@ -429,6 +432,600 @@ static void testHandleMessageParsing(TestSuite& suite)
   EXPECT_EQ(suite, multipartCalls, 1);
   EXPECT_EQ(suite, multipartRetrySeq, uint32_t(UINT32_MAX));
   EXPECT_EQ(suite, multipartOffset, multipartMessage.payloadLen());
+
+  NetlinkMessage malformedMessage;
+  appendFrame(malformedMessage, RTM_NEWLINK, 0, 37, nullptr, 0);
+  headerOf(malformedMessage)->nlmsg_len = sizeof(struct nlmsghdr) - 1;
+  int malformedCalls = 0;
+  EXPECT_FALSE(suite, NetlinkSocket::visitCheckedMessages(
+                          reinterpret_cast<struct msghdr *>(&malformedMessage),
+                          malformedMessage.payloadLen(),
+                          [&](struct nlmsghdr *) { ++malformedCalls; }));
+  EXPECT_EQ(suite, malformedCalls, 0);
+}
+
+static void queueAsyncAckRequest(NetlinkStream& stream, uint16_t type = RTM_NEWLINK, uint16_t flags = NLM_F_ACK)
+{
+  stream.generateRequest([=](NetlinkMessage *request) -> void {
+    appendFrame(*request, type, uint16_t(NLM_F_REQUEST | flags), 0, nullptr, 0);
+  });
+}
+
+static void testAsyncFlushBoundsAndDelayedOutOfOrderAcks(TestSuite& suite)
+{
+  NetlinkStream bounded;
+  queueAsyncAckRequest(bounded);
+  queueAsyncAckRequest(bounded);
+  int boundedStatus = 0;
+  NetlinkStream::AsyncFlushOptions boundedOptions = {};
+  boundedOptions.maxRequests = 1;
+  const auto boundedHandle = bounded.flushAsync([&](int status) { boundedStatus = status; }, {}, boundedOptions);
+  EXPECT_FALSE(suite, boundedHandle.valid());
+  EXPECT_EQ(suite, boundedStatus, -E2BIG);
+
+  int descriptors[2] = {-1, -1};
+  EXPECT_EQ(suite, socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, descriptors), 0);
+  if (descriptors[0] < 0 || descriptors[1] < 0)
+  {
+    return;
+  }
+
+  NetlinkStream stream;
+  stream.socket.close();
+  stream.socket.fd = descriptors[0];
+  stream.socket.isFixedFile = false;
+  stream.socket.isNonBlocking = true;
+  queueAsyncAckRequest(stream);
+  queueAsyncAckRequest(stream, RTM_GETLINK, NLM_F_DUMP);
+
+  struct Scenario final : RingInterface {
+    TestSuite& suite;
+    TimeoutPacket sample;
+    TimeoutPacket earlyCompletionProbe;
+    TimeoutPacket guard;
+    uint32_t samples = 0;
+    uint32_t completions = 0;
+    int completionStatus = -1;
+    bool completedEarly = false;
+    bool guardFired = false;
+    uint32_t responseMessages = 0;
+    std::chrono::steady_clock::time_point lastSample = std::chrono::steady_clock::now();
+    std::vector<int64_t> sampleIntervalsUs;
+
+    explicit Scenario(TestSuite& value) : suite(value)
+    {
+      sample.setTimeoutMs(2);
+      earlyCompletionProbe.setTimeoutMs(20);
+      guard.setTimeoutMs(1000);
+      sample.originator = this;
+      earlyCompletionProbe.originator = this;
+      guard.originator = this;
+    }
+
+    void timeoutHandler(TimeoutPacket *packet, int result) override
+    {
+      if (result != -ETIME)
+      {
+        return;
+      }
+      if (packet == &sample)
+      {
+        const auto now = std::chrono::steady_clock::now();
+        sampleIntervalsUs.push_back(std::chrono::duration_cast<std::chrono::microseconds>(now - lastSample).count());
+        lastSample = now;
+        ++samples;
+        if (completions == 0 || samples < 30)
+        {
+          Ring::queueTimeout(&sample);
+        }
+        else
+        {
+          Ring::exit = true;
+        }
+        return;
+      }
+      if (packet == &earlyCompletionProbe)
+      {
+        completedEarly = completions != 0;
+        return;
+      }
+      if (packet == &guard)
+      {
+        guardFired = true;
+        Ring::exit = true;
+      }
+    }
+  } scenario(suite);
+
+  std::thread peer([peerFD = descriptors[1]] {
+    uint32_t sequences[2] = {};
+    for (uint32_t index = 0; index < 2; ++index)
+    {
+      uint8_t bytes[4096] = {};
+      ssize_t received = -1;
+      for (uint32_t attempts = 0; attempts < 1000 && received < 0; ++attempts)
+      {
+        received = recv(peerFD, bytes, sizeof(bytes), 0);
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+      if (received >= ssize_t(sizeof(struct nlmsghdr)))
+      {
+        sequences[index] = reinterpret_cast<const struct nlmsghdr *>(bytes)->nlmsg_seq;
+      }
+    }
+
+    // This is a wall-clock peer delay.  The test records only actual Ring timer
+    // callbacks; it does not treat the injected delay as CPU work.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    NetlinkMessage dumpReply;
+    struct ifinfomsg link = {};
+    link.ifi_index = 41;
+    appendFrame(dumpReply, RTM_NEWLINK, NLM_F_MULTI, sequences[1], &link, sizeof(link));
+    appendFrame(dumpReply, NLMSG_DONE, NLM_F_MULTI, sequences[1], nullptr, 0);
+    (void)send(peerFD, dumpReply.payload(), dumpReply.payloadLen(), 0);
+    NetlinkMessage ackReply;
+    struct nlmsgerr ack = {};
+    appendFrame(ackReply, NLMSG_ERROR, 0, sequences[0], &ack, sizeof(ack));
+    (void)send(peerFD, ackReply.payload(), ackReply.payloadLen(), 0);
+    close(peerFD);
+  });
+
+  RingDispatcher dispatcher;
+  RingDispatcher::installMultiplexee(&scenario, &scenario);
+  Ring::interfacer = &dispatcher;
+  Ring::lifecycler = &dispatcher;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(64, 128, 8, 2, -1, -1, 8);
+  Ring::queueTimeout(&scenario.sample);
+  Ring::queueTimeout(&scenario.earlyCompletionProbe);
+  Ring::queueTimeout(&scenario.guard);
+
+  const auto handle = stream.flushAsync([&](int status) {
+    ++scenario.completions;
+    scenario.completionStatus = status;
+    if (scenario.samples >= 30)
+    {
+      Ring::exit = true;
+    }
+  }, [&](uint16_t type, uint32_t sequence, void *data, uint32_t) {
+    if (type == RTM_NEWLINK && sequence != 0 && data != nullptr)
+    {
+      ++scenario.responseMessages;
+    }
+  });
+  EXPECT_TRUE(suite, handle.valid());
+  Ring::start();
+  Ring::shutdownForExec();
+  peer.join();
+  RingDispatcher::eraseMultiplexee(&scenario);
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  close(descriptors[0]);
+  stream.socket.fd = -1;
+
+  EXPECT_FALSE(suite, scenario.guardFired);
+  EXPECT_FALSE(suite, scenario.completedEarly);
+  EXPECT_EQ(suite, scenario.completions, uint32_t(1));
+  EXPECT_EQ(suite, scenario.completionStatus, 0);
+  EXPECT_EQ(suite, scenario.responseMessages, uint32_t(1));
+  EXPECT_TRUE(suite, scenario.samples >= 30);
+  if (scenario.sampleIntervalsUs.size() >= 30)
+  {
+    std::cout << "{\"netlink_async_raw_us\":[";
+    for (size_t i = 0; i < scenario.sampleIntervalsUs.size(); ++i)
+    {
+      if (i) std::cout << ',';
+      std::cout << scenario.sampleIntervalsUs[i];
+    }
+    std::cout << "]}\n";
+    std::sort(scenario.sampleIntervalsUs.begin(), scenario.sampleIntervalsUs.end());
+    const size_t percentile95 = (scenario.sampleIntervalsUs.size() * 95 + 99) / 100 - 1;
+    EXPECT_TRUE(suite, scenario.sampleIntervalsUs[percentile95] <= 3000);
+    EXPECT_TRUE(suite, scenario.sampleIntervalsUs.back() <= 20'000);
+    std::cout << "{\"netlink_async\":{\"samples\":" << scenario.sampleIntervalsUs.size()
+              << ",\"p95_us\":" << scenario.sampleIntervalsUs[percentile95]
+              << ",\"max_us\":" << scenario.sampleIntervalsUs.back() << "}}\n";
+  }
+}
+
+static void testSynchronousFlushBaselineStallsDelayedAck(TestSuite& suite)
+{
+  int descriptors[2] = {-1, -1};
+  EXPECT_EQ(suite, socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, descriptors), 0);
+  if (descriptors[0] < 0 || descriptors[1] < 0) return;
+  NetlinkStream stream;
+  stream.socket.close();
+  stream.socket.fd = descriptors[0];
+  const int socketFlags = fcntl(descriptors[0], F_GETFL, 0);
+  EXPECT_TRUE(suite, socketFlags >= 0);
+  if (socketFlags >= 0) EXPECT_EQ(suite, fcntl(descriptors[0], F_SETFL, socketFlags & ~O_NONBLOCK), 0);
+  stream.socket.isNonBlocking = false;
+  queueAsyncAckRequest(stream);
+  std::thread peer([fd = descriptors[1]] {
+    uint8_t request[4096] = {};
+    while (recv(fd, request, sizeof(request), 0) < ssize_t(sizeof(struct nlmsghdr)))
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    NetlinkMessage reply;
+    struct nlmsgerr ack = {};
+    appendFrame(reply, NLMSG_ERROR, 0, reinterpret_cast<struct nlmsghdr *>(request)->nlmsg_seq, &ack, sizeof(ack));
+    (void)send(fd, reply.payload(), reply.payloadLen(), 0);
+    close(fd);
+  });
+  const auto begin = std::chrono::steady_clock::now();
+  const bool completed = stream.flushDiscardChecked();
+  const auto elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+  peer.join();
+  close(descriptors[0]);
+  stream.socket.fd = -1;
+  EXPECT_TRUE(suite, completed);
+  EXPECT_TRUE(suite, elapsedUs >= 80'000);
+  std::cout << "{\"netlink_sync_baseline\":{\"timer_samples\":0,\"blocked_us\":" << elapsedUs << "}}\n";
+}
+
+static void testAsyncFlushCancellationAndTimeout(TestSuite& suite)
+{
+  struct Scenario final : RingInterface {
+    TimeoutPacket guard;
+    uint32_t callbacks = 0;
+    int status = 0;
+    bool guardFired = false;
+
+    Scenario()
+    {
+      guard.setTimeoutMs(500);
+      guard.originator = this;
+    }
+
+    void timeoutHandler(TimeoutPacket *packet, int result) override
+    {
+      if (packet == &guard && result == -ETIME)
+      {
+        guardFired = true;
+        Ring::exit = true;
+      }
+    }
+  } scenario;
+
+  int descriptors[2] = {-1, -1};
+  EXPECT_EQ(suite, socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, descriptors), 0);
+  if (descriptors[0] < 0 || descriptors[1] < 0) return;
+  NetlinkStream stream;
+  stream.socket.close();
+  stream.socket.fd = descriptors[0];
+  stream.socket.isNonBlocking = true;
+  queueAsyncAckRequest(stream);
+
+  RingDispatcher dispatcher;
+  RingDispatcher::installMultiplexee(&scenario, &scenario);
+  Ring::interfacer = &dispatcher;
+  Ring::lifecycler = &dispatcher;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(64, 128, 8, 2, -1, -1, 8);
+  Ring::queueTimeout(&scenario.guard);
+  auto handle = stream.flushAsync([&](int status) {
+    ++scenario.callbacks;
+    scenario.status = status;
+    Ring::exit = true;
+  }, {}, {.timeoutMs = 1000});
+  EXPECT_TRUE(suite, handle.valid());
+  handle.cancel();
+  Ring::start();
+  Ring::shutdownForExec();
+  RingDispatcher::eraseMultiplexee(&scenario);
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  close(descriptors[0]);
+  close(descriptors[1]);
+  stream.socket.fd = -1;
+  EXPECT_FALSE(suite, scenario.guardFired);
+  EXPECT_EQ(suite, scenario.callbacks, uint32_t(1));
+  EXPECT_EQ(suite, scenario.status, -ECANCELED);
+
+  descriptors[0] = descriptors[1] = -1;
+  EXPECT_EQ(suite, socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, descriptors), 0);
+  if (descriptors[0] < 0 || descriptors[1] < 0) return;
+  Scenario timeoutScenario;
+  NetlinkStream timeoutStream;
+  timeoutStream.socket.close();
+  timeoutStream.socket.fd = descriptors[0];
+  timeoutStream.socket.isNonBlocking = true;
+  queueAsyncAckRequest(timeoutStream);
+  RingDispatcher timeoutDispatcher;
+  RingDispatcher::installMultiplexee(&timeoutScenario, &timeoutScenario);
+  Ring::interfacer = &timeoutDispatcher;
+  Ring::lifecycler = &timeoutDispatcher;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(64, 128, 8, 2, -1, -1, 8);
+  Ring::queueTimeout(&timeoutScenario.guard);
+  const auto timeoutHandle = timeoutStream.flushAsync([&](int status) {
+    ++timeoutScenario.callbacks;
+    timeoutScenario.status = status;
+    Ring::exit = true;
+  }, {}, {.timeoutMs = 20});
+  EXPECT_TRUE(suite, timeoutHandle.valid());
+  Ring::start();
+  Ring::shutdownForExec();
+  RingDispatcher::eraseMultiplexee(&timeoutScenario);
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  close(descriptors[0]);
+  close(descriptors[1]);
+  timeoutStream.socket.fd = -1;
+  EXPECT_FALSE(suite, timeoutScenario.guardFired);
+  EXPECT_EQ(suite, timeoutScenario.callbacks, uint32_t(1));
+  EXPECT_EQ(suite, timeoutScenario.status, -ETIMEDOUT);
+}
+
+static void testAsyncFlushNegativeAck(TestSuite& suite)
+{
+  int descriptors[2] = {-1, -1};
+  EXPECT_EQ(suite, socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, descriptors), 0);
+  if (descriptors[0] < 0 || descriptors[1] < 0) return;
+  NetlinkStream stream;
+  stream.socket.close();
+  stream.socket.fd = descriptors[0];
+  stream.socket.isNonBlocking = true;
+  queueAsyncAckRequest(stream);
+
+  struct Scenario final : RingInterface {
+    TimeoutPacket guard;
+    bool guardFired = false;
+    Scenario() { guard.setTimeoutMs(500); guard.originator = this; }
+    void timeoutHandler(TimeoutPacket *packet, int result) override
+    {
+      if (packet == &guard && result == -ETIME) { guardFired = true; Ring::exit = true; }
+    }
+  } scenario;
+  std::thread peer([fd = descriptors[1]] {
+    uint8_t request[4096] = {};
+    for (;;)
+    {
+      ssize_t received = recv(fd, request, sizeof(request), 0);
+      if (received >= ssize_t(sizeof(struct nlmsghdr)))
+      {
+        NetlinkMessage reply;
+        struct nlmsgerr error = {};
+        error.error = -EPERM;
+        appendFrame(reply, NLMSG_ERROR, 0, reinterpret_cast<struct nlmsghdr *>(request)->nlmsg_seq, &error, sizeof(error));
+        (void)send(fd, reply.payload(), reply.payloadLen(), 0);
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    close(fd);
+  });
+  uint32_t callbacks = 0;
+  int status = 0;
+  RingDispatcher dispatcher;
+  RingDispatcher::installMultiplexee(&scenario, &scenario);
+  Ring::interfacer = &dispatcher;
+  Ring::lifecycler = &dispatcher;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(64, 128, 8, 2, -1, -1, 8);
+  Ring::queueTimeout(&scenario.guard);
+  const auto handle = stream.flushAsync([&](int result) { ++callbacks; status = result; Ring::exit = true; });
+  EXPECT_TRUE(suite, handle.valid());
+  Ring::start();
+  Ring::shutdownForExec();
+  peer.join();
+  RingDispatcher::eraseMultiplexee(&scenario);
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  close(descriptors[0]);
+  stream.socket.fd = -1;
+  EXPECT_FALSE(suite, scenario.guardFired);
+  EXPECT_EQ(suite, callbacks, uint32_t(1));
+  EXPECT_EQ(suite, status, -EPERM);
+}
+
+static void testAsyncFlushDumpTerminalErrors(TestSuite& suite)
+{
+  const auto run = [&](int doneError, bool interrupted, int expected) {
+    int descriptors[2] = {-1, -1};
+    EXPECT_EQ(suite, socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, descriptors), 0);
+    if (descriptors[0] < 0 || descriptors[1] < 0) return;
+    NetlinkStream stream;
+    stream.socket.close();
+    stream.socket.fd = descriptors[0];
+    stream.socket.isNonBlocking = true;
+    queueAsyncAckRequest(stream, RTM_GETLINK, NLM_F_DUMP);
+    struct Stopper final : RingInterface {
+      TimeoutPacket guard;
+      Stopper() { guard.setTimeoutMs(500); guard.originator = this; }
+      void timeoutHandler(TimeoutPacket *packet, int result) override { if (packet == &guard && result == -ETIME) Ring::exit = true; }
+    } stopper;
+    std::thread peer([fd = descriptors[1], doneError, interrupted] {
+      uint8_t request[4096] = {};
+      while (recv(fd, request, sizeof(request), 0) < ssize_t(sizeof(struct nlmsghdr)))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      NetlinkMessage reply;
+      const int error = doneError;
+      appendFrame(reply, NLMSG_DONE, interrupted ? NLM_F_DUMP_INTR : 0,
+                  reinterpret_cast<struct nlmsghdr *>(request)->nlmsg_seq,
+                  doneError == 0 ? nullptr : &error, doneError == 0 ? 0 : sizeof(error));
+      (void)send(fd, reply.payload(), reply.payloadLen(), 0);
+      close(fd);
+    });
+    uint32_t callbacks = 0;
+    int status = 0;
+    RingDispatcher dispatcher;
+    RingDispatcher::installMultiplexee(&stopper, &stopper);
+    Ring::interfacer = &dispatcher;
+    Ring::lifecycler = &dispatcher;
+    Ring::exit = false;
+    Ring::shuttingDown = false;
+    Ring::createRing(64, 128, 8, 2, -1, -1, 8);
+    Ring::queueTimeout(&stopper.guard);
+    const auto handle = stream.flushAsync([&](int result) { ++callbacks; status = result; Ring::exit = true; });
+    EXPECT_TRUE(suite, handle.valid());
+    Ring::start();
+    Ring::shutdownForExec();
+    peer.join();
+    RingDispatcher::eraseMultiplexee(&stopper);
+    Ring::interfacer = nullptr;
+    Ring::lifecycler = nullptr;
+    Ring::exit = false;
+    Ring::shuttingDown = false;
+    close(descriptors[0]);
+    stream.socket.fd = -1;
+    EXPECT_EQ(suite, callbacks, uint32_t(1));
+    EXPECT_EQ(suite, status, expected);
+  };
+  run(-EIO, false, -EIO);
+  run(0, true, -EINTR);
+}
+
+static void testAsyncFlushStreamDestructionDrainsOutstandingCQEs(TestSuite& suite)
+{
+  int descriptors[2] = {-1, -1};
+  EXPECT_EQ(suite, socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, descriptors), 0);
+  if (descriptors[0] < 0 || descriptors[1] < 0) return;
+  struct Stopper final : RingInterface {
+    TimeoutPacket guard;
+    Stopper() { guard.setTimeoutMs(40); guard.originator = this; }
+    void timeoutHandler(TimeoutPacket *packet, int result) override { if (packet == &guard && result == -ETIME) Ring::exit = true; }
+  } stopper;
+  bool callbackFired = false;
+  RingDispatcher dispatcher;
+  RingDispatcher::installMultiplexee(&stopper, &stopper);
+  Ring::interfacer = &dispatcher;
+  Ring::lifecycler = &dispatcher;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(64, 128, 8, 2, -1, -1, 8);
+  Ring::queueTimeout(&stopper.guard);
+  {
+    NetlinkStream stream;
+    stream.socket.close();
+    stream.socket.fd = descriptors[0];
+    stream.socket.isNonBlocking = true;
+    queueAsyncAckRequest(stream);
+    const auto handle = stream.flushAsync([&](int) { callbackFired = true; }, {}, {.timeoutMs = 1000});
+    EXPECT_TRUE(suite, handle.valid());
+  }
+  Ring::start();
+  Ring::shutdownForExec();
+  RingDispatcher::eraseMultiplexee(&stopper);
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  close(descriptors[1]);
+  EXPECT_FALSE(suite, callbackFired);
+}
+
+static void testReadonlyLoopbackGetInfoAsyncMatchesSync(TestSuite& suite)
+{
+  const unsigned int loopbackIndex = if_nametoindex("lo");
+  if (loopbackIndex == 0) return;
+  NetDevice synchronous;
+  synchronous.name = "lo"_ctv;
+  synchronous.socket.configure();
+  synchronous.getInfo();
+  EXPECT_EQ(suite, synchronous.ifidx, uint32_t(loopbackIndex));
+
+  NetDevice asynchronous;
+  asynchronous.name = "lo"_ctv;
+  asynchronous.socket.configure();
+  struct Stopper final : RingInterface {
+    TimeoutPacket guard;
+    Stopper() { guard.setTimeoutMs(2000); guard.originator = this; }
+    void timeoutHandler(TimeoutPacket *packet, int result) override { if (packet == &guard && result == -ETIME) Ring::exit = true; }
+  } stopper;
+  int callbacks = 0;
+  int status = -1;
+  RingDispatcher dispatcher;
+  RingDispatcher::installMultiplexee(&stopper, &stopper);
+  Ring::interfacer = &dispatcher;
+  Ring::lifecycler = &dispatcher;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(64, 128, 8, 2, -1, -1, 8);
+  Ring::queueTimeout(&stopper.guard);
+  const auto handle = asynchronous.getInfoAsync([&](int result) { ++callbacks; status = result; Ring::exit = true; });
+  EXPECT_TRUE(suite, handle.valid());
+  Ring::start();
+  Ring::shutdownForExec();
+  RingDispatcher::eraseMultiplexee(&stopper);
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  EXPECT_EQ(suite, callbacks, 1);
+  EXPECT_EQ(suite, status, 0);
+  EXPECT_EQ(suite, asynchronous.ifidx, synchronous.ifidx);
+  EXPECT_EQ(suite, asynchronous.mtu, synchronous.mtu);
+}
+
+static void testAsyncResponseCanDestroyItsStream(TestSuite& suite)
+{
+  int descriptors[2] = {-1, -1};
+  EXPECT_EQ(suite, socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, descriptors), 0);
+  if (descriptors[0] < 0 || descriptors[1] < 0) return;
+  struct Stopper final : RingInterface {
+    TimeoutPacket guard;
+    Stopper() { guard.setTimeoutMs(100); guard.originator = this; }
+    void timeoutHandler(TimeoutPacket *, int result) override { if (result == -ETIME) Ring::exit = true; }
+  } stopper;
+  RingDispatcher dispatcher;
+  RingDispatcher::installMultiplexee(&stopper, &stopper);
+  Ring::interfacer = &dispatcher;
+  Ring::lifecycler = &dispatcher;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  Ring::createRing(64, 128, 8, 2, -1, -1, 8);
+  Ring::queueTimeout(&stopper.guard);
+  auto stream = std::make_unique<NetlinkStream>();
+  stream->socket.close();
+  stream->socket.fd = descriptors[0];
+  queueAsyncAckRequest(*stream, RTM_GETLINK, 0);
+  uint32_t responses = 0, completions = 0;
+  const auto handle = stream->flushAsync([&](int) { ++completions; },
+      [&](uint16_t, uint32_t, void *, uint32_t) { ++responses; stream.reset(); });
+  std::thread peer([fd = descriptors[1]] {
+    uint8_t bytes[4096] = {};
+    ssize_t size = -1;
+    for (unsigned attempt = 0; attempt < 100 && size < 0; ++attempt)
+    {
+      size = recv(fd, bytes, sizeof(bytes), 0);
+      if (size < 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (size >= ssize_t(sizeof(nlmsghdr)))
+    {
+      NetlinkMessage reply;
+      ifinfomsg info = {};
+      appendFrame(reply, RTM_NEWLINK, 0, reinterpret_cast<nlmsghdr *>(bytes)->nlmsg_seq, &info, sizeof(info));
+      (void)send(fd, reply.payload(), reply.payloadLen(), 0);
+    }
+    close(fd);
+  });
+  Ring::start();
+  Ring::shutdownForExec();
+  peer.join();
+  RingDispatcher::eraseMultiplexee(&stopper);
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  EXPECT_EQ(suite, responses, uint32_t(1));
+  EXPECT_EQ(suite, completions, uint32_t(0));
+  EXPECT_TRUE(suite, stream == nullptr);
 }
 
 static void testWrapperHelpers(TestSuite& suite)
@@ -489,6 +1086,14 @@ int main()
   testRouteRequestBuilders(suite);
   testLinkCreationBuilders(suite);
   testHandleMessageParsing(suite);
+  testAsyncFlushBoundsAndDelayedOutOfOrderAcks(suite);
+  testSynchronousFlushBaselineStallsDelayedAck(suite);
+  testAsyncFlushCancellationAndTimeout(suite);
+  testAsyncFlushNegativeAck(suite);
+  testAsyncFlushDumpTerminalErrors(suite);
+  testAsyncFlushStreamDestructionDrainsOutstandingCQEs(suite);
+  testReadonlyLoopbackGetInfoAsyncMatchesSync(suite);
+  testAsyncResponseCanDestroyItsStream(suite);
   testWrapperHelpers(suite);
   testGuardianBootHonorsDisableEnv(suite);
 

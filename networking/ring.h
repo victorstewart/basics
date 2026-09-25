@@ -18,6 +18,11 @@
 #include "networking/message.h"
 #include "networking/pool.h"
 
+// Ring's constrained send helper is defined before stream.h in a few
+// self-contained consumers (notably netlink).  The complete type is required
+// only when that helper is instantiated.
+class StreamBase;
+
 class RecvmsgMultishoter {
 public:
 
@@ -108,8 +113,10 @@ private:
   struct MsghdrPackage {
 
     void *socket;
+    void *dispatchOwner;
     struct msghdr *msg;
     uint64_t generation;
+    uint64_t ticket = 0;
   };
 
   struct SocketCommandPackage {
@@ -179,6 +186,11 @@ private:
   };
 
   static thread_local inline Pool<MsghdrPackage, true, true> msghdrPackagePool;
+  // A ticket is only retained while its msghdr package is live.  This makes a
+  // late cancellation harmless instead of allowing a recycled package pointer
+  // to target an unrelated operation.
+  static thread_local inline bytell_hash_map<uint64_t, uint64_t> msghdrUserDataByTicket;
+  static thread_local inline uint64_t nextMsghdrTicket = 1;
   struct FileBufferPackage {
     int fslot;
     String *buf;
@@ -1068,39 +1080,76 @@ public:
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T> && !std::is_base_of_v<RecvmsgMultishoter, T>)
-  static void queueRecvmsg(T *socket, struct msghdr *msg)
+  static uint64_t queueRecvmsg(T *socket, struct msghdr *msg, void *dispatchOwner = nullptr, bool forceAsync = false)
   {
     MsghdrPackage *package = msghdrPackagePool.get();
     package->socket = socketIdentity(socket);
+    package->dispatchOwner = dispatchOwner ? dispatchOwner : package->socket;
     package->msg = msg;
     package->generation = socket->ioGeneration;
 
-    requireFixedFileSocket(socket, "queueRecvmsg");
+    int submitFD = -1;
+    bool useFixedFile = false;
+    if (resolveSocketSubmitFD(socket, "queueRecvmsg", submitFD, useFixedFile) == false)
+    {
+      msghdrPackagePool.relinquish(package);
+      return 0;
+    }
     noteSocketGeneration(socket);
     retainSocketLifetimeOperation(package->socket);
     struct io_uring_sqe *sqe = getSQESafe();
-    io_uring_prep_recvmsg(sqe, socket->fslot, msg, 0);
-    io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
+    io_uring_prep_recvmsg(sqe, submitFD, msg, 0);
+    if (useFixedFile) io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
+    if (forceAsync) sqe->flags |= IOSQE_ASYNC;
 
     setUserData(sqe, Operation::recvmsg, package, socket->ioGeneration);
+    package->ticket = nextMsghdrTicket++;
+    if (package->ticket == 0) package->ticket = nextMsghdrTicket++;
+    msghdrUserDataByTicket.insert_or_assign(package->ticket, sqe->user_data);
+    return package->ticket;
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
-  static void queueSendmsg(T *socket, struct msghdr *msg)
+  static uint64_t queueSendmsg(T *socket, struct msghdr *msg, void *dispatchOwner = nullptr, bool forceAsync = false)
   {
     MsghdrPackage *package = msghdrPackagePool.get();
     package->socket = socketIdentity(socket);
+    package->dispatchOwner = dispatchOwner ? dispatchOwner : package->socket;
     package->msg = msg;
     package->generation = socket->ioGeneration;
 
-    requireFixedFileSocket(socket, "queueSendmsg");
+    int submitFD = -1;
+    bool useFixedFile = false;
+    if (resolveSocketSubmitFD(socket, "queueSendmsg", submitFD, useFixedFile) == false)
+    {
+      msghdrPackagePool.relinquish(package);
+      return 0;
+    }
     noteSocketGeneration(socket);
     retainSocketLifetimeOperation(package->socket);
     struct io_uring_sqe *sqe = getSQESafe();
-    io_uring_prep_sendmsg(sqe, socket->fslot, msg, 0);
-    io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
+    io_uring_prep_sendmsg(sqe, submitFD, msg, 0);
+    if (useFixedFile) io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
+    if (forceAsync) sqe->flags |= IOSQE_ASYNC;
 
     setUserData(sqe, Operation::sendmsg, (void *)package, socket->ioGeneration);
+    package->ticket = nextMsghdrTicket++;
+    if (package->ticket == 0) package->ticket = nextMsghdrTicket++;
+    msghdrUserDataByTicket.insert_or_assign(package->ticket, sqe->user_data);
+    return package->ticket;
+  }
+
+  static void queueCancelMsghdr(uint64_t ticket)
+  {
+    auto it = msghdrUserDataByTicket.find(ticket);
+    if (it == msghdrUserDataByTicket.end())
+    {
+      return;
+    }
+
+    struct io_uring_sqe *sqe = getSQESafe();
+    io_uring_prep_cancel64(sqe, it->second, 0);
+    setUserData(sqe, Operation::cancel, uint64_t(ticket));
   }
 
   template <typename T> requires (std::is_base_of_v<StreamBase, T> && std::is_base_of_v<SocketBase, T>)
@@ -1348,7 +1397,7 @@ public:
   }
 
   template <typename T> requires (std::is_base_of_v<SocketBase, T>)
-  static void queueClose(T *socket)
+  static void queueClose(T *socket, bool forceAsync = false)
   {
     void *socketKey = socketIdentity(socket);
     if (isClosing.contains(socketKey))
@@ -1470,6 +1519,10 @@ public:
     }
 
     uint64_t userData = issueCloseTracking(socketKey, closeSlot, closeSerial, socket->ioGeneration);
+    if (forceAsync)
+    {
+      sqe->flags |= IOSQE_ASYNC;
+    }
     beginSocketCloseRetirement(closeTrackingByUserData.find(userData)->second, socket, retireStreamSend);
     sqe->user_data = userData;
   }
@@ -2736,6 +2789,7 @@ public:
                   socketGenerationMatches(package->socket, package->generation) == false)
               {
                 void *socketKey = package->socket;
+                msghdrUserDataByTicket.erase(package->ticket);
                 msghdrPackagePool.relinquish(package);
                 releaseSocketLifetimeOperation(socketKey);
                 (void)retireClosingSocketOperation(socketKey);
@@ -3031,7 +3085,14 @@ public:
               MsghdrPackage *package = static_cast<MsghdrPackage *>(object);
               void *socketKey = package->socket;
 
-              interfacer->sendmsgHandler(package->socket, package->msg, result);
+              // A callback may cancel its transaction.  Retire this terminal
+              // ticket first so it cannot enqueue a cancellation for its own
+              // already-completed SQE.
+              msghdrUserDataByTicket.erase(package->ticket);
+              if (interfacer)
+              {
+                interfacer->sendmsgHandler(package->dispatchOwner, package->msg, result);
+              }
 
               msghdrPackagePool.relinquish(package);
               releaseSocketLifetimeOperation(socketKey);
@@ -3058,7 +3119,11 @@ public:
               MsghdrPackage *package = static_cast<MsghdrPackage *>(object);
               void *socketKey = package->socket;
 
-              interfacer->recvmsgHandler(package->socket, package->msg, result);
+              msghdrUserDataByTicket.erase(package->ticket);
+              if (interfacer)
+              {
+                interfacer->recvmsgHandler(package->dispatchOwner, package->msg, result);
+              }
 
               msghdrPackagePool.relinquish(package);
               releaseSocketLifetimeOperation(socketKey);
