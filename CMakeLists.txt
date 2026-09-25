@@ -280,6 +280,11 @@ _basics_add_test_executable(basics_containers_tests tests/containers_tests.cpp)
 _basics_add_test_executable(basics_ebpf_program_tests tests/ebpf_program_tests.cpp)
 depos_link(basics_ebpf_program_tests__objects PRIVATE libbpf::libbpf)
 depos_link(basics_ebpf_program_tests PRIVATE libbpf::libbpf)
+target_link_options(basics_ebpf_program_tests PRIVATE
+  "-Wl,--wrap=open"
+  "-Wl,--wrap=write"
+  "-Wl,--wrap=close"
+)
 _basics_add_test_executable(basics_filesystem_tests tests/filesystem_tests.cpp)
 _basics_add_test_executable(basics_guardian_tests tests/guardian_tests.cpp)
 if (BASICS_ENABLE_TIDESDB)

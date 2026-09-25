@@ -262,6 +262,10 @@ private:
 
 	static void appendPreattachedTracef(const char *format, ...)
 	{
+		// Successful preattached-map resolution is high-frequency diagnostic
+		// progress. Keep filesystem I/O and formatting out of release routing
+		// paths; failure and verifier logging below remain available unchanged.
+#if BASICS_DEBUG
 		int fd = ::open("/switchboard.attach.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
 		if (fd < 0)
 		{
@@ -277,6 +281,9 @@ private:
 		(void)::write(fd, line, strlen(line));
 		(void)::write(fd, "\n", 1);
 		(void)::close(fd);
+#else
+		(void)format;
+#endif
 	}
 
 	static bool metadataMatchesRequestedMap(const PreattachedMapFD& preattachedMap, const struct bpf_map *requestedMap)

@@ -2,12 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "tests/test_support.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cerrno>
+#include <cstdarg>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
 #include <linux/if_link.h>
 #include <net/if.h>
 #include <string_view>
+#include <unordered_set>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -27,6 +32,76 @@
 #include "networking/pool.h"
 #include "networking/eth.h"
 #include "networking/netlink.h"
+
+namespace PreattachedTraceIntercept {
+
+static std::string redirectedPath;
+static std::unordered_set<int> diagnosticFDs;
+static uint64_t opens = 0;
+static uint64_t writes = 0;
+static uint64_t closes = 0;
+
+static void resetCounts()
+{
+  opens = 0;
+  writes = 0;
+  closes = 0;
+}
+
+static bool redirects(const char *path)
+{
+  return redirectedPath.empty() == false && path != nullptr &&
+         strcmp(path, "/switchboard.attach.log") == 0;
+}
+
+} // namespace PreattachedTraceIntercept
+
+extern "C" int __real_open(const char *path, int flags, ...);
+extern "C" ssize_t __real_write(int fd, const void *buffer, size_t count);
+extern "C" int __real_close(int fd);
+
+extern "C" int __wrap_open(const char *path, int flags, ...)
+{
+  if ((flags & O_CREAT) == 0 && (flags & O_TMPFILE) != O_TMPFILE)
+  {
+    return __real_open(path, flags);
+  }
+
+  va_list arguments;
+  va_start(arguments, flags);
+  const mode_t mode = static_cast<mode_t>(va_arg(arguments, int));
+  va_end(arguments);
+
+  if (PreattachedTraceIntercept::redirects(path) == false)
+  {
+    return __real_open(path, flags, mode);
+  }
+  int fd = __real_open(PreattachedTraceIntercept::redirectedPath.c_str(), flags, mode);
+  if (fd >= 0)
+  {
+    PreattachedTraceIntercept::diagnosticFDs.insert(fd);
+    PreattachedTraceIntercept::opens += 1;
+  }
+  return fd;
+}
+
+extern "C" ssize_t __wrap_write(int fd, const void *buffer, size_t count)
+{
+  if (PreattachedTraceIntercept::diagnosticFDs.contains(fd))
+  {
+    PreattachedTraceIntercept::writes += 1;
+  }
+  return __real_write(fd, buffer, count);
+}
+
+extern "C" int __wrap_close(int fd)
+{
+  if (PreattachedTraceIntercept::diagnosticFDs.erase(fd) != 0)
+  {
+    PreattachedTraceIntercept::closes += 1;
+  }
+  return __real_close(fd);
+}
 
 namespace {
 
@@ -182,6 +257,9 @@ static bool compileFixtureProgram(CompiledProgramFixture& fixture)
     << "SEC(\"xdp\")\n"
     << "int " << kProgramName << "(struct xdp_md *ctx)\n"
     << "{\n"
+    << "  __u32 key = 0;\n"
+    << "  __u64 *counter = bpf_map_lookup_elem(&" << kMapName << ", &key);\n"
+    << "  if (counter) { *counter += 1; }\n"
     << "  return XDP_PASS;\n"
     << "}\n"
     << "\n"
@@ -720,6 +798,167 @@ static void testPreattachedMapReopenDisambiguatesTruncatedNames(EBPFTestContext&
   loopback.detachXDP();
 }
 
+static void testPreattachedMapLoggingIsReleaseGated(EBPFTestContext& context, const CompiledProgramFixture& fixture)
+{
+  if (haveRuntimeLoadSupport() == false)
+  {
+    context.skip("preattached trace test requires root or CAP_BPF on this host");
+    return;
+  }
+
+  ScopedTempDirectory traceDirectory = {};
+  if (traceDirectory.valid() == false)
+  {
+    context.skip("preattached trace test temporary directory is unavailable");
+    return;
+  }
+
+  // The linker wrappers redirect only this diagnostic literal. They are armed
+  // before the actual attach/reopen so a debug build never writes the
+  // production trace path either.
+  PreattachedTraceIntercept::redirectedPath = traceDirectory.child("switchboard.attach.log");
+  PreattachedTraceIntercept::diagnosticFDs.clear();
+  PreattachedTraceIntercept::resetCounts();
+
+  NetDevice loopback = {};
+  initializeNetDevice(loopback);
+  loopback.name = "lo"_ctv;
+  loopback.getInfo();
+  if (loopback.ifidx == 0)
+  {
+    PreattachedTraceIntercept::redirectedPath.clear();
+    context.skip("loopback interface lookup failed");
+    return;
+  }
+
+  __u32 existingProgramID = 0;
+  if (bpf_xdp_query_id(loopback.ifidx, XDP_FLAGS_SKB_MODE, &existingProgramID) != 0 || existingProgramID != 0)
+  {
+    PreattachedTraceIntercept::redirectedPath.clear();
+    context.skip("loopback is unavailable for isolated preattached trace coverage");
+    return;
+  }
+
+  BPFProgram *attached = loopback.attachXDP(fixture.objectPath,
+                                              String(kProgramName),
+                                              XDP_FLAGS_UPDATE_IF_NOEXIST | XDP_FLAGS_SKB_MODE);
+  if (attached == nullptr)
+  {
+    PreattachedTraceIntercept::redirectedPath.clear();
+    context.skip("loopback XDP attach failed for preattached trace coverage");
+    return;
+  }
+
+  uint32_t key = 17;
+  uint64_t expectedValue = 0xB0F17ULL;
+  bool seeded = false;
+  attached->openMap(String(kMapName), [&](int mapFD) {
+    seeded = mapFD >= 0 && bpf_map_update_elem(mapFD, &key, &expectedValue, BPF_ANY) == 0;
+  });
+  if (seeded == false)
+  {
+    loopback.detachXDP();
+    PreattachedTraceIntercept::redirectedPath.clear();
+    context.skip("attached map could not be seeded for preattached trace coverage");
+    return;
+  }
+
+  NetDevice reopenedDevice = {};
+  initializeNetDevice(reopenedDevice);
+  reopenedDevice.name = "lo"_ctv;
+  reopenedDevice.getInfo();
+  BPFProgram *reopened = reopenedDevice.loadPreattachedProgram(BPF_XDP, fixture.objectPath);
+  if (reopened == nullptr)
+  {
+    loopback.detachXDP();
+    PreattachedTraceIntercept::redirectedPath.clear();
+    context.skip("loopback preattached reopen failed for trace coverage");
+    return;
+  }
+
+  // Exclude attach/reopen progress from the measurement. Each sample now
+  // performs only successful preattached openMap resolutions and readback.
+  PreattachedTraceIntercept::resetCounts();
+  constexpr uint32_t samples = 30;
+  constexpr uint32_t opensPerSample = 128;
+  std::vector<uint64_t> elapsedUs = {};
+  elapsedUs.reserve(samples);
+  std::vector<uint64_t> cpuUs = {};
+  cpuUs.reserve(samples);
+  bool allResolved = true;
+  for (uint32_t sample = 0; sample < samples; ++sample)
+  {
+    timespec cpuStarted = {};
+    EXPECT_EQ(context.suite(), clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpuStarted), 0);
+    const auto started = std::chrono::steady_clock::now();
+    for (uint32_t open = 0; open < opensPerSample; ++open)
+    {
+      bool resolved = false;
+      reopened->openMap(String(kMapName), [&](int mapFD) {
+        struct bpf_map_info info = {};
+        __u32 infoLength = sizeof(info);
+        uint64_t actualValue = 0;
+        resolved = mapFD >= 0 &&
+                   bpf_map_get_info_by_fd(mapFD, &info, &infoLength) == 0 &&
+                   objectNameMatches(kMapName, info.name) &&
+                   bpf_map_lookup_elem(mapFD, &key, &actualValue) == 0 &&
+                   actualValue == expectedValue;
+      });
+      allResolved = allResolved && resolved;
+    }
+    const auto finished = std::chrono::steady_clock::now();
+    timespec cpuFinished = {};
+    EXPECT_EQ(context.suite(), clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpuFinished), 0);
+    elapsedUs.push_back(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(finished - started).count()));
+    cpuUs.push_back(uint64_t((cpuFinished.tv_sec - cpuStarted.tv_sec) * 1000000000LL +
+                            cpuFinished.tv_nsec - cpuStarted.tv_nsec) / 1000);
+  }
+
+  EXPECT_TRUE(context.suite(), allResolved);
+#if BASICS_DEBUG
+  const uint64_t expectedTraceRecords = uint64_t(samples) * opensPerSample * 2;
+  EXPECT_EQ(context.suite(), PreattachedTraceIntercept::opens, expectedTraceRecords);
+  EXPECT_EQ(context.suite(), PreattachedTraceIntercept::writes, expectedTraceRecords * 2);
+  EXPECT_EQ(context.suite(), PreattachedTraceIntercept::closes, expectedTraceRecords);
+#else
+  EXPECT_EQ(context.suite(), PreattachedTraceIntercept::opens, 0U);
+  EXPECT_EQ(context.suite(), PreattachedTraceIntercept::writes, 0U);
+  EXPECT_EQ(context.suite(), PreattachedTraceIntercept::closes, 0U);
+#endif
+
+  std::cout << "PREATTACHED_TRACE_SAMPLE_US";
+  for (uint64_t sample : elapsedUs)
+  {
+    std::cout << ' ' << sample;
+  }
+  std::cout << '\n';
+  std::cout << "PREATTACHED_TRACE_CPU_SAMPLE_US";
+  for (uint64_t sample : cpuUs)
+  {
+    std::cout << ' ' << sample;
+  }
+  std::cout << '\n';
+  std::vector<uint64_t> sortedElapsedUs = elapsedUs;
+  std::sort(sortedElapsedUs.begin(), sortedElapsedUs.end());
+  std::sort(cpuUs.begin(), cpuUs.end());
+  std::cout << "PREATTACHED_TRACE_P95_US "
+            << sortedElapsedUs[(sortedElapsedUs.size() * 95 + 99) / 100 - 1] << '\n';
+  std::cout << "PREATTACHED_TRACE_CPU_P95_US "
+            << cpuUs[(cpuUs.size() * 95 + 99) / 100 - 1] << '\n';
+  std::cout << "PREATTACHED_TRACE_COUNTS open=" << PreattachedTraceIntercept::opens
+            << " write=" << PreattachedTraceIntercept::writes
+            << " close=" << PreattachedTraceIntercept::closes << '\n';
+
+  reopenedDevice.detachXDP();
+  loopback.detachXDP();
+  __u32 remainingProgramID = 0;
+  EXPECT_EQ(context.suite(), bpf_xdp_query_id(loopback.ifidx, XDP_FLAGS_SKB_MODE, &remainingProgramID), 0);
+  EXPECT_EQ(context.suite(), remainingProgramID, 0U);
+  EXPECT_TRUE(context.suite(), PreattachedTraceIntercept::diagnosticFDs.empty());
+  PreattachedTraceIntercept::diagnosticFDs.clear();
+  PreattachedTraceIntercept::redirectedPath.clear();
+}
+
 } // namespace
 
 int main()
@@ -730,6 +969,13 @@ int main()
   if (compileFixtureProgram(fixture) == false)
   {
     context.skip("clang with the BPF backend is unavailable");
+    return context.finish();
+  }
+
+  const char *only = getenv("BASICS_TEST_ONLY");
+  if (only != nullptr && strcmp(only, "preattached-logging") == 0)
+  {
+    testPreattachedMapLoggingIsReleaseGated(context, fixture);
     return context.finish();
   }
 
@@ -752,5 +998,6 @@ int main()
   }
 
   testPreattachedMapReopenDisambiguatesTruncatedNames(context, truncatedMapFixture);
+  testPreattachedMapLoggingIsReleaseGated(context, fixture);
   return context.finish();
 }
