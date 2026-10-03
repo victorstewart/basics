@@ -210,9 +210,8 @@ private:
 		bool requestedIsPrefix = (requestedLen >= candidateLen && memcmp(requestedName, candidateName, candidateLen) == 0);
 		bool candidateIsPrefix = (candidateLen >= requestedLen && memcmp(candidateName, requestedName, requestedLen) == 0);
 
-		// Kernel-side BPF object names are capped to BPF_OBJ_NAME_LEN, so accept
-		// both exact and truncated-prefix matches when reopening a preattached
-		// program or map from its persisted kernel identity.
+		// Program lookup preserves the existing truncated-name behavior. Map
+		// identity is stricter below because one valid map name may prefix another.
 		return exactMatch || requestedIsPrefix || candidateIsPrefix;
 	}
 
@@ -236,28 +235,24 @@ private:
 		return nullptr;
 	}
 
+	static bool objectNameEquals(const char *requestedName, const char *candidateName)
+	{
+		if (requestedName == nullptr || candidateName == nullptr)
+		{
+			return false;
+		}
+
+		size_t requestedLen = strnlen(requestedName, BPF_OBJ_NAME_LEN);
+		size_t candidateLen = strnlen(candidateName, BPF_OBJ_NAME_LEN);
+		return requestedLen == candidateLen && memcmp(requestedName, candidateName, requestedLen) == 0;
+	}
+
 	static struct bpf_map *findMapByKernelName(struct bpf_object *object, const char *requestedName)
 	{
-		if (object == nullptr || requestedName == nullptr)
-		{
-			return nullptr;
-		}
-
-		if (struct bpf_map *match = bpf_object__find_map_by_name(object, requestedName))
-		{
-			return match;
-		}
-
-		struct bpf_map *candidate = nullptr;
-		bpf_object__for_each_map(candidate, object)
-		{
-			if (objectNameMatches(requestedName, bpf_map__name(candidate)))
-			{
-				return candidate;
-			}
-		}
-
-		return nullptr;
+		// Map names are constrained to the kernel limit before reaching this
+		// owner. A prefix can identify a different map (for example
+		// wh_egress versus wh_egress4), so reopening never treats it as an alias.
+		return (object == nullptr || requestedName == nullptr) ? nullptr : bpf_object__find_map_by_name(object, requestedName);
 	}
 
 	static void appendPreattachedTracef(const char *format, ...)
@@ -286,29 +281,19 @@ private:
 #endif
 	}
 
-	static bool metadataMatchesRequestedMap(const PreattachedMapFD& preattachedMap, const struct bpf_map *requestedMap)
+	static bool schemaMatchesRequestedMap(const PreattachedMapFD& preattachedMap, const struct bpf_map *requestedMap)
 	{
 		if (requestedMap == nullptr)
 		{
 			return false;
 		}
 
+		// Allocation configuration can intentionally change while reopening a
+		// compatible map (for example development max_entries or NO_PREALLOC).
+		// Identity is exact kernel name plus type/key/value schema below.
 		if (preattachedMap.type != bpf_map__type(requestedMap)
 			|| preattachedMap.keySize != bpf_map__key_size(requestedMap)
-			|| preattachedMap.valueSize != bpf_map__value_size(requestedMap)
-			|| preattachedMap.maxEntries != bpf_map__max_entries(requestedMap)
-			|| preattachedMap.mapFlags != bpf_map__map_flags(requestedMap))
-		{
-			return false;
-		}
-
-		__u32 requestedBTFKeyTypeID = bpf_map__btf_key_type_id(requestedMap);
-		__u32 requestedBTFValueTypeID = bpf_map__btf_value_type_id(requestedMap);
-		if (requestedBTFKeyTypeID != 0 && preattachedMap.btfKeyTypeID != 0 && preattachedMap.btfKeyTypeID != requestedBTFKeyTypeID)
-		{
-			return false;
-		}
-		if (requestedBTFValueTypeID != 0 && preattachedMap.btfValueTypeID != 0 && preattachedMap.btfValueTypeID != requestedBTFValueTypeID)
+			|| preattachedMap.valueSize != bpf_map__value_size(requestedMap))
 		{
 			return false;
 		}
@@ -853,58 +838,28 @@ public:
 
 				if (requestedMap != nullptr)
 				{
-					const PreattachedMapFD *metadataMatch = nullptr;
-					uint32_t metadataMatchCount = 0;
-
+					const PreattachedMapFD *exactSchemaMatch = nullptr;
+					uint32_t exactSchemaMatchCount = 0;
 					for (const PreattachedMapFD& preattachedMap : preattachedMapFDs)
 					{
-						if (preattachedMap.fd < 0 || metadataMatchesRequestedMap(preattachedMap, requestedMap) == false)
+						if (preattachedMap.fd < 0
+							|| objectNameEquals(requestedName, preattachedMap.name) == false
+							|| schemaMatchesRequestedMap(preattachedMap, requestedMap) == false)
 						{
 							continue;
 						}
 
-						metadataMatch = &preattachedMap;
-						metadataMatchCount += 1;
+						exactSchemaMatch = &preattachedMap;
+						exactSchemaMatchCount += 1;
 					}
 
-					if (metadataMatchCount > 1)
+					if (exactSchemaMatchCount == 1)
 					{
-						metadataMatch = nullptr;
-						metadataMatchCount = 0;
-
-						for (const PreattachedMapFD& preattachedMap : preattachedMapFDs)
-						{
-							if (preattachedMap.fd < 0
-								|| metadataMatchesRequestedMap(preattachedMap, requestedMap) == false
-								|| objectNameMatches(requestedName, preattachedMap.name) == false)
-							{
-								continue;
-							}
-
-							metadataMatch = &preattachedMap;
-							metadataMatchCount += 1;
-						}
-					}
-
-					if (metadataMatchCount == 1 && metadataMatch != nullptr)
-					{
-						appendPreattachedTracef("BPFProgram openMap metadata match request=%s fd=%d name=%s",
+						appendPreattachedTracef("BPFProgram openMap exact schema match request=%s fd=%d name=%s",
 							requestedName,
-							metadataMatch->fd,
-							metadataMatch->name);
-						return metadataMatch->fd;
-					}
-				}
-
-				for (const PreattachedMapFD& preattachedMap : preattachedMapFDs)
-				{
-					if (preattachedMap.fd >= 0 && objectNameMatches(requestedName, preattachedMap.name))
-					{
-						appendPreattachedTracef("BPFProgram openMap name match request=%s fd=%d name=%s",
-							requestedName,
-							preattachedMap.fd,
-							preattachedMap.name);
-						return preattachedMap.fd;
+							exactSchemaMatch->fd,
+							exactSchemaMatch->name);
+						return exactSchemaMatch->fd;
 					}
 				}
 

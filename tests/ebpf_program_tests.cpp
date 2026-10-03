@@ -108,8 +108,9 @@ namespace {
 constexpr const char *kProgramName = "xdp_pass";
 constexpr const char *kTCXProgramName = "tcx_pass";
 constexpr const char *kMapName = "counters";
-constexpr const char *kOverlapMap4Name = "owned_routable_prefixes4";
-constexpr const char *kOverlapMap6Name = "owned_routable_prefixes6";
+// Exact kernel names intentionally collide under prefix comparison.
+constexpr const char *kOverlapMap4Name = "wh_egress4";
+constexpr const char *kOverlapMap6Name = "wh_egress";
 
 class ScopedTempDirectory {
 private:
@@ -286,7 +287,7 @@ static bool compileFixtureProgram(CompiledProgramFixture& fixture)
   return exitCode == 0;
 }
 
-static bool compileTruncatedMapFixtureProgram(CompiledProgramFixture& fixture)
+static bool compileTruncatedMapFixtureProgram(CompiledProgramFixture& fixture, uint32_t maxEntries)
 {
   if (fixture.tempDirectory.valid() == false)
   {
@@ -316,23 +317,31 @@ static bool compileTruncatedMapFixtureProgram(CompiledProgramFixture& fixture)
     << "  __u32 addr[4];\n"
     << "};\n"
     << "\n"
+    // Put the shorter name first: the pre-fix prefix fallback would return it
+    // for the later wh_egress4 request.
     << "struct {\n"
     << "  __uint(type, BPF_MAP_TYPE_HASH);\n"
-    << "  __uint(max_entries, 4);\n"
-    << "  __type(key, struct key4);\n"
-    << "  __type(value, __u8);\n"
-    << "} " << kOverlapMap4Name << " SEC(\".maps\");\n"
-    << "\n"
-    << "struct {\n"
-    << "  __uint(type, BPF_MAP_TYPE_HASH);\n"
-    << "  __uint(max_entries, 4);\n"
+    << "  __uint(max_entries, " << maxEntries << ");\n"
     << "  __type(key, struct key6);\n"
     << "  __type(value, __u8);\n"
     << "} " << kOverlapMap6Name << " SEC(\".maps\");\n"
     << "\n"
+    << "struct {\n"
+    << "  __uint(type, BPF_MAP_TYPE_HASH);\n"
+    << "  __uint(max_entries, " << maxEntries << ");\n"
+    << "  __type(key, struct key4);\n"
+    << "  __type(value, __u8);\n"
+    << "} " << kOverlapMap4Name << " SEC(\".maps\");\n"
+    << "\n"
     << "SEC(\"xdp\")\n"
     << "int " << kProgramName << "(struct xdp_md *ctx)\n"
     << "{\n"
+    << "  struct key4 key4 = {};\n"
+    << "  struct key6 key6 = {};\n"
+    << "  __u8 *value6 = bpf_map_lookup_elem(&" << kOverlapMap6Name << ", &key6);\n"
+    << "  __u8 *value4 = bpf_map_lookup_elem(&" << kOverlapMap4Name << ", &key4);\n"
+    << "  if (value6) { *value6 += 1; }\n"
+    << "  if (value4) { *value4 += 1; }\n"
     << "  return XDP_PASS;\n"
     << "}\n"
     << "\n"
@@ -689,7 +698,9 @@ static void testTCXLinkAttach(EBPFTestContext& context, const CompiledProgramFix
   removeVeth();
 }
 
-static void testPreattachedMapReopenDisambiguatesTruncatedNames(EBPFTestContext& context, const CompiledProgramFixture& fixture)
+static void testPreattachedMapReopenDisambiguatesCollidingNames(EBPFTestContext& context,
+                                                                  const CompiledProgramFixture& attachedFixture,
+                                                                  const CompiledProgramFixture& reopenedFixture)
 {
   if (haveRuntimeLoadSupport() == false)
   {
@@ -720,7 +731,7 @@ static void testPreattachedMapReopenDisambiguatesTruncatedNames(EBPFTestContext&
     return;
   }
 
-  BPFProgram *attached = loopback.attachXDP(fixture.objectPath, String(kProgramName), XDP_FLAGS_UPDATE_IF_NOEXIST | XDP_FLAGS_SKB_MODE);
+  BPFProgram *attached = loopback.attachXDP(attachedFixture.objectPath, String(kProgramName), XDP_FLAGS_UPDATE_IF_NOEXIST | XDP_FLAGS_SKB_MODE);
   if (attached == nullptr)
   {
     context.skip("loopback XDP attach failed on this host");
@@ -731,7 +742,9 @@ static void testPreattachedMapReopenDisambiguatesTruncatedNames(EBPFTestContext&
   initializeNetDevice(reopenedDevice);
   reopenedDevice.name = "lo"_ctv;
   reopenedDevice.getInfo();
-  BPFProgram *reopened = reopenedDevice.loadPreattachedProgram(BPF_XDP, fixture.objectPath);
+  // The reopened ELF intentionally requests smaller allocation settings. Exact
+  // name plus schema must still recover the originally attached map.
+  BPFProgram *reopened = reopenedDevice.loadPreattachedProgram(BPF_XDP, reopenedFixture.objectPath);
   if (reopened == nullptr)
   {
     loopback.detachXDP();
@@ -793,6 +806,13 @@ static void testPreattachedMapReopenDisambiguatesTruncatedNames(EBPFTestContext&
 
   expectKeySizeForMap(kOverlapMap4Name, 8);
   expectKeySizeForMap(kOverlapMap6Name, 20);
+
+  bool missingCalled = false;
+  reopened->openMap("wh_egres"_ctv, [&] (int mapFD) -> void {
+    missingCalled = true;
+    EXPECT_EQ(context.suite(), mapFD, -1);
+  });
+  EXPECT_TRUE(context.suite(), missingCalled);
 
   reopenedDevice.detachXDP();
   loopback.detachXDP();
@@ -978,6 +998,19 @@ int main()
     testPreattachedMapLoggingIsReleaseGated(context, fixture);
     return context.finish();
   }
+  if (only != nullptr && strcmp(only, "preattached-map-identity") == 0)
+  {
+    CompiledProgramFixture attachedCollidingMapFixture;
+    CompiledProgramFixture reopenedCollidingMapFixture;
+    if (compileTruncatedMapFixtureProgram(attachedCollidingMapFixture, 4096) == false
+        || compileTruncatedMapFixtureProgram(reopenedCollidingMapFixture, 4) == false)
+    {
+      context.skip("clang with the BPF backend is unavailable for colliding-map reopen coverage");
+      return context.finish();
+    }
+    testPreattachedMapReopenDisambiguatesCollidingNames(context, attachedCollidingMapFixture, reopenedCollidingMapFixture);
+    return context.finish();
+  }
 
   testLoadAndCleanup(context, fixture);
   testLoopbackXDPAttach(context, fixture);
@@ -990,14 +1023,16 @@ int main()
   }
   testTCXLinkAttach(context, tcxFixture);
 
-  CompiledProgramFixture truncatedMapFixture;
-  if (compileTruncatedMapFixtureProgram(truncatedMapFixture) == false)
+  CompiledProgramFixture attachedCollidingMapFixture;
+  CompiledProgramFixture reopenedCollidingMapFixture;
+  if (compileTruncatedMapFixtureProgram(attachedCollidingMapFixture, 4096) == false
+      || compileTruncatedMapFixtureProgram(reopenedCollidingMapFixture, 4) == false)
   {
-    context.skip("clang with the BPF backend is unavailable for truncated-map reopen coverage");
+    context.skip("clang with the BPF backend is unavailable for colliding-map reopen coverage");
     return context.finish();
   }
 
-  testPreattachedMapReopenDisambiguatesTruncatedNames(context, truncatedMapFixture);
+  testPreattachedMapReopenDisambiguatesCollidingNames(context, attachedCollidingMapFixture, reopenedCollidingMapFixture);
   testPreattachedMapLoggingIsReleaseGated(context, fixture);
   return context.finish();
 }
