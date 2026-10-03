@@ -900,15 +900,24 @@ public:
 
 		if (link != nullptr)
 		{
-			int result = bpf_link__destroy(link);
+			// `link` is assigned only by bpf_program__attach_tcx. libbpf's
+			// destroy callback closes its FD, but a bpffs pin retains that TCX
+			// attachment. Explicit NetDevice teardown must detach first.
+			int result = bpf_link__detach(link);
 			if (result != 0)
 			{
-				basics_log("BPFProgram::detach link failed fd=%d ifidx=%d attach_type=%d result=%d errno=%d\n",
-					prog_fd,
+				basics_log("BPFProgram::detach TCX link failed fd=%d ifidx=%d attach_type=%d result=%d errno=%d\n",
+					bpf_link__fd(link),
 					attachidx,
 					int(attachtype),
 					result,
 					errno);
+			}
+			int destroyResult = bpf_link__destroy(link);
+			if (destroyResult != 0)
+			{
+				basics_log("BPFProgram::detach TCX link release failed ifidx=%d attach_type=%d result=%d errno=%d\n",
+					attachidx, int(attachtype), destroyResult, errno);
 			}
 			link = nullptr;
 			attachidx = -1;

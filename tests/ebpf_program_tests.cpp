@@ -961,6 +961,34 @@ static void testTCXRetentionIdentity(EBPFTestContext& context, const CompiledPro
   BPFProgram::closeTCXIdentity(identity);
   EXPECT_EQ(context.suite(), unlink(bpffs.pinPath().c_str()), 0);
   EXPECT_FALSE(context.suite(), BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, programID, identity));
+
+  // An owned TCX wrapper also must issue BPF_LINK_DETACH when a pin keeps
+  // its link alive. A close-only destroy leaves this pair attached.
+  BPFProgram *owned = device.attachBPF(BPF_TCX_EGRESS, fixture.objectPath, String(kTCXProgramName));
+  EXPECT_TRUE(context.suite(), owned != nullptr);
+  __u32 ownedProgramID = 0;
+  BPFProgram::TCXIdentity ownedIdentity = {};
+  bool openedOwnedIdentity = owned != nullptr
+                          && BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, 0, ownedIdentity);
+  EXPECT_TRUE(context.suite(), openedOwnedIdentity);
+  if (openedOwnedIdentity)
+  {
+    ownedProgramID = ownedIdentity.programID;
+    EXPECT_EQ(context.suite(), bpf_obj_pin(ownedIdentity.linkFD, bpffs.pinPath().c_str()), 0);
+    BPFProgram::closeTCXIdentity(ownedIdentity);
+    device.detachBPF(BPF_TCX_EGRESS);
+    EXPECT_FALSE(context.suite(), BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, ownedProgramID, ownedIdentity));
+    BPFProgram::closeTCXIdentity(ownedIdentity);
+    int detachedPinFD = bpf_obj_get(bpffs.pinPath().c_str());
+    EXPECT_TRUE(context.suite(), detachedPinFD >= 0);
+    if (detachedPinFD >= 0) { close(detachedPinFD); }
+    EXPECT_EQ(context.suite(), unlink(bpffs.pinPath().c_str()), 0);
+  }
+  else
+  {
+    BPFProgram::closeTCXIdentity(ownedIdentity);
+    if (owned != nullptr) { device.detachBPF(BPF_TCX_EGRESS); }
+  }
   removeVeth();
 }
 
