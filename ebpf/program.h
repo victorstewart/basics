@@ -86,6 +86,9 @@ private:
 	bool progFDOwnedByObject = false;
 	bool loadedFromPreattached = false;
 	struct bpf_link *link = nullptr;
+	// A pre-existing TCX attachment is owned by its link, not this wrapper.
+	// Keep a borrowed FD only so explicit detach can address that exact link.
+	int borrowedTCXLinkFD = -1;
 	__u32 expectedPreattachedMapCount = 0;
 	std::vector<char> kernelLog;
 
@@ -444,6 +447,101 @@ private:
 
 public:
 
+	struct TCXIdentity
+	{
+		__u32 programID = 0;
+		__u32 linkID = 0;
+		__u8 programTag[BPF_TAG_SIZE] = {};
+		int programFD = -1;
+		int linkFD = -1;
+	};
+
+	static void closeTCXIdentity(TCXIdentity& identity)
+	{
+		if (identity.linkFD >= 0)
+		{
+			::close(identity.linkFD);
+		}
+		if (identity.programFD >= 0)
+		{
+			::close(identity.programFD);
+		}
+		identity = {};
+	}
+
+	// Resolve one exact TCX attachment in the caller's current network namespace.
+	// link_ids and prog_ids are returned as parallel arrays by bpf_prog_query_opts.
+	static bool openTCXIdentity(int ifidx,
+	                            enum bpf_attach_type direction,
+	                            __u32 expectedProgramID,
+	                            TCXIdentity& identity)
+	{
+		closeTCXIdentity(identity);
+		if (ifidx <= 0
+			|| (direction != BPF_TCX_INGRESS && direction != BPF_TCX_EGRESS))
+		{
+			return false;
+		}
+
+		__u32 programIDs[1] = {};
+		__u32 linkIDs[1] = {};
+		struct bpf_prog_query_opts query = {};
+		query.sz = sizeof(query);
+		query.prog_ids = programIDs;
+		query.link_ids = linkIDs;
+		query.prog_cnt = 1;
+		if (bpf_prog_query_opts(ifidx, direction, &query) != 0
+			|| query.prog_cnt != 1
+			|| (expectedProgramID != 0 && programIDs[0] != expectedProgramID)
+			|| linkIDs[0] == 0)
+		{
+			return false;
+		}
+
+		const __u32 programID = programIDs[0];
+		int linkFD = bpf_link_get_fd_by_id(linkIDs[0]);
+		if (linkFD < 0)
+		{
+			return false;
+		}
+		struct bpf_link_info linkInfo = {};
+		__u32 linkInfoLength = sizeof(linkInfo);
+		if (bpf_link_get_info_by_fd(linkFD, &linkInfo, &linkInfoLength) != 0
+			|| linkInfo.id != linkIDs[0]
+			|| linkInfo.type != BPF_LINK_TYPE_TCX
+			|| linkInfo.prog_id != programID
+			|| linkInfo.tcx.ifindex != static_cast<__u32>(ifidx)
+			|| linkInfo.tcx.attach_type != static_cast<__u32>(direction))
+		{
+			::close(linkFD);
+			return false;
+		}
+
+		int programFD = bpf_prog_get_fd_by_id(programID);
+		if (programFD < 0)
+		{
+			::close(linkFD);
+			return false;
+		}
+		struct bpf_prog_info programInfo = {};
+		__u32 programInfoLength = sizeof(programInfo);
+		if (bpf_prog_get_info_by_fd(programFD, &programInfo, &programInfoLength) != 0
+			|| programInfo.id != programID
+			|| programInfo.type != BPF_PROG_TYPE_SCHED_CLS)
+		{
+			::close(programFD);
+			::close(linkFD);
+			return false;
+		}
+
+		identity.programID = programID;
+		identity.linkID = linkIDs[0];
+		memcpy(identity.programTag, programInfo.tag, sizeof(identity.programTag));
+		identity.programFD = programFD;
+		identity.linkFD = linkFD;
+		return true;
+	}
+
 	BPFProgram() = default;
 	BPFProgram(const BPFProgram&) = delete;
 	BPFProgram& operator=(const BPFProgram&) = delete;
@@ -535,14 +633,29 @@ public:
 	{
 		close();
 
-		prog_fd = bpf_prog_get_fd_by_id(prog_id);
-
-		if (prog_fd < 0) 
+		if (progtype == BPF_TCX_INGRESS || progtype == BPF_TCX_EGRESS)
 		{
-			basics_log("BPFProgram::loadPreattached bpf_prog_get_fd_by_id failed prog_id=%u errno=%d\n",
-				prog_id,
-				errno);
-			return false;
+			TCXIdentity identity = {};
+			if (openTCXIdentity(attachedIfidx, progtype, prog_id, identity) == false)
+			{
+				basics_log("BPFProgram::loadPreattached TCX identity failed prog_id=%u ifidx=%d attach_type=%d errno=%d\n",
+					prog_id, attachedIfidx, int(progtype), errno);
+				return false;
+			}
+			prog_fd = identity.programFD;
+			borrowedTCXLinkFD = identity.linkFD;
+			identity.programFD = -1;
+			identity.linkFD = -1;
+		}
+		else
+		{
+			prog_fd = bpf_prog_get_fd_by_id(prog_id);
+			if (prog_fd < 0)
+			{
+				basics_log("BPFProgram::loadPreattached bpf_prog_get_fd_by_id failed prog_id=%u errno=%d\n",
+					prog_id, errno);
+				return false;
+			}
 		}
 
 		struct bpf_prog_info prog_info = {};
@@ -771,6 +884,20 @@ public:
 
 	void detach(void)
 	{
+		if (borrowedTCXLinkFD >= 0)
+		{
+			int result = bpf_link_detach(borrowedTCXLinkFD);
+			if (result != 0)
+			{
+				basics_log("BPFProgram::detach borrowed TCX link failed fd=%d ifidx=%d attach_type=%d result=%d errno=%d\n",
+					borrowedTCXLinkFD, attachidx, int(attachtype), result, errno);
+			}
+			::close(borrowedTCXLinkFD);
+			borrowedTCXLinkFD = -1;
+			attachidx = -1;
+			return;
+		}
+
 		if (link != nullptr)
 		{
 			int result = bpf_link__destroy(link);
@@ -1035,7 +1162,18 @@ public:
 
 	void close(void)
 	{
-		detach();
+		// Close a borrowed pre-existing TCX reference without changing the
+		// attachment. NetDevice::detachBPF is the explicit destructive owner.
+		if (borrowedTCXLinkFD >= 0)
+		{
+			::close(borrowedTCXLinkFD);
+			borrowedTCXLinkFD = -1;
+			attachidx = -1;
+		}
+		else
+		{
+			detach();
+		}
 		closePreattachedMapFDs();
 
 		if (obj != nullptr)

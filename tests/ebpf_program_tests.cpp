@@ -14,6 +14,9 @@
 #include <string_view>
 #include <unordered_set>
 #include <sys/wait.h>
+#include <sys/mount.h>
+#include <signal.h>
+#include <sched.h>
 #include <unistd.h>
 
 #include "ebpf/program.h"
@@ -698,6 +701,269 @@ static void testTCXLinkAttach(EBPFTestContext& context, const CompiledProgramFix
   removeVeth();
 }
 
+struct ScopedPrivateBPFFS {
+  ScopedTempDirectory directory;
+  bool mounted = false;
+
+  bool open()
+  {
+    if (directory.valid() == false || unshare(CLONE_NEWNS) != 0)
+    {
+      return false;
+    }
+    (void)mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr);
+    std::error_code error;
+    std::filesystem::create_directory(directory.child("bpffs"), error);
+    if (error)
+    {
+      return false;
+    }
+    mounted = mount("bpffs", directory.child("bpffs").c_str(), "bpf", 0, nullptr) == 0;
+    return mounted;
+  }
+
+  std::string pinPath() const
+  {
+    return directory.child("bpffs/tcx-retained");
+  }
+
+  ~ScopedPrivateBPFFS()
+  {
+    if (mounted)
+    {
+      (void)umount2(directory.child("bpffs").c_str(), MNT_DETACH);
+    }
+  }
+};
+
+static bool childOwnsTCX(const std::string& deviceName,
+                         const CompiledProgramFixture& fixture,
+                         int readyWrite,
+                         int releaseRead)
+{
+  NetDevice device = {};
+  initializeNetDevice(device);
+  device.name.assign(deviceName.c_str(), deviceName.size());
+  device.getInfo();
+  BPFProgram *program = device.attachBPF(BPF_TCX_EGRESS, fixture.objectPath, String(kTCXProgramName));
+  if (program == nullptr)
+  {
+    return false;
+  }
+
+  __u32 programID = 0;
+  __u32 linkID = 0;
+  struct bpf_prog_query_opts query = {};
+  query.sz = sizeof(query);
+  query.prog_ids = &programID;
+  query.link_ids = &linkID;
+  query.prog_cnt = 1;
+  if (bpf_prog_query_opts(device.ifidx, BPF_TCX_EGRESS, &query) != 0
+      || query.prog_cnt != 1 || programID == 0 || linkID == 0
+      || write(readyWrite, &programID, sizeof(programID)) != sizeof(programID))
+  {
+    return false;
+  }
+
+  char release = 0;
+  (void)read(releaseRead, &release, sizeof(release));
+  return true;
+}
+
+static bool startTCXOwner(const std::string& deviceName,
+                          const CompiledProgramFixture& fixture,
+                          pid_t& child,
+                          int& releaseWrite,
+                          __u32& programID)
+{
+  int ready[2] = {-1, -1};
+  int release[2] = {-1, -1};
+  if (pipe(ready) != 0 || pipe(release) != 0)
+  {
+    if (ready[0] >= 0) { close(ready[0]); }
+    if (ready[1] >= 0) { close(ready[1]); }
+    if (release[0] >= 0) { close(release[0]); }
+    if (release[1] >= 0) { close(release[1]); }
+    return false;
+  }
+  child = fork();
+  if (child == 0)
+  {
+    close(ready[0]);
+    close(release[1]);
+    bool attached = childOwnsTCX(deviceName, fixture, ready[1], release[0]);
+    _exit(attached ? 0 : 1);
+  }
+  if (child < 0)
+  {
+    close(ready[0]);
+    close(ready[1]);
+    close(release[0]);
+    close(release[1]);
+    return false;
+  }
+  close(ready[1]);
+  close(release[0]);
+  releaseWrite = release[1];
+  ssize_t received = read(ready[0], &programID, sizeof(programID));
+  close(ready[0]);
+  if (received == sizeof(programID) && programID != 0)
+  {
+    return true;
+  }
+  (void)kill(child, SIGKILL);
+  close(releaseWrite);
+  releaseWrite = -1;
+  int status = 0;
+  (void)waitpid(child, &status, 0);
+  child = -1;
+  return false;
+}
+
+static int stopTCXOwner(pid_t child, int releaseWrite, bool killOwner)
+{
+  if (child <= 0)
+  {
+    if (releaseWrite >= 0) { close(releaseWrite); }
+    return -1;
+  }
+  if (killOwner)
+  {
+    // Kill before closing the release pipe: a successful exit would exercise
+    // normal destructor cleanup instead of last-reference process exit.
+    (void)kill(child, SIGKILL);
+    if (releaseWrite >= 0) { close(releaseWrite); }
+  }
+  else if (releaseWrite >= 0)
+  {
+    char release = 1;
+    (void)write(releaseWrite, &release, sizeof(release));
+    close(releaseWrite);
+  }
+  int status = 0;
+  return waitpid(child, &status, 0) == child ? status : -1;
+}
+
+static void testTCXRetentionIdentity(EBPFTestContext& context, const CompiledProgramFixture& fixture)
+{
+  if (haveRuntimeLoadSupport() == false)
+  {
+    context.skip("TCX retention requires root or CAP_BPF on this host");
+    return;
+  }
+  ScopedPrivateBPFFS bpffs = {};
+  if (bpffs.open() == false)
+  {
+    context.skip("private bpffs mount is unavailable for TCX retention coverage");
+    return;
+  }
+
+  std::string deviceName = "brtn" + std::to_string(getpid());
+  std::string peerName = "brtp" + std::to_string(getpid());
+  deviceName.resize(std::min(deviceName.size(), size_t(IFNAMSIZ - 1)));
+  peerName.resize(std::min(peerName.size(), size_t(IFNAMSIZ - 1)));
+  if (runCommand({"ip", "link", "add", deviceName, "type", "veth", "peer", "name", peerName}) != 0)
+  {
+    context.skip("TCX retention veth creation is unavailable on this host");
+    return;
+  }
+  auto removeVeth = [&] { (void)runCommand({"ip", "link", "del", deviceName}); };
+  NetDevice device = {};
+  initializeNetDevice(device);
+  device.name.assign(deviceName.c_str(), deviceName.size());
+  device.getInfo();
+  if (device.ifidx == 0)
+  {
+    removeVeth();
+    context.skip("TCX retention veth lookup failed");
+    return;
+  }
+
+  // No pin: SIGKILL closes the sole link FD, so the exact pair must disappear.
+  pid_t child = -1;
+  int releaseWrite = -1;
+  __u32 programID = 0;
+  if (startTCXOwner(deviceName, fixture, child, releaseWrite, programID) == false)
+  {
+    removeVeth();
+    context.skip("TCX owner child could not attach");
+    return;
+  }
+  BPFProgram::TCXIdentity identity = {};
+  EXPECT_TRUE(context.suite(), BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, programID, identity));
+  BPFProgram::closeTCXIdentity(identity);
+  int ownerStatus = stopTCXOwner(child, releaseWrite, true);
+  EXPECT_TRUE(context.suite(), ownerStatus != -1 && WIFSIGNALED(ownerStatus));
+  EXPECT_EQ(context.suite(), WTERMSIG(ownerStatus), SIGKILL);
+  EXPECT_FALSE(context.suite(), BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, programID, identity));
+
+  // Pinning the exact validated link retains it across the owner SIGKILL.
+  child = -1;
+  releaseWrite = -1;
+  programID = 0;
+  if (startTCXOwner(deviceName, fixture, child, releaseWrite, programID) == false
+      || BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, programID, identity) == false)
+  {
+    stopTCXOwner(child, releaseWrite, true);
+    removeVeth();
+    context.skip("TCX retained owner setup failed");
+    return;
+  }
+  EXPECT_EQ(context.suite(), bpf_obj_pin(identity.linkFD, bpffs.pinPath().c_str()), 0);
+  BPFProgram::closeTCXIdentity(identity);
+  ownerStatus = stopTCXOwner(child, releaseWrite, true);
+  EXPECT_TRUE(context.suite(), ownerStatus != -1 && WIFSIGNALED(ownerStatus));
+  EXPECT_EQ(context.suite(), WTERMSIG(ownerStatus), SIGKILL);
+  EXPECT_TRUE(context.suite(), BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, programID, identity));
+  int pinnedFD = bpf_obj_get(bpffs.pinPath().c_str());
+  EXPECT_TRUE(context.suite(), pinnedFD >= 0);
+  if (pinnedFD >= 0)
+  {
+    close(pinnedFD);
+  }
+  BPFProgram::closeTCXIdentity(identity);
+
+  // A preattached owner may close its borrowed reference without detaching
+  // the link retained by the pin.
+  BPFProgram adopted = {};
+  EXPECT_TRUE(context.suite(), adopted.loadPreattached(BPF_TCX_EGRESS, device.ifidx, programID, fixture.objectPath));
+  adopted.close();
+  EXPECT_TRUE(context.suite(), BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, programID, identity));
+  BPFProgram::closeTCXIdentity(identity);
+
+  // A wrong expected ID is rejected while the target still has one valid pair.
+  BPFProgram::TCXIdentity wrongProgram = {};
+  EXPECT_FALSE(context.suite(), BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, programID + 1, wrongProgram));
+
+  // A second TCX link makes the target attachment ambiguous. The helper
+  // rejects it instead of choosing an arbitrary link.
+  BPFProgram competing = {};
+  EXPECT_TRUE(context.suite(), competing.loadAttach(BPF_TCX_EGRESS, device.ifidx, fixture.objectPath, String(kTCXProgramName)));
+  BPFProgram::TCXIdentity ambiguous = {};
+  EXPECT_FALSE(context.suite(), BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, programID, ambiguous));
+  competing.detach();
+  EXPECT_TRUE(context.suite(), BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, programID, identity));
+  BPFProgram::closeTCXIdentity(identity);
+
+  // The target-scoped helper must neither select a peer-interface link nor
+  // detach the surviving good attachment on an identity mismatch.
+  NetDevice peer = {};
+  initializeNetDevice(peer);
+  peer.name.assign(peerName.c_str(), peerName.size());
+  peer.getInfo();
+  BPFProgram::TCXIdentity wrong = {};
+  EXPECT_FALSE(context.suite(), BPFProgram::openTCXIdentity(peer.ifidx, BPF_TCX_EGRESS, programID, wrong));
+  EXPECT_TRUE(context.suite(), BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, programID, identity));
+
+  BPFProgram explicitAdoption = {};
+  EXPECT_TRUE(context.suite(), explicitAdoption.loadPreattached(BPF_TCX_EGRESS, device.ifidx, programID, fixture.objectPath));
+  explicitAdoption.detach();
+  BPFProgram::closeTCXIdentity(identity);
+  EXPECT_EQ(context.suite(), unlink(bpffs.pinPath().c_str()), 0);
+  EXPECT_FALSE(context.suite(), BPFProgram::openTCXIdentity(device.ifidx, BPF_TCX_EGRESS, programID, identity));
+  removeVeth();
+}
+
 static void testPreattachedMapReopenDisambiguatesCollidingNames(EBPFTestContext& context,
                                                                   const CompiledProgramFixture& attachedFixture,
                                                                   const CompiledProgramFixture& reopenedFixture)
@@ -998,6 +1264,17 @@ int main()
     testPreattachedMapLoggingIsReleaseGated(context, fixture);
     return context.finish();
   }
+  if (only != nullptr && strcmp(only, "tcx-retention") == 0)
+  {
+    CompiledProgramFixture tcxFixture;
+    if (compileTCXFixtureProgram(tcxFixture) == false)
+    {
+      context.skip("clang with TCX BPF support is unavailable");
+      return context.finish();
+    }
+    testTCXRetentionIdentity(context, tcxFixture);
+    return context.finish();
+  }
   if (only != nullptr && strcmp(only, "preattached-map-identity") == 0)
   {
     CompiledProgramFixture attachedCollidingMapFixture;
@@ -1022,6 +1299,7 @@ int main()
     return context.finish();
   }
   testTCXLinkAttach(context, tcxFixture);
+  testTCXRetentionIdentity(context, tcxFixture);
 
   CompiledProgramFixture attachedCollidingMapFixture;
   CompiledProgramFixture reopenedCollidingMapFixture;

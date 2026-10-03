@@ -2417,15 +2417,26 @@ public:
           return nullptr;
         }
       }
+      else if (progtype == BPF_TCX_INGRESS || progtype == BPF_TCX_EGRESS)
+      {
+        BPFProgram::TCXIdentity identity = {};
+        // A one-slot paired query rejects an ambiguous TCX attachment rather
+        // than selecting an arbitrary program/link from this interface.
+        if (BPFProgram::openTCXIdentity(ifidx, progtype, 0, identity) == false)
+        {
+          BPFProgram::closeTCXIdentity(identity);
+          return nullptr;
+        }
+        prog_id = identity.programID;
+        BPFProgram::closeTCXIdentity(identity);
+      }
       else
       {
         uint32_t prog_cnt = 1;
-
         struct bpf_prog_query_opts opts = {};
         opts.sz = sizeof(opts);
         opts.prog_ids = &prog_id;
         opts.prog_cnt = prog_cnt;
-
         if (bpf_prog_query_opts(ifidx, progtype, &opts) != 0 || prog_id == 0)
         {
           return nullptr;
