@@ -5,7 +5,7 @@
 `basics` is my personal C++20 utility library.
 
 It builds through CMake with `depos`-managed dependencies. Release tags publish a detached
-`basics.DepoFile` asset alongside the GitHub source tarball so `depos 0.5.0+` consumers can
+`basics.DepoFile` asset alongside the GitHub source tarball so `depos 0.5.6+` consumers can
 download one depofile, fetch the source tarball, and let the embedded `depofiles/` tree resolve
 the full dependency graph.
 

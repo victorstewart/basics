@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(basics LANGUAGES CXX)
-set(BASICS_RELEASE_IDENTITY "0.4.14-rc.2")
+set(BASICS_RELEASE_IDENTITY "0.4.14-rc.3")
 set(PROJECT_VERSION "${BASICS_RELEASE_IDENTITY}")
 set(basics_VERSION "${BASICS_RELEASE_IDENTITY}")
 
@@ -428,6 +428,14 @@ add_test(
       "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
       "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/depofile-version-contract"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_depofile_version_contract.cmake"
+)
+
+add_test(
+  NAME basics_depos_bootstrap_contract
+  COMMAND
+    "${CMAKE_COMMAND}"
+      "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_depos_bootstrap_contract.cmake"
 )
 
 add_test(

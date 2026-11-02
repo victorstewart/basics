@@ -32,7 +32,7 @@ endforeach()
 
 file(READ "${BASICS_SOURCE_DIR}/CMakeLists.txt" _basics_cmakelists)
 string(FIND "${_basics_cmakelists}"
-  [[set(BASICS_RELEASE_IDENTITY "0.4.14-rc.2")]]
+  [[set(BASICS_RELEASE_IDENTITY "0.4.14-rc.3")]]
   _basics_source_identity_index)
 if (_basics_source_identity_index EQUAL -1)
   message(FATAL_ERROR "Basics source does not own the exact release identity.")
