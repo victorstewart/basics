@@ -405,6 +405,14 @@ add_test(
 )
 
 add_test(
+  NAME basics_production_logging_contract
+  COMMAND
+    "${CMAKE_COMMAND}"
+      "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_production_logging_contract.cmake"
+)
+
+add_test(
   NAME basics_dependency_materialization_contract
   COMMAND
     "${CMAKE_COMMAND}"

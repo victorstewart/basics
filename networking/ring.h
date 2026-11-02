@@ -900,12 +900,16 @@ private:
 
   static void writeCreateRingStage(const char *stage)
   {
+#if NAMETAG_ENABLE_DEBUG_LOGS
     int fd = open("/bootstage.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0)
     {
       (void)write(fd, stage, strlen(stage));
       (void)close(fd);
     }
+#else
+    (void)stage;
+#endif
   }
 
   static struct io_uring_sqe *getSQESafe(void)
