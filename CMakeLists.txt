@@ -3,7 +3,7 @@
 
 cmake_minimum_required(VERSION 3.21)
 
-project(basics VERSION 0.4.6 LANGUAGES CXX)
+project(basics VERSION 0.4.14 LANGUAGES CXX)
 
 include(CTest)
 include("${CMAKE_CURRENT_SOURCE_DIR}/.depos.cmake")
@@ -394,6 +394,14 @@ add_test(
       "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
       "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/release-depofile-generator-contract"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_release_depofile_generator.cmake"
+)
+
+add_test(
+  NAME basics_source_release_producer_contract
+  COMMAND
+    "${CMAKE_COMMAND}"
+      "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_source_release_producer.cmake"
 )
 
 add_test(
