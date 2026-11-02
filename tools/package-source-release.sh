@@ -5,7 +5,8 @@ set -euo pipefail
 # downstream Depos builds. Publication is deliberately outside this script.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 output_root="${1:-${repo_root}/.run/source-release}"
-version="${BASICS_SOURCE_RELEASE_VERSION:-0.4.14-rc.1}"
+declared_version="$(sed -n 's/^set(BASICS_RELEASE_IDENTITY "\([^"]*\)")$/\1/p' "${repo_root}/CMakeLists.txt")"
+version="${BASICS_SOURCE_RELEASE_VERSION:-${declared_version}}"
 
 for command in cmake git gzip sha256sum tar; do
   command -v "${command}" >/dev/null 2>&1 || {
@@ -15,6 +16,10 @@ for command in cmake git gzip sha256sum tar; do
 done
 [[ "${version}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
   echo "package-source-release: BASICS_SOURCE_RELEASE_VERSION is invalid." >&2
+  exit 1
+}
+[[ -n "${declared_version}" && "${version}" == "${declared_version}" ]] || {
+  echo "package-source-release: version '${version}' disagrees with source identity '${declared_version}'." >&2
   exit 1
 }
 

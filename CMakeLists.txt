@@ -3,7 +3,10 @@
 
 cmake_minimum_required(VERSION 3.21)
 
-project(basics VERSION 0.4.14 LANGUAGES CXX)
+project(basics LANGUAGES CXX)
+set(BASICS_RELEASE_IDENTITY "0.4.14-rc.1")
+set(PROJECT_VERSION "${BASICS_RELEASE_IDENTITY}")
+set(basics_VERSION "${BASICS_RELEASE_IDENTITY}")
 
 include(CTest)
 include("${CMAKE_CURRENT_SOURCE_DIR}/.depos.cmake")

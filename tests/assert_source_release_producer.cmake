@@ -12,7 +12,8 @@ endif()
 file(READ "${_basics_producer}" _basics_producer_contents)
 
 foreach(_basics_required_contract IN ITEMS
-  [[BASICS_SOURCE_RELEASE_VERSION:-0.4.14-rc.1]]
+  [[BASICS_SOURCE_RELEASE_VERSION:-${declared_version}]]
+  [[disagrees with source identity]]
   [[source worktree must be clean and fully committed]]
   [[git -C "${repo_root}" archive --format=tar]]
   [[gzip -n]]
@@ -28,6 +29,14 @@ foreach(_basics_required_contract IN ITEMS
     message(FATAL_ERROR "Basics source-release producer is missing '${_basics_required_contract}'.")
   endif()
 endforeach()
+
+file(READ "${BASICS_SOURCE_DIR}/CMakeLists.txt" _basics_cmakelists)
+string(FIND "${_basics_cmakelists}"
+  [[set(BASICS_RELEASE_IDENTITY "0.4.14-rc.1")]]
+  _basics_source_identity_index)
+if (_basics_source_identity_index EQUAL -1)
+  message(FATAL_ERROR "Basics source does not own the exact release identity.")
+endif()
 
 foreach(_basics_forbidden_contract IN ITEMS
   [[archive/refs/heads]]
