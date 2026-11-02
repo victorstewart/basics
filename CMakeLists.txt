@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(basics LANGUAGES CXX)
-set(BASICS_RELEASE_IDENTITY "0.4.14-rc.1")
+set(BASICS_RELEASE_IDENTITY "0.4.14-rc.2")
 set(PROJECT_VERSION "${BASICS_RELEASE_IDENTITY}")
 set(basics_VERSION "${BASICS_RELEASE_IDENTITY}")
 
@@ -18,6 +18,8 @@ set_property(CACHE BASICS_DEPENDENCY_LINK_MODE PROPERTY STRINGS STATIC SHARED)
 set(BASICS_SANITIZER_MODE "NONE" CACHE STRING "Optional sanitizer mode for basics test targets: NONE or ASAN_UBSAN")
 set_property(CACHE BASICS_SANITIZER_MODE PROPERTY STRINGS NONE ASAN_UBSAN)
 option(BASICS_ENABLE_TIDESDB "Include the optional TidesDB wrapper and dependency in the generated basics package surface" OFF)
+option(BASICS_VALIDATE_DEPOFILE_VERSIONS_ONLY "Validate Basics DepoFile version contracts without resolving dependencies" OFF)
+set(BASICS_VERSION_CONTRACT_EXTRA_DEPOFILE "" CACHE FILEPATH "Optional additional DepoFile checked by the Basics version-contract validator")
 
 file(GLOB _basics_dependency_depofiles CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/depofiles/*.DepoFile")
 list(SORT _basics_dependency_depofiles)
@@ -151,7 +153,10 @@ function(_basics_prepare_self_depofile out_var)
 endfunction()
 
 function(_basics_validate_depofile_versions)
-  set(_basics_version_regex "^[0-9]+(\\.[0-9]+)+$")
+  # Depos releases use normal numeric tiers. Basics source-release candidates
+  # additionally use the unambiguous <tiers>-rc.<positive-integer> grammar.
+  # Do not admit generic labels: version order must remain machine-readable.
+  set(_basics_version_regex "^([0-9]+(\\.[0-9]+)+|[0-9]+(\\.[0-9]+)+-rc\\.[1-9][0-9]*)$")
 
   foreach(_basics_depofile IN LISTS ARGN)
     file(STRINGS "${_basics_depofile}" _basics_depofile_lines)
@@ -176,6 +181,15 @@ _basics_prepare_self_depofile(_basics_self_depofile)
 string(TOUPPER "${BASICS_MIMALLOC_MODE}" _basics_selected_mimalloc_mode)
 
 _basics_validate_depofile_versions(${_basics_dependency_depofiles} "${_basics_self_depofile}")
+if (NOT "${BASICS_VERSION_CONTRACT_EXTRA_DEPOFILE}" STREQUAL "")
+  if (NOT EXISTS "${BASICS_VERSION_CONTRACT_EXTRA_DEPOFILE}")
+    message(FATAL_ERROR "BASICS_VERSION_CONTRACT_EXTRA_DEPOFILE does not exist: ${BASICS_VERSION_CONTRACT_EXTRA_DEPOFILE}")
+  endif()
+  _basics_validate_depofile_versions("${BASICS_VERSION_CONTRACT_EXTRA_DEPOFILE}")
+endif()
+if (BASICS_VALIDATE_DEPOFILE_VERSIONS_ONLY)
+  return()
+endif()
 depos_depend("${_basics_self_depofile}")
 
 function(_basics_configure_dev_compile_target target optimization_flag)
@@ -405,6 +419,15 @@ add_test(
     "${CMAKE_COMMAND}"
       "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_source_release_producer.cmake"
+)
+
+add_test(
+  NAME basics_depofile_version_contract
+  COMMAND
+    "${CMAKE_COMMAND}"
+      "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+      "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/depofile-version-contract"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_depofile_version_contract.cmake"
 )
 
 add_test(
