@@ -7,10 +7,6 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 output_root="${1:-${repo_root}/.run/source-release}"
 version="${BASICS_SOURCE_RELEASE_VERSION:-0.4.14-rc.1}"
 
-if [[ "$(uname -s)" != "Linux" ]]; then
-  echo "package-source-release: run in the verified Linux guest." >&2
-  exit 1
-fi
 for command in cmake git gzip sha256sum tar; do
   command -v "${command}" >/dev/null 2>&1 || {
     echo "package-source-release: missing required command '${command}'." >&2

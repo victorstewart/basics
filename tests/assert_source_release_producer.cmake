@@ -33,6 +33,7 @@ foreach(_basics_forbidden_contract IN ITEMS
   [[archive/refs/heads]]
   [[tar -cz]]
   [[SOURCE_DATE_EPOCH:-$(date]]
+  [[uname -s]]
 )
   string(FIND "${_basics_producer_contents}" "${_basics_forbidden_contract}" _basics_forbidden_index)
   if (NOT _basics_forbidden_index EQUAL -1)
