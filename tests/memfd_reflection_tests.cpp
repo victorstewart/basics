@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "tests/test_support.h"
 
+#include <fcntl.h>
+#include <linux/memfd.h>
 #include <string_view>
 #include <unistd.h>
 
@@ -78,6 +80,34 @@ static void testMemfdDuplicateToFixedFd(TestSuite& suite)
   closeIfOpen(fd);
 }
 
+static void testMemfdExplicitFlagsPermitSealing(TestSuite& suite)
+{
+  int fd = Memfd::create(
+      "basics-memfd-sealed"_ctv,
+      MFD_ALLOW_SEALING | MFD_CLOEXEC);
+  EXPECT_TRUE(suite, fd >= 0);
+  if (fd < 0)
+  {
+    return;
+  }
+
+  const int descriptorFlags = fcntl(fd, F_GETFD);
+  EXPECT_TRUE(suite, descriptorFlags >= 0);
+  EXPECT_TRUE(suite, descriptorFlags >= 0 && (descriptorFlags & FD_CLOEXEC) != 0);
+  String payload("sealed-payload");
+  EXPECT_TRUE(suite, Memfd::writeAll(fd, payload));
+  EXPECT_TRUE(suite, fcntl(
+      fd,
+      F_ADD_SEALS,
+      F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) == 0);
+  const int seals = fcntl(fd, F_GET_SEALS);
+  EXPECT_TRUE(suite, seals >= 0);
+  EXPECT_TRUE(suite, seals >= 0 && (seals & F_SEAL_WRITE) != 0);
+  EXPECT_FALSE(suite, Memfd::writeAll(fd, payload));
+
+  closeIfOpen(fd);
+}
+
 static void testMemfdRejectsEmptyAndInvalidDescriptors(TestSuite& suite)
 {
   String output;
@@ -103,6 +133,7 @@ int main()
   testReflectionTypeNames(suite);
   testMemfdRoundTripAndRewind(suite);
   testMemfdDuplicateToFixedFd(suite);
+  testMemfdExplicitFlagsPermitSealing(suite);
   testMemfdRejectsEmptyAndInvalidDescriptors(suite);
   return suite.finish("basics_memfd_reflection_tests");
 }

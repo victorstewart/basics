@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <utility>
 
 #pragma once
 
@@ -36,16 +37,24 @@ public:
 
   static int create(const char *name)
   {
+    return create(name, 0);
+  }
+
+  static int create(const char *name, unsigned int flags)
+  {
     String scratch;
-    // flags = 0 to ensure FD is inherited across exec (no CLOEXEC)
-    return int(syscall(SYS_memfd_create, nameCString(name, scratch), 0));
+    return int(syscall(SYS_memfd_create, nameCString(name, scratch), flags));
   }
 
   static int create(StringType auto&& name)
   {
+    return create(std::forward<decltype(name)>(name), 0);
+  }
+
+  static int create(StringType auto&& name, unsigned int flags)
+  {
     String scratch;
-    // flags = 0 to ensure FD is inherited across exec (no CLOEXEC)
-    return int(syscall(SYS_memfd_create, nameCString(name, scratch), 0));
+    return int(syscall(SYS_memfd_create, nameCString(name, scratch), flags));
   }
 
   static bool writeAll(int fd, StringType auto&& data)
