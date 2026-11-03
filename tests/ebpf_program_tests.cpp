@@ -3,6 +3,7 @@
 #include "tests/test_support.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cerrno>
 #include <cstdarg>
@@ -12,7 +13,6 @@
 #include <linux/if_link.h>
 #include <net/if.h>
 #include <string_view>
-#include <unordered_set>
 #include <sys/wait.h>
 #include <sys/mount.h>
 #include <signal.h>
@@ -38,8 +38,75 @@
 
 namespace PreattachedTraceIntercept {
 
+struct DiagnosticFDTable {
+  std::array<unsigned int, 64> entries = {};
+
+  void insert(int fd)
+  {
+    if (fd < 0)
+    {
+      return;
+    }
+    const unsigned int encoded = static_cast<unsigned int>(fd) + 1;
+    for (unsigned int& entry : entries)
+    {
+      if (entry == encoded)
+      {
+        return;
+      }
+      if (entry == 0)
+      {
+        entry = encoded;
+        return;
+      }
+    }
+  }
+
+  bool contains(int fd) const
+  {
+    if (fd < 0)
+    {
+      return false;
+    }
+    const unsigned int encoded = static_cast<unsigned int>(fd) + 1;
+    return std::find(entries.begin(), entries.end(), encoded) != entries.end();
+  }
+
+  size_t erase(int fd)
+  {
+    if (fd < 0)
+    {
+      return 0;
+    }
+    const unsigned int encoded = static_cast<unsigned int>(fd) + 1;
+    auto entry = std::find(entries.begin(), entries.end(), encoded);
+    if (entry == entries.end())
+    {
+      return 0;
+    }
+    *entry = 0;
+    return 1;
+  }
+
+  void clear()
+  {
+    entries.fill(0);
+  }
+
+  bool empty() const
+  {
+    return std::all_of(entries.begin(), entries.end(), [](unsigned int entry) {
+      return entry == 0;
+    });
+  }
+};
+
 static std::string redirectedPath;
-static std::unordered_set<int> diagnosticFDs;
+static bool redirectEnabled = false;
+// The linker wrappers run during allocator initialization, before dynamic C++
+// initialization is complete. This table must therefore remain allocation-free
+// and valid from zero-initialized storage.
+static DiagnosticFDTable diagnosticFDs = {};
 static uint64_t opens = 0;
 static uint64_t writes = 0;
 static uint64_t closes = 0;
@@ -53,7 +120,7 @@ static void resetCounts()
 
 static bool redirects(const char *path)
 {
-  return redirectedPath.empty() == false && path != nullptr &&
+  return redirectEnabled && redirectedPath.empty() == false && path != nullptr &&
          strcmp(path, "/switchboard.attach.log") == 0;
 }
 
@@ -1133,6 +1200,7 @@ static void testPreattachedMapLoggingIsReleaseGated(EBPFTestContext& context, co
   PreattachedTraceIntercept::redirectedPath = traceDirectory.child("switchboard.attach.log");
   PreattachedTraceIntercept::diagnosticFDs.clear();
   PreattachedTraceIntercept::resetCounts();
+  PreattachedTraceIntercept::redirectEnabled = true;
 
   NetDevice loopback = {};
   initializeNetDevice(loopback);
@@ -1269,6 +1337,7 @@ static void testPreattachedMapLoggingIsReleaseGated(EBPFTestContext& context, co
   EXPECT_EQ(context.suite(), bpf_xdp_query_id(loopback.ifidx, XDP_FLAGS_SKB_MODE, &remainingProgramID), 0);
   EXPECT_EQ(context.suite(), remainingProgramID, 0U);
   EXPECT_TRUE(context.suite(), PreattachedTraceIntercept::diagnosticFDs.empty());
+  PreattachedTraceIntercept::redirectEnabled = false;
   PreattachedTraceIntercept::diagnosticFDs.clear();
   PreattachedTraceIntercept::redirectedPath.clear();
 }
