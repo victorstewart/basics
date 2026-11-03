@@ -83,6 +83,9 @@ archive_sha256=${archive_sha256}
 depofile_sha256=${depofile_sha256}
 local_depofile_sha256=${local_depofile_sha256}
 EOF
-sha256sum "${archive}" "${depofile}" "${local_depofile}" > "${output_root}/SHA256SUMS"
+(
+  cd "${output_root}"
+  sha256sum "${asset_name}" "basics.DepoFile" > SHA256SUMS
+)
 printf 'Basics source release candidate: %s\nPublishable DepoFile: %s\nLocal verification DepoFile: %s\n' \
   "${archive}" "${depofile}" "${local_depofile}"

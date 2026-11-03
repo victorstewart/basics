@@ -23,6 +23,7 @@ foreach(_basics_required_contract IN ITEMS
   [[services/memfd.h]]
   [[tools/package-source-release.sh]]
   [[source_commit=${commit}]]
+  [[sha256sum "${asset_name}" "basics.DepoFile"]]
 )
   string(FIND "${_basics_producer_contents}" "${_basics_required_contract}" _basics_contract_index)
   if (_basics_contract_index EQUAL -1)
@@ -43,6 +44,7 @@ foreach(_basics_forbidden_contract IN ITEMS
   [[tar -cz]]
   [[SOURCE_DATE_EPOCH:-$(date]]
   [[uname -s]]
+  [[sha256sum "${archive}" "${depofile}"]]
 )
   string(FIND "${_basics_producer_contents}" "${_basics_forbidden_contract}" _basics_forbidden_index)
   if (NOT _basics_forbidden_index EQUAL -1)
