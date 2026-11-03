@@ -4,20 +4,28 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(basics LANGUAGES CXX)
-set(BASICS_RELEASE_IDENTITY "0.4.14-rc.4")
+set(BASICS_RELEASE_IDENTITY "0.4.14-rc.5")
 set(PROJECT_VERSION "${BASICS_RELEASE_IDENTITY}")
 set(basics_VERSION "${BASICS_RELEASE_IDENTITY}")
 
 include(CTest)
 
-if ((NOT DEFINED DEPOS_ROOT OR "${DEPOS_ROOT}" STREQUAL "")
-    AND (NOT DEFINED ENV{DEPOS_ROOT} OR "$ENV{DEPOS_ROOT}" STREQUAL ""))
-  set(
-    DEPOS_ROOT
-    "${CMAKE_BINARY_DIR}/depos-root"
-    CACHE PATH
-    "Basics build-local Depos root"
-  )
+if (NOT DEFINED DEPOS_ROOT OR "${DEPOS_ROOT}" STREQUAL "")
+  if (DEFINED ENV{DEPOS_ROOT} AND NOT "$ENV{DEPOS_ROOT}" STREQUAL "")
+    set(
+      DEPOS_ROOT
+      "$ENV{DEPOS_ROOT}"
+      CACHE PATH
+      "Basics Depos root inherited from ENV{DEPOS_ROOT}"
+    )
+  else()
+    set(
+      DEPOS_ROOT
+      "${CMAKE_BINARY_DIR}/depos-root"
+      CACHE PATH
+      "Basics build-local Depos root"
+    )
+  endif()
 endif()
 if (NOT DEFINED DEPOS_BOOTSTRAP_DIR OR "${DEPOS_BOOTSTRAP_DIR}" STREQUAL "")
   set(
@@ -29,6 +37,15 @@ if (NOT DEFINED DEPOS_BOOTSTRAP_DIR OR "${DEPOS_BOOTSTRAP_DIR}" STREQUAL "")
 endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/.depos.cmake")
+
+option(
+  BASICS_VALIDATE_DEPOS_STATE_PATHS_ONLY
+  "Configure only far enough to validate Basics' Depos state-path defaults"
+  OFF
+)
+if (BASICS_VALIDATE_DEPOS_STATE_PATHS_ONLY)
+  return()
+endif()
 
 set(BASICS_MIMALLOC_MODE "" CACHE STRING "Explicit mimalloc mode for basics: NONE, OBJECT, STATIC, or SHARED")
 set_property(CACHE BASICS_MIMALLOC_MODE PROPERTY STRINGS NONE OBJECT STATIC SHARED)
@@ -444,6 +461,15 @@ add_test(
     "${CMAKE_COMMAND}"
       "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_source_release_producer.cmake"
+)
+
+add_test(
+  NAME basics_depos_state_path_contract
+  COMMAND
+    "${CMAKE_COMMAND}"
+      "-DBASICS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+      "-DBASICS_STATE_PATH_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/depos-state-path-contract"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_depos_state_paths.cmake"
 )
 
 add_test(

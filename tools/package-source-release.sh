@@ -8,7 +8,7 @@ output_root="${1:-${repo_root}/.run/source-release}"
 declared_version="$(sed -n 's/^set(BASICS_RELEASE_IDENTITY "\([^"]*\)")$/\1/p' "${repo_root}/CMakeLists.txt")"
 version="${BASICS_SOURCE_RELEASE_VERSION:-${declared_version}}"
 
-for command in cmake git gzip sha256sum tar; do
+for command in awk cat cmake git gzip sed sha256sum tar; do
   command -v "${command}" >/dev/null 2>&1 || {
     echo "package-source-release: missing required command '${command}'." >&2
     exit 1
@@ -74,18 +74,19 @@ sed "s|${source_url}|file://${archive}|" "${depofile}" > "${local_depofile}"
 
 archive_sha256="$(sha256sum "${archive}" | awk '{print $1}')"
 depofile_sha256="$(sha256sum "${depofile}" | awk '{print $1}')"
-local_depofile_sha256="$(sha256sum "${local_depofile}" | awk '{print $1}')"
 cat > "${receipt}" <<EOF
-version=${version}
-source_commit=${commit}
-source_url=${source_url}
-archive_sha256=${archive_sha256}
-depofile_sha256=${depofile_sha256}
-local_depofile_sha256=${local_depofile_sha256}
+FORMAT=basics-source-release-v1
+VERSION=${version}
+SOURCE_COMMIT=${commit}
+SOURCE_URL=${source_url}
+ARCHIVE=${asset_name}
+ARCHIVE_SHA256=${archive_sha256}
+DEPOFILE=basics.DepoFile
+DEPOFILE_SHA256=${depofile_sha256}
 EOF
 (
   cd "${output_root}"
-  sha256sum "${asset_name}" "basics.DepoFile" > SHA256SUMS
+  sha256sum "${asset_name}" "basics.DepoFile" "RELEASE-RECEIPT.txt" > SHA256SUMS
 )
 printf 'Basics source release candidate: %s\nPublishable DepoFile: %s\nLocal verification DepoFile: %s\n' \
   "${archive}" "${depofile}" "${local_depofile}"

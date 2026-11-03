@@ -22,8 +22,9 @@ foreach(_basics_required_contract IN ITEMS
   [[BASICS_RELEASE_SOURCE_URL=${source_url}]]
   [[services/memfd.h]]
   [[tools/package-source-release.sh]]
-  [[source_commit=${commit}]]
-  [[sha256sum "${asset_name}" "basics.DepoFile"]]
+  [[FORMAT=basics-source-release-v1]]
+  [[SOURCE_COMMIT=${commit}]]
+  [[sha256sum "${asset_name}" "basics.DepoFile" "RELEASE-RECEIPT.txt"]]
 )
   string(FIND "${_basics_producer_contents}" "${_basics_required_contract}" _basics_contract_index)
   if (_basics_contract_index EQUAL -1)
@@ -33,7 +34,7 @@ endforeach()
 
 file(READ "${BASICS_SOURCE_DIR}/CMakeLists.txt" _basics_cmakelists)
 string(FIND "${_basics_cmakelists}"
-  [[set(BASICS_RELEASE_IDENTITY "0.4.14-rc.4")]]
+  [[set(BASICS_RELEASE_IDENTITY "0.4.14-rc.5")]]
   _basics_source_identity_index)
 if (_basics_source_identity_index EQUAL -1)
   message(FATAL_ERROR "Basics source does not own the exact release identity.")
@@ -45,6 +46,7 @@ foreach(_basics_forbidden_contract IN ITEMS
   [[SOURCE_DATE_EPOCH:-$(date]]
   [[uname -s]]
   [[sha256sum "${archive}" "${depofile}"]]
+  [[local_depofile_sha256=]]
 )
   string(FIND "${_basics_producer_contents}" "${_basics_forbidden_contract}" _basics_forbidden_index)
   if (NOT _basics_forbidden_index EQUAL -1)
