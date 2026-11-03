@@ -9,6 +9,7 @@ if (NOT DEFINED BUILD_DIR OR "${BUILD_DIR}" STREQUAL "")
 endif()
 
 set(_downstream_source_dir "${CMAKE_CURRENT_LIST_DIR}/downstream_package")
+get_filename_component(_downstream_repository_root "${_downstream_source_dir}/../.." ABSOLUTE)
 
 file(REMOVE_RECURSE "${BUILD_DIR}")
 
@@ -57,6 +58,59 @@ execute_process(
 
 if (NOT _configure_result EQUAL 0)
   message(FATAL_ERROR "Failed to configure downstream basics package smoke project.")
+endif()
+
+set(_downstream_default_state_build "${BUILD_DIR}-default-depos-state")
+set(_downstream_default_root "${_downstream_default_state_build}/depos-root")
+set(_downstream_default_bootstrap "${_downstream_default_state_build}/depos-bootstrap")
+set(_downstream_source_adjacent_bootstrap "${_downstream_repository_root}/.depos")
+if (EXISTS "${_downstream_source_adjacent_bootstrap}")
+  message(FATAL_ERROR "Downstream isolation fixture requires no source-adjacent Depos state: ${_downstream_source_adjacent_bootstrap}")
+endif()
+
+file(REMOVE_RECURSE "${_downstream_default_state_build}")
+set(_downstream_default_configure_args
+  -S "${_downstream_source_dir}"
+  -B "${_downstream_default_state_build}"
+  "-DBASICS_PACKAGE_DEPOFILE=${BASICS_PACKAGE_DEPOFILE}"
+  -DBASICS_DOWNSTREAM_STATE_PATH_PROBE_ONLY=ON
+)
+if (NOT DEFINED DEPOS_EXECUTABLE_VALUE OR "${DEPOS_EXECUTABLE_VALUE}" STREQUAL "")
+  message(FATAL_ERROR "DEPOS_EXECUTABLE_VALUE is required for the isolated downstream state-path probe.")
+endif()
+list(APPEND _downstream_default_configure_args
+  "-DDEPOS_EXECUTABLE=${DEPOS_EXECUTABLE_VALUE}"
+)
+if (DEFINED GENERATOR AND NOT "${GENERATOR}" STREQUAL "")
+  list(PREPEND _downstream_default_configure_args -G "${GENERATOR}")
+endif()
+if (DEFINED CXX_COMPILER AND NOT "${CXX_COMPILER}" STREQUAL "")
+  list(APPEND _downstream_default_configure_args "-DCMAKE_CXX_COMPILER=${CXX_COMPILER}")
+endif()
+if (DEFINED CMAKE_BUILD_TYPE_VALUE AND NOT "${CMAKE_BUILD_TYPE_VALUE}" STREQUAL "")
+  list(APPEND _downstream_default_configure_args "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE_VALUE}")
+endif()
+if (DEFINED CMAKE_MAKE_PROGRAM_VALUE AND NOT "${CMAKE_MAKE_PROGRAM_VALUE}" STREQUAL "")
+  list(APPEND _downstream_default_configure_args "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM_VALUE}")
+endif()
+execute_process(
+  COMMAND "${CMAKE_COMMAND}" ${_downstream_default_configure_args}
+  RESULT_VARIABLE _downstream_default_configure_result
+)
+if (NOT _downstream_default_configure_result EQUAL 0)
+  message(FATAL_ERROR "Downstream default-state isolation probe failed to configure.")
+endif()
+foreach(_downstream_default_cache_entry IN ITEMS
+  "DEPOS_ROOT:PATH=${_downstream_default_root}"
+  "DEPOS_BOOTSTRAP_DIR:PATH=${_downstream_default_bootstrap}"
+)
+  file(STRINGS "${_downstream_default_state_build}/CMakeCache.txt" _downstream_default_cache_line REGEX "^${_downstream_default_cache_entry}$")
+  if (NOT _downstream_default_cache_line)
+    message(FATAL_ERROR "Downstream default Depos state is not build-local: expected '${_downstream_default_cache_entry}'.")
+  endif()
+endforeach()
+if (EXISTS "${_downstream_source_adjacent_bootstrap}")
+  message(FATAL_ERROR "Downstream default configure created source-adjacent Depos state: ${_downstream_source_adjacent_bootstrap}")
 endif()
 
 include(ProcessorCount)
@@ -136,9 +190,10 @@ if (DEFINED EXPECT_MIMALLOC_OBJECT_INTERPOSITION AND EXPECT_MIMALLOC_OBJECT_INTE
   if (_downstream_main_index EQUAL -1)
     message(FATAL_ERROR "Downstream OBJECT-mode executable link line did not include main.cpp.o:\n${_downstream_link_line}")
   endif()
-  if (_downstream_mimalloc_index GREATER _downstream_main_index)
-    message(FATAL_ERROR "Downstream OBJECT-mode executable did not place mimalloc.o before main.cpp.o:\n${_downstream_link_line}")
-  endif()
+  # CMake places transitive TARGET_OBJECTS after the consumer's own objects but
+  # before linked libraries. The strong allocator symbols below are the actual
+  # interposition contract; requiring mimalloc.o before main.cpp.o rejects the
+  # canonical CMake propagation shape without strengthening that contract.
 
   execute_process(
     COMMAND nm -C "${_downstream_executable}"

@@ -37,18 +37,18 @@ function(_basics_configure_contract label fixture expect_success)
 endfunction()
 
 # This configures the source-owned generated self DepoFile at the exact path
-# published in Basics source archives. Its rc.3 VERSION must not be rejected.
+# published in Basics source archives. Its rc.4 VERSION must not be rejected.
 set(_basics_valid "${TEST_ROOT}/valid.DepoFile")
-_basics_write_fixture("${_basics_valid}" "0.4.14-rc.3" "1.2.3-rc.7")
+_basics_write_fixture("${_basics_valid}" "0.4.14-rc.4" "1.2.3-rc.7")
 _basics_configure_contract(valid_rc "${_basics_valid}" TRUE)
 set(_basics_self_depofile "${TEST_ROOT}/valid_rc/.deps/basics-self/basics.DepoFile")
 if (NOT EXISTS "${_basics_self_depofile}")
   message(FATAL_ERROR "Version-only configuration did not generate the published self DepoFile.")
 endif()
 file(READ "${_basics_self_depofile}" _basics_self_contents)
-string(FIND "${_basics_self_contents}" "VERSION 0.4.14-rc.3" _basics_self_version_index)
+string(FIND "${_basics_self_contents}" "VERSION 0.4.14-rc.4" _basics_self_version_index)
 if (_basics_self_version_index EQUAL -1)
-  message(FATAL_ERROR "Published self DepoFile does not preserve Basics rc.3 release identity.")
+  message(FATAL_ERROR "Published self DepoFile does not preserve Basics rc.4 release identity.")
 endif()
 
 foreach(_basics_case IN ITEMS

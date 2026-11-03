@@ -8,12 +8,35 @@ project(basics_downstream_package_consumer LANGUAGES CXX)
 include(CTest)
 
 option(BASICS_DOWNSTREAM_ENABLE_TIDESDB "Require the optional TidesDB basics package surface in the downstream smoke consumer" OFF)
+option(BASICS_DOWNSTREAM_STATE_PATH_PROBE_ONLY "Configure only far enough to inspect downstream Depos state paths" OFF)
 
 if (NOT DEFINED BASICS_PACKAGE_DEPOFILE OR "${BASICS_PACKAGE_DEPOFILE}" STREQUAL "")
   message(FATAL_ERROR "BASICS_PACKAGE_DEPOFILE must be provided to the downstream package smoke project.")
 endif()
 
+if ((NOT DEFINED DEPOS_ROOT OR "${DEPOS_ROOT}" STREQUAL "")
+    AND (NOT DEFINED ENV{DEPOS_ROOT} OR "$ENV{DEPOS_ROOT}" STREQUAL ""))
+  set(
+    DEPOS_ROOT
+    "${CMAKE_BINARY_DIR}/depos-root"
+    CACHE PATH
+    "Downstream consumer-local Depos root"
+  )
+endif()
+if (NOT DEFINED DEPOS_BOOTSTRAP_DIR OR "${DEPOS_BOOTSTRAP_DIR}" STREQUAL "")
+  set(
+    DEPOS_BOOTSTRAP_DIR
+    "${CMAKE_BINARY_DIR}/depos-bootstrap"
+    CACHE PATH
+    "Downstream consumer-local Depos bootstrap directory"
+  )
+endif()
+
 include("${CMAKE_CURRENT_LIST_DIR}/../../.depos.cmake")
+
+if (BASICS_DOWNSTREAM_STATE_PATH_PROBE_ONLY)
+  return()
+endif()
 
 depos_depend("${BASICS_PACKAGE_DEPOFILE}")
 

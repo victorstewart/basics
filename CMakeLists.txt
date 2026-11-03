@@ -4,11 +4,30 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(basics LANGUAGES CXX)
-set(BASICS_RELEASE_IDENTITY "0.4.14-rc.3")
+set(BASICS_RELEASE_IDENTITY "0.4.14-rc.4")
 set(PROJECT_VERSION "${BASICS_RELEASE_IDENTITY}")
 set(basics_VERSION "${BASICS_RELEASE_IDENTITY}")
 
 include(CTest)
+
+if ((NOT DEFINED DEPOS_ROOT OR "${DEPOS_ROOT}" STREQUAL "")
+    AND (NOT DEFINED ENV{DEPOS_ROOT} OR "$ENV{DEPOS_ROOT}" STREQUAL ""))
+  set(
+    DEPOS_ROOT
+    "${CMAKE_BINARY_DIR}/depos-root"
+    CACHE PATH
+    "Basics build-local Depos root"
+  )
+endif()
+if (NOT DEFINED DEPOS_BOOTSTRAP_DIR OR "${DEPOS_BOOTSTRAP_DIR}" STREQUAL "")
+  set(
+    DEPOS_BOOTSTRAP_DIR
+    "${CMAKE_BINARY_DIR}/depos-bootstrap"
+    CACHE PATH
+    "Basics build-local Depos bootstrap directory"
+  )
+endif()
+
 include("${CMAKE_CURRENT_SOURCE_DIR}/.depos.cmake")
 
 set(BASICS_MIMALLOC_MODE "" CACHE STRING "Explicit mimalloc mode for basics: NONE, OBJECT, STATIC, or SHARED")
@@ -377,6 +396,12 @@ add_test(
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_compile_failure.cmake"
 )
 
+get_property(
+  _basics_resolved_depos_executable
+  GLOBAL
+  PROPERTY DEPOS_RESOLVED_EXECUTABLE
+)
+
 add_test(
   NAME basics_downstream_package_consumer_smoke
   COMMAND
@@ -389,7 +414,7 @@ add_test(
       "-DCXX_COMPILER=${CMAKE_CXX_COMPILER}"
       "-DCMAKE_BUILD_TYPE_VALUE=${CMAKE_BUILD_TYPE}"
       "-DCMAKE_MAKE_PROGRAM_VALUE=${CMAKE_MAKE_PROGRAM}"
-      "-DDEPOS_EXECUTABLE_VALUE=${DEPOS_EXECUTABLE}"
+      "-DDEPOS_EXECUTABLE_VALUE=${_basics_resolved_depos_executable}"
       "-DDEPOS_ROOT_VALUE=${DEPOS_ROOT}"
       "-DDEPOS_BOOTSTRAP_DIR_VALUE=${DEPOS_BOOTSTRAP_DIR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_downstream_consumer.cmake"
