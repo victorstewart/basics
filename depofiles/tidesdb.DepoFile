@@ -1,14 +1,14 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
 NAME tidesdb
-VERSION 10.2.1.20261102.2
+VERSION 10.2.1.20261106.051416
 SYSTEM_LIBS ALLOW
 # Public release archive pinned by immutable checksum.
 DEPENDS zstd VERSION 1.5.7
 DEPENDS snappy VERSION 1.2.2
 DEPENDS lz4 VERSION 1.10.0
-SOURCE URL https://github.com/victorstewart/tidesdb/releases/download/v10.2.1.20261102.2/tidesdb-10.2.1.20261102.2.tar.gz
-SHA256 3b559b5aa3bf662919e5e763db6ace49be2f23581583bcfdc77c45c63c6ebb52
+SOURCE URL https://github.com/victorstewart/tidesdb/archive/81691faa9032b1e192c0e15cb63170f485e89d30.tar.gz
+SHA256 a8288f4098ae21ddad86a67f22b6f07b5fe1043a5e3dcbf996765d4c48d36877
 BUILD_SYSTEM CMAKE
 CMAKE_ARG "-DCMAKE_PREFIX_PATH=${dep:zstd};${dep:snappy};${dep:lz4}"
 CMAKE_ARG "-DCMAKE_C_FLAGS=-I${dep:zstd}/include -I${dep:snappy}/include -I${dep:lz4}/include"

@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(basics LANGUAGES CXX)
-set(BASICS_RELEASE_IDENTITY "0.4.14-rc.5")
+set(BASICS_RELEASE_IDENTITY "0.4.14-rc.6")
 set(PROJECT_VERSION "${BASICS_RELEASE_IDENTITY}")
 set(basics_VERSION "${BASICS_RELEASE_IDENTITY}")
 
@@ -96,7 +96,7 @@ function(_basics_prepare_self_depofile out_var)
   if (BASICS_ENABLE_TIDESDB)
     set(_basics_tidesdb_variant_suffix "on")
     set(BASICS_SELF_TIDESDB_ENABLED "ON")
-    set(BASICS_SELF_TIDESDB_DEPENDS "DEPENDS tidesdb VERSION 10.2.1.20261102.2")
+    set(BASICS_SELF_TIDESDB_DEPENDS "DEPENDS tidesdb VERSION 10.2.1.20261106.051416")
     set(BASICS_SELF_TIDESDB_LINK " tidesdb::tidesdb")
   else()
     set(_basics_tidesdb_variant_suffix "off")
