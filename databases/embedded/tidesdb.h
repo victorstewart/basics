@@ -25,11 +25,27 @@ public:
     full
   };
 
+  // These are open-time storage choices. They remain separate from the
+  // TidesDB configuration struct, whose by-value ABI is shared with callers
+  // compiled against older TidesDB headers.
+  struct OpenOptions {
+    // Zero retains TidesDB's ordinary 4,096-segment default. A caller that
+    // owns a persisted store with more retained VLog files must request a
+    // capacity large enough to leave room for a new active segment at reopen.
+    uint64_t maxVLogSegments;
+
+    constexpr OpenOptions(uint64_t requestedMaxVLogSegments = 0)
+        : maxVLogSegments(requestedMaxVLogSegments)
+    {
+    }
+  };
+
 private:
 
   tidesdb_t *db = nullptr;
   String dbPath;
   Durability durability = Durability::inherit;
+  OpenOptions openOptions;
   uint64_t logicalWriteFlushByteBudget = 0;
   uint64_t committedLogicalWriteBytes = 0;
   bool flushBeforeNextMutation = false;
@@ -192,7 +208,10 @@ private:
       config.memtable_sync_mode = TDB_SYNC_FULL;
     }
 
-    int rc = tidesdb_open(&config, &db);
+    tidesdb_open_options_t options = {};
+    options.size = sizeof(options);
+    options.max_vlog_segments = openOptions.maxVLogSegments;
+    int rc = tidesdb_open_with_options(&config, &options, &db);
     if (rc != TDB_SUCCESS)
     {
       String message;
@@ -287,8 +306,10 @@ public:
   explicit TidesDB(
       const String& path = ""_ctv,
       Durability requestedDurability = Durability::inherit,
-      uint64_t requestedLogicalWriteFlushByteBudget = 0)
+      uint64_t requestedLogicalWriteFlushByteBudget = 0,
+      OpenOptions requestedOpenOptions = OpenOptions())
       : dbPath(path), durability(requestedDurability),
+        openOptions(requestedOpenOptions),
         logicalWriteFlushByteBudget(requestedLogicalWriteFlushByteBudget)
   {
   }
