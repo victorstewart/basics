@@ -954,6 +954,66 @@ static void testZeroTtlImmediateAndQueuedAdmission(TestSuite& suite)
    }
 }
 
+static void testOptInResponsePrefixKeepsErrorsStrict(TestSuite& suite)
+{
+   HttpFixture complete("head", 0);
+   HttpFixture oversized("metadata", 0, 2);
+   HttpFixture plainTls("not-tls", 0);
+   EXPECT_TRUE(suite, complete.ready() && oversized.ready() && plainTls.ready());
+   if (!complete.ready() || !oversized.ready() || !plainTls.ready())
+   {
+      return;
+   }
+
+   SequenceDnsClient resolver({SequenceDnsClient::makeAnswer({"127.0.0.1"}, 30)});
+   Vector<MultiCurlClient::Request> requests;
+   MultiCurlClient::Request normal = plainRequest("prefix.test", complete.port());
+   normal.responseBytes = 8;
+   normal.retainResponsePrefix = true;
+   requests.push_back(std::move(normal));
+
+   MultiCurlClient::Request prefix = plainRequest("prefix.test", oversized.port());
+   prefix.responseBytes = 4;
+   prefix.retainResponsePrefix = true;
+   requests.push_back(std::move(prefix));
+
+   MultiCurlClient::Request strict = plainRequest("prefix.test", oversized.port());
+   strict.responseBytes = 4;
+   requests.push_back(std::move(strict));
+
+   MultiCurlClient::Request tls = plainRequest("prefix.test", plainTls.port());
+   tls.url.snprintf<"https://127.0.0.1:{itoa}/"_ctv>(uint64_t(plainTls.port()));
+   tls.requireTls = true;
+   tls.retainResponsePrefix = true;
+   requests.push_back(std::move(tls));
+
+   Vector<MultiCurlClient::Result> results =
+       runCurlBatch(suite, resolver, {}, std::move(requests));
+   EXPECT_EQ(suite, results.size(), size_t(4));
+   if (results.size() != 4)
+   {
+      return;
+   }
+   bool normal200 = false;
+   bool retainedPrefix = false;
+   bool strictOverflow = false;
+   bool tlsFailure = false;
+   for (const MultiCurlClient::Result& result : results)
+   {
+      normal200 |= result.succeeded() && result.statusCode == 200 &&
+                   result.body == "head"_ctv && !result.bodyTruncated &&
+                   result.curlCode == CURLE_OK;
+      retainedPrefix |= result.succeeded() && result.statusCode == 200 &&
+                        result.body == "meta"_ctv && result.bodyTruncated &&
+                        result.curlCode == CURLE_WRITE_ERROR;
+      strictOverflow |= result.status == MultiCurlClient::Status::responseTooLarge &&
+                        result.body.empty() && !result.bodyTruncated;
+      tlsFailure |= !result.succeeded() && !result.bodyTruncated &&
+                    result.curlCode != CURLE_WRITE_ERROR;
+   }
+   EXPECT_TRUE(suite, normal200 && retainedPrefix && strictOverflow && tlsFailure);
+}
+
 static void testRealHappyEyeballsFamilyFallback(TestSuite& suite)
 {
    HttpFixture ipv4Only("fallback", 0);
@@ -1679,6 +1739,7 @@ int main()
    testResetAndActiveShutdownBarriers(suite, true);
    testResetAndActiveShutdownBarriers(suite, false);
    testZeroTtlImmediateAndQueuedAdmission(suite);
+   testOptInResponsePrefixKeepsErrorsStrict(suite);
    testIpv6LiteralCanonicalizationAndPolicy(suite);
    testRealHappyEyeballsFamilyFallback(suite);
    testQueuedPinExpiryReresolves(suite);
