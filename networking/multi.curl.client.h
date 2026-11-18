@@ -213,6 +213,9 @@ public:
       TimePoint overallDeadline = TimePoint::max();
       uint64_t resolutionGeneration = 0;
       uint64_t identityGeneration = 0;
+      // Opt-in only: retain one bounded prefix of a response that is known to
+      // be stream-parseable. All ordinary requests reject incomplete bodies.
+      bool retainResponsePrefix = false;
       bool requireTls = true;
       bool pathAsIs = false;
    };
@@ -228,6 +231,7 @@ public:
       String headers;
       String body;
       uint32_t resolvedTtlSeconds = 0;
+      bool bodyTruncated = false;
 
       bool succeeded(void) const
       {
@@ -460,6 +464,15 @@ private:
       const size_t bytes = size * count;
       if (bytes > transfer.responseLimit - transfer.result.body.size())
       {
+         if (transfer.request.retainResponsePrefix)
+         {
+            const size_t remaining = transfer.responseLimit - transfer.result.body.size();
+            transfer.result.body.append(data, remaining);
+            transfer.result.bodyTruncated = true;
+            // A short return cancels libcurl after retaining exactly the
+            // caller-approved prefix. finish() recognizes this sole error.
+            return remaining;
+         }
          transfer.bodyOverflow = true;
          return 0;
       }
@@ -621,7 +634,7 @@ private:
          }
          transfer.contentLengthSeen = true;
          transfer.declaredContentLength = length;
-         if (length > transfer.responseLimit)
+         if (length > transfer.responseLimit && transfer.request.retainResponsePrefix == false)
          {
             transfer.bodyOverflow = true;
             return 0;
@@ -1668,9 +1681,12 @@ private:
       const long lowSpeedSeconds = long(std::max<int64_t>(1, (transfer.idleTimeout.count() + 999) / 1000));
       code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_LOW_SPEED_LIMIT, 1L) : code;
       code = code == CURLE_OK ? curl_easy_setopt(easy, CURLOPT_LOW_SPEED_TIME, lowSpeedSeconds) : code;
-      code = code == CURLE_OK ? curl_easy_setopt(easy,
-                                                 CURLOPT_MAXFILESIZE_LARGE,
-                                                 curl_off_t(transfer.responseLimit + 1)) : code;
+      if (transfer.request.retainResponsePrefix == false)
+      {
+         code = code == CURLE_OK ? curl_easy_setopt(easy,
+                                                    CURLOPT_MAXFILESIZE_LARGE,
+                                                    curl_off_t(transfer.responseLimit + 1)) : code;
+      }
 
       if (!transfer.request.body.empty())
       {
@@ -2062,6 +2078,11 @@ private:
                (curlCode == CURLE_WEIRD_SERVER_REPLY && transfer->locationSeen))
       {
          finalStatus = Status::invalidResponse;
+      }
+      else if (transfer->request.retainResponsePrefix && transfer->result.bodyTruncated &&
+               curlCode == CURLE_WRITE_ERROR)
+      {
+         finalStatus = Status::success;
       }
       else if (requestedStatus == Status::success && curlCode != CURLE_OK)
       {
